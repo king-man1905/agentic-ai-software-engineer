@@ -1,0 +1,23 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python & Virtual Environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Ephemeral Agent Workspaces & Outputs
+workspace/
+graphify-out/
+vector_store/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
