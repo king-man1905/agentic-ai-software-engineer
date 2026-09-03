@@ -130,7 +130,23 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
                 detail=str(e),
             )
 
+    # -------------------------------------------------------------------------
+    # Static Dashboard Mounting
+    # -------------------------------------------------------------------------
+    from pathlib import Path
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import RedirectResponse
+
+    static_dir = Path(__file__).resolve().parent.parent / "static"
+    if static_dir.exists():
+        app.mount("/dashboard", StaticFiles(directory=str(static_dir), html=True), name="static")
+
+    @app.get("/", include_in_schema=False)
+    def root_redirect():
+        return RedirectResponse(url="/dashboard/")
+
     return app
+
 
 
 # Default application instance for uvicorn/ASGI entrypoints

@@ -343,3 +343,17 @@ class TestConcurrentRunIsolation:
         )
         assert resume_b.status_code == 200
         assert resume_b.json()["status"] == "COMPLETED"
+
+    def test_dashboard_static_mount_and_redirect(self):
+        client = TestClient(create_app())
+        # Test /dashboard/ returns HTML
+        res = client.get("/dashboard/")
+        assert res.status_code == 200
+        assert "Autonomous AI Software Engineer — HITL Control Panel" in res.text
+        assert "text/html" in res.headers.get("content-type", "")
+
+        # Test root redirect
+        res_root = client.get("/", follow_redirects=True)
+        assert res_root.status_code == 200
+        assert "Autonomous AI Software Engineer — HITL Control Panel" in res_root.text
+

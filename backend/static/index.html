@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Autonomous AI Software Engineer — HITL Control Panel</title>
+  <!-- Tailwind CSS via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Google Fonts: Inter & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              100: '#e0e7ff',
+              400: '#818cf8',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+              900: '#1e1b4b',
+            },
+            surface: {
+              base: '#0B0F17',
+              card: '#111827',
+              lighter: '#1F2937',
+              border: '#374151',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      background: radial-gradient(circle at 50% 0%, #171d2d 0%, #0B0F17 75%);
+      min-height: 100vh;
+    }
+    .glass-panel {
+      background: rgba(17, 24, 39, 0.85);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(75, 85, 99, 0.4);
+    }
+    .diff-add {
+      background-color: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border-left: 3px solid #10b981;
+    }
+    .diff-del {
+      background-color: rgba(239, 68, 68, 0.15);
+      color: #f87171;
+      border-left: 3px solid #ef4444;
+    }
+    .diff-hdr {
+      background-color: rgba(99, 102, 241, 0.15);
+      color: #818cf8;
+      border-left: 3px solid #6366f1;
+    }
+    .pulse-glow {
+      box-shadow: 0 0 15px rgba(99, 102, 241, 0.5);
+    }
+  </style>
+</head>
+<body class="text-slate-200 font-sans antialiased selection:bg-brand-500 selection:text-white pb-16">
+
+  <!-- Navigation Bar -->
+  <header class="border-b border-surface-border/50 glass-panel sticky top-0 z-50">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <div class="flex items-center space-x-3">
+        <div class="w-9 h-9 rounded-lg bg-gradient-to-tr from-brand-600 to-cyan-500 flex items-center justify-center shadow-lg shadow-brand-500/20">
+          <svg class="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+        </div>
+        <div>
+          <span class="font-bold text-lg tracking-tight text-white flex items-center gap-2">
+            Antigravity <span class="text-brand-400 font-medium text-xs px-2 py-0.5 rounded-full bg-brand-900/60 border border-brand-500/30">HITL Gateway</span>
+          </span>
+          <p class="text-xs text-slate-400">Autonomous AI Software Engineer Control Panel</p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-4">
+        <div id="system-status-badge" class="flex items-center space-x-2 text-xs px-3 py-1.5 rounded-full bg-emerald-950/60 border border-emerald-500/30 text-emerald-400">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span>Gateway Online</span>
+        </div>
+        <a href="https://github.com/king-man1905/agentic-ai-software-engineer" target="_blank" rel="noopener" class="text-slate-400 hover:text-white transition text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg hover:bg-surface-lighter">
+          <svg class="w-4 h-4 fill-current" viewBox="0 0 24 24"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          <span>GitHub</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8 space-y-8">
+
+    <!-- Hero / Trigger Form Section -->
+    <div class="glass-panel rounded-2xl p-6 sm:p-8 shadow-2xl relative overflow-hidden">
+      <div class="absolute top-0 right-0 -mt-8 -mr-8 w-64 h-64 bg-brand-500/10 rounded-full blur-3xl pointer-events-none"></div>
+      
+      <div class="max-w-3xl">
+        <h1 class="text-2xl sm:text-3xl font-bold text-white tracking-tight">Autonomous Run Dispatcher</h1>
+        <p class="mt-2 text-sm text-slate-400">
+          Trigger an autonomous LangGraph agent cycle across the Indexer, Planner, Developer, and Sandbox Pytest. When the agent arrives at the VCS deployment gate, review risk heuristics and approve or reject the Pull Request.
+        </p>
+      </div>
+
+      <form id="dispatch-form" class="mt-6 grid grid-cols-1 sm:grid-cols-12 gap-4 items-end">
+        <div class="sm:col-span-6">
+          <label for="input-repo" class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">Target GitHub Repository</label>
+          <div class="relative">
+            <span class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500">
+              <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
+            </span>
+            <input type="text" id="input-repo" value="king-man1905/sandbox-ai-demo" required class="w-full bg-surface-base border border-surface-border text-white text-sm rounded-xl pl-10 pr-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-brand-500 transition placeholder-slate-600 font-mono" placeholder="owner/repo" />
+          </div>
+        </div>
+
+        <div class="sm:col-span-3">
+          <label for="input-issue" class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">Issue Number</label>
+          <div class="relative">
+            <span class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500 font-mono text-sm">#</span>
+            <input type="number" id="input-issue" value="1" min="1" required class="w-full bg-surface-base border border-surface-border text-white text-sm rounded-xl pl-8 pr-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-brand-500 transition font-mono" placeholder="1" />
+          </div>
+        </div>
+
+        <div class="sm:col-span-3">
+          <button type="submit" id="btn-dispatch" class="w-full bg-gradient-to-r from-brand-600 to-brand-500 hover:from-brand-500 hover:to-brand-400 text-white font-medium text-sm rounded-xl px-5 py-2.5 shadow-lg shadow-brand-500/25 transition duration-150 flex items-center justify-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed">
+            <svg id="dispatch-spinner" class="hidden animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+            </svg>
+            <span id="dispatch-label">Dispatch Run</span>
+          </button>
+        </div>
+      </form>
+    </div>
+
+    <!-- Active Run Pipeline Section -->
+    <div id="pipeline-section" class="hidden glass-panel rounded-2xl p-6 sm:p-8 space-y-6">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-surface-border/50 gap-4">
+        <div>
+          <span class="text-xs font-semibold uppercase tracking-wider text-slate-400">Active Execution Thread</span>
+          <div class="flex items-center gap-3 mt-1">
+            <span id="run-id-display" class="font-mono text-base text-brand-300 font-semibold">run_...</span>
+            <span id="run-status-pill" class="text-xs px-2.5 py-0.5 rounded-full font-medium bg-indigo-950 text-indigo-400 border border-indigo-700/50">RUNNING</span>
+          </div>
+        </div>
+        <div class="text-xs text-slate-400 font-mono">
+          <span>Polling interval: <span class="text-slate-200">2000ms</span></span>
+        </div>
+      </div>
+
+      <!-- Pipeline Step Indicators -->
+      <div>
+        <label class="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-4">Pipeline Execution Stages</label>
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+          <!-- Step 1: Router -->
+          <div id="pill-router" class="flex flex-col p-3 rounded-xl bg-surface-base border border-surface-border text-slate-400 transition-all">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium uppercase tracking-wider">Step 1</span>
+              <span class="step-icon text-xs font-mono">○</span>
+            </div>
+            <span class="font-semibold text-sm mt-1 text-white">Router</span>
+            <span class="text-[11px] text-slate-500 mt-0.5">Classification</span>
+          </div>
+
+          <!-- Step 2: Planner -->
+          <div id="pill-planner" class="flex flex-col p-3 rounded-xl bg-surface-base border border-surface-border text-slate-400 transition-all">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium uppercase tracking-wider">Step 2</span>
+              <span class="step-icon text-xs font-mono">○</span>
+            </div>
+            <span class="font-semibold text-sm mt-1 text-white">Planner</span>
+            <span class="text-[11px] text-slate-500 mt-0.5">Strategy</span>
+          </div>
+
+          <!-- Step 3: Developer -->
+          <div id="pill-developer" class="flex flex-col p-3 rounded-xl bg-surface-base border border-surface-border text-slate-400 transition-all">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium uppercase tracking-wider">Step 3</span>
+              <span class="step-icon text-xs font-mono">○</span>
+            </div>
+            <span class="font-semibold text-sm mt-1 text-white">Developer</span>
+            <span class="text-[11px] text-slate-500 mt-0.5">AST Patching</span>
+          </div>
+
+          <!-- Step 4: Sandbox Pytest -->
+          <div id="pill-qa" class="flex flex-col p-3 rounded-xl bg-surface-base border border-surface-border text-slate-400 transition-all">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium uppercase tracking-wider">Step 4</span>
+              <span class="step-icon text-xs font-mono">○</span>
+            </div>
+            <span class="font-semibold text-sm mt-1 text-white">Sandbox</span>
+            <span class="text-[11px] text-slate-500 mt-0.5">Pytest Runner</span>
+          </div>
+
+          <!-- Step 5: Git VCS -->
+          <div id="pill-git_prepare" class="flex flex-col p-3 rounded-xl bg-surface-base border border-surface-border text-slate-400 transition-all">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium uppercase tracking-wider">Step 5</span>
+              <span class="step-icon text-xs font-mono">○</span>
+            </div>
+            <span class="font-semibold text-sm mt-1 text-white">Git VCS</span>
+            <span class="text-[11px] text-slate-500 mt-0.5">Diff & Risk</span>
+          </div>
+
+          <!-- Step 6: HITL Gate -->
+          <div id="pill-approval" class="flex flex-col p-3 rounded-xl bg-surface-base border border-surface-border text-slate-400 transition-all">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium uppercase tracking-wider">Step 6</span>
+              <span class="step-icon text-xs font-mono">○</span>
+            </div>
+            <span class="font-semibold text-sm mt-1 text-white">HITL Gate</span>
+            <span class="text-[11px] text-slate-500 mt-0.5">Human Decision</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- HITL Review Panel (Displays when status == WAITING_APPROVAL) -->
+    <div id="hitl-panel" class="hidden space-y-6">
+      <div class="glass-panel rounded-2xl p-6 sm:p-8 border-brand-500/40 pulse-glow relative overflow-hidden">
+        <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-surface-border/50">
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="w-3 h-3 rounded-full bg-amber-400 animate-ping"></span>
+              <h2 class="text-xl font-bold text-white tracking-tight">Human-in-the-Loop Review Gate</h2>
+            </div>
+            <p class="text-sm text-slate-400 mt-1">
+              The agent has validated code changes in the sandbox and paused execution. Inspect the heuristic risk score and unified diff below before approving deployment.
+            </p>
+          </div>
+          <!-- Action Bar -->
+          <div class="flex items-center space-x-3 shrink-0">
+            <button id="btn-reject" class="px-5 py-2.5 rounded-xl text-sm font-medium text-red-300 bg-red-950/60 hover:bg-red-900/60 border border-red-800/50 transition flex items-center gap-2 disabled:opacity-50">
+              <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+              <span>Reject</span>
+            </button>
+            <button id="btn-approve" class="px-6 py-2.5 rounded-xl text-sm font-medium text-white bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 shadow-lg shadow-emerald-500/20 border border-emerald-400/30 transition flex items-center gap-2 disabled:opacity-50">
+              <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+              <span>Approve & Push PR</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Risk Assessment & Diff Layout -->
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 mt-6">
+          <!-- Left Column: Risk Score & Details -->
+          <div class="lg:col-span-4 space-y-4">
+            <div class="bg-surface-base rounded-xl p-5 border border-surface-border">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-400 block mb-2">Risk Evaluation</span>
+              <div class="flex items-center justify-between">
+                <span id="risk-score-badge" class="px-3 py-1 rounded-full text-xs font-bold bg-amber-950 border border-amber-500/30 text-amber-400 flex items-center gap-1.5">
+                  <span>🟡</span> <span id="risk-score-text">MEDIUM RISK</span>
+                </span>
+                <span id="branch-name-text" class="text-xs font-mono text-slate-400 truncate max-w-[150px]">agent/task-...</span>
+              </div>
+
+              <!-- Lines changed stats -->
+              <div class="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-surface-border/50 text-center font-mono">
+                <div class="bg-surface-card p-2 rounded-lg border border-surface-border/30">
+                  <span class="text-[10px] text-slate-500 block">FILES</span>
+                  <span id="stat-files" class="text-sm font-bold text-slate-300">1</span>
+                </div>
+                <div class="bg-surface-card p-2 rounded-lg border border-surface-border/30">
+                  <span class="text-[10px] text-slate-500 block">ADDED</span>
+                  <span id="stat-added" class="text-sm font-bold text-emerald-400">+5</span>
+                </div>
+                <div class="bg-surface-card p-2 rounded-lg border border-surface-border/30">
+                  <span class="text-[10px] text-slate-500 block">DELETED</span>
+                  <span id="stat-deleted" class="text-sm font-bold text-rose-400">-1</span>
+                </div>
+              </div>
+
+              <!-- Risk Reasons -->
+              <div class="mt-4 pt-4 border-t border-surface-border/50">
+                <span class="text-xs font-semibold text-slate-400 block mb-2">Heuristic Reasons</span>
+                <ul id="risk-reasons-list" class="space-y-1.5 text-xs text-slate-300 list-disc list-inside">
+                  <li>Single file modification in non-critical component.</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right Column: Unified Code Diff Viewer -->
+          <div class="lg:col-span-8">
+            <div class="bg-surface-base rounded-xl border border-surface-border overflow-hidden">
+              <div class="px-4 py-2.5 bg-surface-card border-b border-surface-border/50 flex items-center justify-between">
+                <span class="text-xs font-mono text-slate-400 flex items-center gap-2">
+                  <svg class="w-4 h-4 text-brand-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2"/></svg>
+                  <span>Unified Git Diff Preview</span>
+                </span>
+                <span id="diff-file-badge" class="text-[11px] font-mono text-slate-500">math_utils.py</span>
+              </div>
+              <div class="overflow-x-auto max-h-96 font-mono text-xs p-3 space-y-0.5 select-text" id="diff-content-container">
+                <pre class="text-slate-500">No diff available.</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Final Outcome Alert / Summary Section -->
+    <div id="outcome-panel" class="hidden glass-panel rounded-2xl p-6 sm:p-8">
+      <!-- Success State -->
+      <div id="outcome-success" class="hidden flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+        <div class="flex items-center space-x-4">
+          <div class="w-12 h-12 rounded-xl bg-emerald-950 border border-emerald-500/30 flex items-center justify-center shrink-0">
+            <svg class="w-6 h-6 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+          </div>
+          <div>
+            <h3 class="text-lg font-bold text-white">Pull Request Published Successfully!</h3>
+            <p class="text-xs text-slate-400 mt-0.5">The autonomous run was approved and the branch was pushed to GitHub with sandbox verification proofs.</p>
+          </div>
+        </div>
+        <a id="btn-view-pr" href="#" target="_blank" rel="noopener" class="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-sm font-medium transition shadow-lg shadow-brand-500/20 flex items-center gap-2 shrink-0">
+          <span>View Pull Request on GitHub</span>
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+        </a>
+      </div>
+
+      <!-- Failure State -->
+      <div id="outcome-failure" class="hidden flex items-start space-x-4">
+        <div class="w-12 h-12 rounded-xl bg-red-950 border border-red-500/30 flex items-center justify-center shrink-0">
+          <svg class="w-6 h-6 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+        </div>
+        <div>
+          <h3 class="text-lg font-bold text-white">Workflow Terminated with Error</h3>
+          <p id="error-message-text" class="text-xs text-red-300 font-mono mt-1 bg-red-950/40 p-2.5 rounded-lg border border-red-900/50">Error summary will appear here.</p>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Frontend Logic -->
+  <script>
+    let activeRunId = null;
+    let pollInterval = null;
+
+    const dispatchForm = document.getElementById('dispatch-form');
+    const inputRepo = document.getElementById('input-repo');
+    const inputIssue = document.getElementById('input-issue');
+    const btnDispatch = document.getElementById('btn-dispatch');
+    const dispatchSpinner = document.getElementById('dispatch-spinner');
+    const dispatchLabel = document.getElementById('dispatch-label');
+
+    const pipelineSection = document.getElementById('pipeline-section');
+    const runIdDisplay = document.getElementById('run-id-display');
+    const runStatusPill = document.getElementById('run-status-pill');
+
+    const hitlPanel = document.getElementById('hitl-panel');
+    const btnApprove = document.getElementById('btn-approve');
+    const btnReject = document.getElementById('btn-reject');
+    const riskScoreBadge = document.getElementById('risk-score-badge');
+    const riskScoreText = document.getElementById('risk-score-text');
+    const branchNameText = document.getElementById('branch-name-text');
+    const statFiles = document.getElementById('stat-files');
+    const statAdded = document.getElementById('stat-added');
+    const statDeleted = document.getElementById('stat-deleted');
+    const riskReasonsList = document.getElementById('risk-reasons-list');
+    const diffContentContainer = document.getElementById('diff-content-container');
+    const diffFileBadge = document.getElementById('diff-file-badge');
+
+    const outcomePanel = document.getElementById('outcome-panel');
+    const outcomeSuccess = document.getElementById('outcome-success');
+    const outcomeFailure = document.getElementById('outcome-failure');
+    const btnViewPr = document.getElementById('btn-view-pr');
+    const errorMessageText = document.getElementById('error-message-text');
+
+    const stepPills = {
+      router: document.getElementById('pill-router'),
+      planner: document.getElementById('pill-planner'),
+      developer: document.getElementById('pill-developer'),
+      qa: document.getElementById('pill-qa'),
+      git_prepare: document.getElementById('pill-git_prepare'),
+      approval: document.getElementById('pill-approval')
+    };
+
+    const orderedSteps = ['router', 'planner', 'developer', 'qa', 'git_prepare', 'approval'];
+
+    // Dispatch Form Handler
+    dispatchForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const repo = inputRepo.value.trim();
+      const issue = parseInt(inputIssue.value.trim(), 10);
+      const projectId = repo.split('/')[1] || repo;
+
+      btnDispatch.disabled = true;
+      dispatchSpinner.classList.remove('hidden');
+      dispatchLabel.textContent = 'Starting Run...';
+
+      outcomePanel.classList.add('hidden');
+      outcomeSuccess.classList.add('hidden');
+      outcomeFailure.classList.add('hidden');
+      hitlPanel.classList.add('hidden');
+
+      try {
+        const res = await fetch('/api/v1/runs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user_message: `Resolve GitHub issue #${issue} on repository ${repo}`,
+            project_id: projectId,
+            metadata: {
+              github_repo: repo,
+              issue_number: issue,
+              triggered_by: 'hitl_dashboard'
+            }
+          })
+        });
+
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.detail || 'Failed to dispatch run.');
+        }
+
+        const data = await res.json();
+        activeRunId = data.run_id;
+        runIdDisplay.textContent = activeRunId;
+        pipelineSection.classList.remove('hidden');
+        resetStepPills();
+        updateStatusPill(data.status);
+
+        if (pollInterval) clearInterval(pollInterval);
+        pollInterval = setInterval(pollRunStatus, 2000);
+        pollRunStatus();
+
+      } catch (err) {
+        alert(`Error starting run: ${err.message}`);
+      } finally {
+        btnDispatch.disabled = false;
+        dispatchSpinner.classList.add('hidden');
+        dispatchLabel.textContent = 'Dispatch Run';
+      }
+    });
+
+    // Polling Status Logic
+    async function pollRunStatus() {
+      if (!activeRunId) return;
+
+      try {
+        const res = await fetch(`/api/v1/runs/${activeRunId}`);
+        if (!res.ok) return;
+
+        const data = await res.json();
+        updateStatusPill(data.status);
+        updateProgressSteps(data.current_node, data.status);
+
+        if (data.status === 'WAITING_APPROVAL') {
+          renderHitlPanel(data.git_diff);
+        } else {
+          hitlPanel.classList.add('hidden');
+        }
+
+        if (data.status === 'COMPLETED') {
+          clearInterval(pollInterval);
+          pollInterval = null;
+          showOutcomeSuccess(data);
+        } else if (data.status === 'FAILED') {
+          clearInterval(pollInterval);
+          pollInterval = null;
+          showOutcomeFailure(data.error_summary);
+        }
+
+      } catch (err) {
+        console.error('Error polling run status:', err);
+      }
+    }
+
+    // HITL Decisions
+    btnApprove.addEventListener('click', () => sendApprovalDecision(true));
+    btnReject.addEventListener('click', () => sendApprovalDecision(false));
+
+    async function sendApprovalDecision(approved) {
+      if (!activeRunId) return;
+      btnApprove.disabled = true;
+      btnReject.disabled = true;
+
+      try {
+        const res = await fetch(`/api/v1/runs/${activeRunId}/resume`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            approved: approved,
+            reviewer: 'dashboard_human_reviewer',
+            rejection_reason: approved ? null : 'Rejected via HITL Dashboard review.'
+          })
+        });
+
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.detail || 'Failed to submit approval.');
+        }
+
+        const data = await res.json();
+        updateStatusPill(data.status);
+        hitlPanel.classList.add('hidden');
+        
+        if (pollInterval) clearInterval(pollInterval);
+        pollInterval = setInterval(pollRunStatus, 2000);
+        pollRunStatus();
+
+      } catch (err) {
+        alert(`Failed to resume run: ${err.message}`);
+      } finally {
+        btnApprove.disabled = false;
+        btnReject.disabled = false;
+      }
+    }
+
+    // Render HITL Review Panel
+    function renderHitlPanel(gitDiff) {
+      hitlPanel.classList.remove('hidden');
+
+      if (!gitDiff) return;
+
+      branchNameText.textContent = gitDiff.branch_name || 'agent/feature';
+      statFiles.textContent = gitDiff.files_changed ? gitDiff.files_changed.length : 0;
+      statAdded.textContent = `+${gitDiff.lines_added || 0}`;
+      statDeleted.textContent = `-${gitDiff.lines_deleted || 0}`;
+
+      const score = (gitDiff.risk_score || 'LOW').toUpperCase();
+      riskScoreText.textContent = `${score} RISK`;
+      if (score === 'HIGH') {
+        riskScoreBadge.className = 'px-3 py-1 rounded-full text-xs font-bold bg-rose-950 border border-rose-500/30 text-rose-400 flex items-center gap-1.5';
+      } else if (score === 'MEDIUM') {
+        riskScoreBadge.className = 'px-3 py-1 rounded-full text-xs font-bold bg-amber-950 border border-amber-500/30 text-amber-400 flex items-center gap-1.5';
+      } else {
+        riskScoreBadge.className = 'px-3 py-1 rounded-full text-xs font-bold bg-emerald-950 border border-emerald-500/30 text-emerald-400 flex items-center gap-1.5';
+      }
+
+      riskReasonsList.innerHTML = '';
+      if (gitDiff.risk_reasons && gitDiff.risk_reasons.length > 0) {
+        gitDiff.risk_reasons.forEach(reason => {
+          const li = document.createElement('li');
+          li.textContent = reason;
+          riskReasonsList.appendChild(li);
+        });
+      } else {
+        const li = document.createElement('li');
+        li.textContent = 'No elevated risk factors detected.';
+        riskReasonsList.appendChild(li);
+      }
+
+      if (gitDiff.files_changed && gitDiff.files_changed.length > 0) {
+        diffFileBadge.textContent = gitDiff.files_changed[0];
+      }
+
+      renderDiff(gitDiff.unified_diff || 'No unified diff generated.');
+    }
+
+    function renderDiff(diffText) {
+      diffContentContainer.innerHTML = '';
+      const lines = diffText.split('\n');
+      lines.forEach(line => {
+        const div = document.createElement('div');
+        div.className = 'px-2 py-0.5 rounded leading-relaxed whitespace-pre font-mono';
+        if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) {
+          div.className += ' diff-hdr';
+        } else if (line.startsWith('+')) {
+          div.className += ' diff-add';
+        } else if (line.startsWith('-')) {
+          div.className += ' diff-del';
+        } else {
+          div.className += ' text-slate-400';
+        }
+        div.textContent = line;
+        diffContentContainer.appendChild(div);
+      });
+    }
+
+    function updateStatusPill(status) {
+      runStatusPill.textContent = status;
+      if (status === 'WAITING_APPROVAL') {
+        runStatusPill.className = 'text-xs px-2.5 py-0.5 rounded-full font-medium bg-amber-950 text-amber-300 border border-amber-500/40 animate-pulse';
+      } else if (status === 'COMPLETED') {
+        runStatusPill.className = 'text-xs px-2.5 py-0.5 rounded-full font-medium bg-emerald-950 text-emerald-300 border border-emerald-500/40';
+      } else if (status === 'FAILED') {
+        runStatusPill.className = 'text-xs px-2.5 py-0.5 rounded-full font-medium bg-rose-950 text-rose-300 border border-rose-500/40';
+      } else {
+        runStatusPill.className = 'text-xs px-2.5 py-0.5 rounded-full font-medium bg-indigo-950 text-indigo-300 border border-indigo-700/50';
+      }
+    }
+
+    function resetStepPills() {
+      orderedSteps.forEach(s => {
+        const el = stepPills[s];
+        el.className = 'flex flex-col p-3 rounded-xl bg-surface-base border border-surface-border text-slate-400 transition-all';
+        el.querySelector('.step-icon').textContent = '○';
+      });
+    }
+
+    function updateProgressSteps(currentNode, status) {
+      if (!currentNode && status === 'RUNNING') currentNode = 'router';
+      if (status === 'WAITING_APPROVAL') currentNode = 'approval';
+      if (status === 'COMPLETED') currentNode = 'approval';
+
+      let reached = false;
+      const targetIdx = orderedSteps.indexOf(currentNode);
+
+      orderedSteps.forEach((s, idx) => {
+        const el = stepPills[s];
+        const icon = el.querySelector('.step-icon');
+
+        if (status === 'COMPLETED' || idx < targetIdx) {
+          el.className = 'flex flex-col p-3 rounded-xl bg-emerald-950/40 border border-emerald-500/40 text-emerald-300 transition-all';
+          icon.textContent = '✓';
+        } else if (idx === targetIdx) {
+          if (status === 'WAITING_APPROVAL') {
+            el.className = 'flex flex-col p-3 rounded-xl bg-amber-950/60 border border-amber-500 text-amber-200 pulse-glow transition-all';
+            icon.textContent = '⏸';
+          } else {
+            el.className = 'flex flex-col p-3 rounded-xl bg-brand-900/60 border border-brand-400 text-white pulse-glow transition-all';
+            icon.textContent = '▶';
+          }
+        } else {
+          el.className = 'flex flex-col p-3 rounded-xl bg-surface-base border border-surface-border text-slate-500 transition-all';
+          icon.textContent = '○';
+        }
+      });
+    }
+
+    function showOutcomeSuccess(data) {
+      outcomePanel.classList.remove('hidden');
+      outcomeSuccess.classList.remove('hidden');
+      outcomeFailure.classList.add('hidden');
+      const repo = inputRepo.value.trim();
+      btnViewPr.href = `https://github.com/${repo}/pulls`;
+    }
+
+    function showOutcomeFailure(errorSummary) {
+      outcomePanel.classList.remove('hidden');
+      outcomeFailure.classList.remove('hidden');
+      outcomeSuccess.classList.add('hidden');
+      errorMessageText.textContent = errorSummary || 'Execution encountered an unrecoverable failure.';
+    }
+  </script>
+</body>
+</html>
