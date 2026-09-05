@@ -110,3 +110,8 @@ Honest disclosure — this runs correctly today at the scale of one operator wor
 | No API authentication, open CORS (`*`) | API keys/OAuth, per-tenant workspace isolation, rate limiting |
 | Two overlapping FastAPI entrypoints (`main.py`, `api/app.py`) | One entrypoint |
 | `.env` file secrets | A secrets manager (Vault / AWS Secrets Manager / equivalent) |
+
+## License
+
+This project is licensed under the [MIT License](LICENSE) &copy; 2026 king-man1905.
+
