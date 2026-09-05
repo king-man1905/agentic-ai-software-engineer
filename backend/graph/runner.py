@@ -109,6 +109,8 @@ class AgentRunner:
         self._graph = _build_graph(self._checkpointer)
         # Track metadata supplied at run-creation time (not stored in graph state)
         self._run_metadata: Dict[str, Dict[str, Any]] = {}
+        self._active_runs: Dict[str, str] = {}
+        self._run_errors: Dict[str, str] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -181,6 +183,20 @@ class AgentRunner:
     # Public API
     # ------------------------------------------------------------------
 
+    def register_run(
+        self,
+        run_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Registers a run in memory before starting execution in the background,
+        marking its initial status as RUNNING.
+        """
+        with self._lock:
+            if metadata:
+                self._run_metadata[run_id] = metadata
+            self._active_runs[run_id] = "RUNNING"
+
     def start_run(
         self,
         run_id: str,
@@ -205,6 +221,7 @@ class AgentRunner:
         with self._lock:
             if metadata:
                 self._run_metadata[run_id] = metadata
+            self._active_runs[run_id] = "RUNNING"
 
         initial_state: AgentState = {"user_message": user_message, "run_id": run_id}
 
@@ -217,9 +234,14 @@ class AgentRunner:
             invoke_result = self._graph.invoke(initial_state, config=config)
             state_snapshot = self._graph.get_state(config)
             status = self._derive_status(state_snapshot, invoke_result)
+            with self._lock:
+                self._active_runs.pop(run_id, None)
             return self._build_status_response(run_id, status, state_snapshot)
         except Exception as e:
             state_snapshot = self._try_get_state(config)
+            with self._lock:
+                self._active_runs.pop(run_id, None)
+                self._run_errors[run_id] = str(e)
             return self._build_status_response(
                 run_id, "FAILED", state_snapshot, error_summary=str(e)
             )
@@ -240,8 +262,32 @@ class AgentRunner:
         config = self._config(run_id)
         state_snapshot = self._graph.get_state(config)
 
+        with self._lock:
+            is_active = run_id in self._active_runs
+            error_msg = self._run_errors.get(run_id)
+
+        if error_msg and (state_snapshot is None or not state_snapshot.values):
+            return self._build_status_response(
+                run_id, "FAILED", state_snapshot, error_summary=error_msg
+            )
+
+        if is_active and (state_snapshot is None or not state_snapshot.values):
+            return RunStatusResponse(
+                run_id=run_id,
+                status="RUNNING",
+                message="Run is currently executing in background",
+            )
+
         if state_snapshot is None or not state_snapshot.values:
             raise KeyError(f"Run not found: {run_id}")
+
+        if is_active:
+            return RunStatusResponse(
+                run_id=run_id,
+                status="RUNNING",
+                current_node=self._extract_current_node(state_snapshot),
+                message="Run is currently executing in background",
+            )
 
         status = self._derive_status(state_snapshot)
         return self._build_status_response(run_id, status, state_snapshot)
@@ -301,6 +347,9 @@ class AgentRunner:
 
         resume_value = approval_decision.model_dump()
 
+        with self._lock:
+            self._active_runs[run_id] = "RUNNING"
+
         try:
             invoke_result = self._graph.invoke(
                 Command(resume=resume_value),
@@ -308,9 +357,14 @@ class AgentRunner:
             )
             state_snapshot = self._graph.get_state(config)
             status = self._derive_status(state_snapshot, invoke_result)
+            with self._lock:
+                self._active_runs.pop(run_id, None)
             return self._build_status_response(run_id, status, state_snapshot)
         except Exception as e:
             state_snapshot = self._try_get_state(config)
+            with self._lock:
+                self._active_runs.pop(run_id, None)
+                self._run_errors[run_id] = str(e)
             return self._build_status_response(
                 run_id, "FAILED", state_snapshot, error_summary=str(e)
             )

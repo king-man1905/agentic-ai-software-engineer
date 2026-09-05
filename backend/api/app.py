@@ -1,6 +1,6 @@
 import uuid
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Request, Response, status, Depends
+from fastapi import FastAPI, HTTPException, Request, Response, status, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -66,22 +66,32 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
     @app.post(
         "/api/v1/runs",
         response_model=RunStatusResponse,
-        status_code=status.HTTP_201_CREATED,
+        status_code=status.HTTP_202_ACCEPTED,
         tags=["Runs"],
-        summary="Create and start a new agent workflow run",
+        summary="Create and dispatch a new agent workflow run in the background",
     )
     def create_run(
         request: CreateRunRequest,
+        background_tasks: BackgroundTasks,
         runner_instance: AgentRunner = Depends(get_agent_runner),
     ) -> RunStatusResponse:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
-        status_res = runner_instance.start_run(
+        runner_instance.register_run(
+            run_id=run_id,
+            metadata=request.metadata,
+        )
+        background_tasks.add_task(
+            runner_instance.start_run,
             run_id=run_id,
             user_message=request.user_message,
             project_id=request.project_id,
             metadata=request.metadata,
         )
-        return status_res
+        return RunStatusResponse(
+            run_id=run_id,
+            status="RUNNING",
+            message="Run dispatched successfully in background",
+        )
 
     @app.get(
         "/api/v1/runs/{run_id}",

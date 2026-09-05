@@ -49,6 +49,10 @@ class RunStatusResponse(BaseModel):
         default=None,
         description="Human-readable error summary when status is FAILED.",
     )
+    message: Optional[str] = Field(
+        default=None,
+        description="Optional human-readable informational message regarding the run dispatch or lifecycle.",
+    )
 
 
 class ResumeRunRequest(BaseModel):

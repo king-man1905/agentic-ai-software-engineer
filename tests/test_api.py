@@ -144,6 +144,16 @@ class TestRunEndpointsValidationAndErrors:
         response = client.post("/api/v1/runs", json={})
         assert response.status_code == 422
 
+    def test_run_status_while_active_in_memory(self):
+        runner = AgentRunner()
+        run_id = "run_test_in_progress"
+        runner.register_run(run_id)
+        status_res = runner.get_status(run_id)
+        assert status_res.status == "RUNNING"
+        assert status_res.run_id == run_id
+        assert status_res.message is not None
+        assert "background" in status_res.message.lower()
+
 
 # ============================================================================
 # 4. FULL HITL APPROVAL & REJECTION LIFECYCLE TESTS (MOCKED AGENTS)
@@ -197,7 +207,7 @@ class TestHITLLifecycleWithAPI:
     def test_full_hitl_approval_lifecycle(self, client_and_runner):
         client, runner = client_and_runner
 
-        # 1. Create run
+        # 1. Create run (dispatched asynchronously in background)
         create_resp = client.post(
             "/api/v1/runs",
             json={
@@ -205,14 +215,14 @@ class TestHITLLifecycleWithAPI:
                 "metadata": {"source": "unit_test"},
             },
         )
-        assert create_resp.status_code == 201
+        assert create_resp.status_code == 202
         run_data = create_resp.json()
         run_id = run_data["run_id"]
         assert run_id.startswith("run_")
-        assert run_data["status"] == "WAITING_APPROVAL"
-        assert run_data["current_node"] == "approval"
+        assert run_data["status"] == "RUNNING"
+        assert run_data["message"] == "Run dispatched successfully in background"
 
-        # 2. Inspect run via GET
+        # 2. Inspect run via GET (background execution reached approval gate)
         get_resp = client.get(f"/api/v1/runs/{run_id}")
         assert get_resp.status_code == 200
         get_data = get_resp.json()
@@ -247,16 +257,22 @@ class TestHITLLifecycleWithAPI:
     def test_full_hitl_rejection_lifecycle(self, client_and_runner):
         client, runner = client_and_runner
 
-        # 1. Create run
+        # 1. Create run (dispatched asynchronously in background)
         create_resp = client.post(
             "/api/v1/runs",
             json={"user_message": "Fix the null check in service"},
         )
-        assert create_resp.status_code == 201
+        assert create_resp.status_code == 202
         run_id = create_resp.json()["run_id"]
-        assert create_resp.json()["status"] == "WAITING_APPROVAL"
+        assert create_resp.json()["status"] == "RUNNING"
+        assert create_resp.json()["message"] == "Run dispatched successfully in background"
 
-        # 2. Resume run with rejection
+        # 2. Inspect run via GET (background execution reached approval gate)
+        get_resp = client.get(f"/api/v1/runs/{run_id}")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["status"] == "WAITING_APPROVAL"
+
+        # 3. Resume run with rejection
         resume_resp = client.post(
             f"/api/v1/runs/{run_id}/resume",
             json={
@@ -268,7 +284,7 @@ class TestHITLLifecycleWithAPI:
         assert resume_resp.status_code == 200
         assert resume_resp.json()["status"] == "COMPLETED"
 
-        # 3. Verify final state
+        # 4. Verify final state
         get_resp = client.get(f"/api/v1/runs/{run_id}")
         assert get_resp.status_code == 200
         assert get_resp.json()["status"] == "COMPLETED"
@@ -316,12 +332,24 @@ class TestConcurrentRunIsolation:
         res_a = client.post("/api/v1/runs", json={"user_message": "Task A"})
         res_b = client.post("/api/v1/runs", json={"user_message": "Task B"})
 
+        assert res_a.status_code == 202
+        assert res_b.status_code == 202
+
         run_a_id = res_a.json()["run_id"]
         run_b_id = res_b.json()["run_id"]
 
         assert run_a_id != run_b_id
-        assert res_a.json()["status"] == "WAITING_APPROVAL"
-        assert res_b.json()["status"] == "WAITING_APPROVAL"
+        assert res_a.json()["status"] == "RUNNING"
+        assert res_b.json()["status"] == "RUNNING"
+
+        # Inspect both runs reached WAITING_APPROVAL after background dispatch
+        status_a = client.get(f"/api/v1/runs/{run_a_id}")
+        assert status_a.status_code == 200
+        assert status_a.json()["status"] == "WAITING_APPROVAL"
+
+        status_b = client.get(f"/api/v1/runs/{run_b_id}")
+        assert status_b.status_code == 200
+        assert status_b.json()["status"] == "WAITING_APPROVAL"
 
         # Resume Run A only
         resume_a = client.post(
@@ -332,9 +360,9 @@ class TestConcurrentRunIsolation:
         assert resume_a.json()["status"] == "COMPLETED"
 
         # Run B must still be WAITING_APPROVAL
-        status_b = client.get(f"/api/v1/runs/{run_b_id}")
-        assert status_b.status_code == 200
-        assert status_b.json()["status"] == "WAITING_APPROVAL"
+        status_b_after = client.get(f"/api/v1/runs/{run_b_id}")
+        assert status_b_after.status_code == 200
+        assert status_b_after.json()["status"] == "WAITING_APPROVAL"
 
         # Resume Run B with rejection
         resume_b = client.post(
