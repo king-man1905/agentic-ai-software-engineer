@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from backend.vcs.models import GitDiffSummary
@@ -166,3 +166,32 @@ class PublishPRResponse(BaseModel):
     is_draft: bool
     status: str = "PUBLISHED"
 
+
+from backend.schemas.telemetry import (
+    AnalyticsOverview,
+    EvaluationSummary,
+    EvaluationTask,
+    FailureAnalytics,
+    ModelAnalytics,
+    QualityAnalytics,
+    RunRecord,
+    TelemetryEvent,
+)
+
+
+class RunListResponse(BaseModel):
+    runs: List[RunRecord]
+    total: int
+    limit: int
+    offset: int
+
+
+class RunEventsResponse(BaseModel):
+    run_id: str
+    events: List[TelemetryEvent]
+
+
+class RunEvaluationRequest(BaseModel):
+    model: str = "gpt-4o"
+    provider: str = "openai"
+    tasks: Optional[List[EvaluationTask]] = None

@@ -560,3 +560,87 @@ class TestAuditSecurity:
         valid, err = audit_logger.verify_integrity(org_id)
         assert valid is True
         assert err is None
+
+
+# =============================================================================
+# 7. AGENTRUNNER TENANT FALLBACK (regression for the Phase 6 audit finding:
+# runner.py's "organization_id or ... or 'default-org'" fallback had no
+# production awareness of its own, independent of the API layer's checks)
+# =============================================================================
+
+class TestRunnerProductionTenantFallback:
+    def test_register_run_without_org_fails_in_production(self):
+        tenant_manager.set_mode(AuthMode.PRODUCTION, fallback=False)
+        runner = AgentRunner()
+        with pytest.raises(PermissionError, match="AUTH_MODE=production"):
+            runner.register_run(run_id="run-no-org-register")
+
+    def test_start_run_without_org_fails_in_production(self):
+        tenant_manager.set_mode(AuthMode.PRODUCTION, fallback=False)
+        runner = AgentRunner()
+        with pytest.raises(PermissionError, match="AUTH_MODE=production"):
+            runner.start_run(run_id="run-no-org-start", user_message="do something")
+
+    def test_get_status_without_org_fails_safely_in_production(self):
+        # A run legitimately created under a real tenant in dev mode...
+        tenant_manager.set_mode(AuthMode.DEVELOPMENT, fallback=True)
+        runner = AgentRunner()
+        runner.register_run(run_id="run-existing-prod-check", organization_id="org-real")
+
+        # ...must not become readable with no organization_id once the
+        # server is actually running in production - "no identity" must
+        # never quietly resolve to "default-org" or "whatever the run has".
+        tenant_manager.set_mode(AuthMode.PRODUCTION, fallback=False)
+        with pytest.raises(KeyError):
+            runner.get_status("run-existing-prod-check")
+
+    def test_resume_run_without_org_fails_safely_in_production(self):
+        tenant_manager.set_mode(AuthMode.PRODUCTION, fallback=False)
+        runner = AgentRunner()
+        with pytest.raises(KeyError):
+            runner.resume_run("nonexistent-run", ApprovalDecision(approved=True))
+
+    def test_default_org_fallback_still_works_in_development(self):
+        tenant_manager.set_mode(AuthMode.DEVELOPMENT, fallback=True)
+        runner = AgentRunner()
+        # No organization_id passed at all - explicit dev fallback must
+        # still default cleanly, this is the behavior Phase 6 intended to
+        # keep for local development.
+        runner.register_run(run_id="run-dev-fallback")
+        result = runner.get_status("run-dev-fallback")
+        assert result.status == "RUNNING"
+
+    def test_authenticated_production_tenant_remains_correctly_scoped(self):
+        tenant_manager.set_mode(AuthMode.PRODUCTION, fallback=False)
+        org_a = tenant_manager.create_organization("org-prod-a", "Prod Org A")
+        user_a = tenant_manager.create_user("user-prod-a", "a@prod.local", "Prod User A")
+        tenant_manager.add_membership(org_a.id, user_a.id, Role.ENGINEER)
+        raw_key_a, _ = tenant_manager.create_user_api_key(user_a.id, org_a.id, "key-prod-a")
+
+        org_b = tenant_manager.create_organization("org-prod-b", "Prod Org B")
+        user_b = tenant_manager.create_user("user-prod-b", "b@prod.local", "Prod User B")
+        tenant_manager.add_membership(org_b.id, user_b.id, Role.ENGINEER)
+        raw_key_b, _ = tenant_manager.create_user_api_key(user_b.id, org_b.id, "key-prod-b")
+
+        app = create_app()
+        client = TestClient(app)
+
+        resp = client.post(
+            "/api/v1/runs",
+            json={"user_message": "Fix the auth bug"},
+            headers={"Authorization": f"Bearer {raw_key_a}"},
+        )
+        assert resp.status_code == 202
+        run_id = resp.json()["run_id"]
+
+        # The authenticated owner can read their own run.
+        own_read = client.get(f"/api/v1/runs/{run_id}", headers={"Authorization": f"Bearer {raw_key_a}"})
+        assert own_read.status_code == 200
+
+        # A different authenticated production tenant must not see it.
+        cross_tenant_read = client.get(f"/api/v1/runs/{run_id}", headers={"Authorization": f"Bearer {raw_key_b}"})
+        assert cross_tenant_read.status_code == 404
+
+        # No credentials at all must not see it either (no silent default-org).
+        unauthenticated_read = client.get(f"/api/v1/runs/{run_id}")
+        assert unauthenticated_read.status_code == 401

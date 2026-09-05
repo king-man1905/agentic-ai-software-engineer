@@ -125,6 +125,10 @@ class PolicyEvaluationResult(BaseModel):
         default_factory=dict,
         description="Per-category check verdicts (e.g., {'repository': 'PASS', 'protected_paths': 'PASS'}).",
     )
+    requires_human_approval: bool = Field(
+        default=False,
+        description="Whether the policy verdict mandates human-in-the-loop review.",
+    )
     policy_version: str = Field(
         default="1.0.0",
         description="Version of the policy applied during evaluation.",

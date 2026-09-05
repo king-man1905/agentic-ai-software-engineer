@@ -15,11 +15,19 @@ from typing import Any, Dict, Optional
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
+import time
+from datetime import datetime, timezone
+
 from backend.api.models import RunStatusResponse
 from backend.graph.state import AgentState
 from backend.vcs.models import ApprovalDecision, GitDiffSummary
 from backend.schemas.qa import QAResult
 from backend.schemas.policy import PolicyEvaluationResult
+from backend.observability.collector import telemetry_collector
+from backend.observability.store import telemetry_store
+from backend.schemas.telemetry import TelemetryEventType
+from backend.security.auth import AuthMode
+from backend.security.tenant import tenant_manager
 
 
 def _build_graph(checkpointer: MemorySaver):
@@ -227,6 +235,40 @@ class AgentRunner:
     # Tenant Enforcement Helper
     # ------------------------------------------------------------------
 
+    def _is_production_mode(self) -> bool:
+        """True when AUTH_MODE=production (or dev fallback is explicitly
+        disabled) - the mode in which a missing tenant identity must fail
+        closed rather than default to the sandbox tenant."""
+        return tenant_manager.auth_mode == AuthMode.PRODUCTION or not tenant_manager.dev_auth_fallback
+
+    def _require_org(
+        self,
+        organization_id: Optional[str],
+        run_id: Optional[str] = None,
+    ) -> str:
+        """
+        Resolves the organization to use for a call, refusing to invent
+        "default-org" when running in production. A caller reaching here
+        with no organization_id in production means no authenticated
+        identity was ever resolved upstream - treating that as
+        "default-org" would let a missing/misconfigured auth layer read or
+        mutate the sandbox tenant's data. Development fallback (the
+        pre-existing behavior) remains available when AUTH_MODE isn't
+        production and dev_auth_fallback hasn't been explicitly disabled.
+        """
+        if organization_id:
+            return organization_id
+        if run_id:
+            tracked = self._run_tenants.get(run_id)
+            if tracked:
+                return tracked
+        if self._is_production_mode():
+            raise PermissionError(
+                "AUTHENTICATION_REQUIRED: No organization identity was provided; "
+                "AUTH_MODE=production forbids an implicit 'default-org' fallback."
+            )
+        return "default-org"
+
     def _check_tenant_access(
         self,
         run_id: str,
@@ -234,6 +276,11 @@ class AgentRunner:
         state_snapshot=None,
     ) -> None:
         if not organization_id:
+            if self._is_production_mode():
+                # No authenticated identity in production: fail the same
+                # way as "run not found" rather than silently allowing
+                # access - don't reveal whether the run exists either.
+                raise KeyError(f"Run not found: {run_id}")
             return
         assigned_org = self._run_tenants.get(run_id)
         if not assigned_org and state_snapshot and state_snapshot.values:
@@ -255,12 +302,19 @@ class AgentRunner:
         Registers a run in memory before starting execution in the background,
         marking its initial status as RUNNING.
         """
+        effective_org = self._require_org(organization_id)
         with self._lock:
             if metadata:
                 self._run_metadata[run_id] = metadata
             if organization_id:
                 self._run_tenants[run_id] = organization_id
             self._active_runs[run_id] = "RUNNING"
+
+        telemetry_collector.on_run_created(
+            run_id=run_id,
+            organization_id=effective_org,
+            metadata=metadata,
+        )
 
     def start_run(
         self,
@@ -289,12 +343,25 @@ class AgentRunner:
         Returns:
             RunStatusResponse with the initial status.
         """
+        t0 = time.time()
+        effective_org = self._require_org(organization_id)
+
         with self._lock:
             if metadata:
                 self._run_metadata[run_id] = metadata
             if organization_id:
                 self._run_tenants[run_id] = organization_id
             self._active_runs[run_id] = "RUNNING"
+
+        telemetry_collector.on_run_created(
+            run_id=run_id,
+            organization_id=effective_org,
+            user_id=user_id,
+            repository=repository_id or project_id,
+            user_message=user_message,
+            metadata=metadata,
+        )
+        telemetry_collector.on_run_started(run_id, effective_org)
 
         initial_state: AgentState = {"user_message": user_message, "run_id": run_id}
 
@@ -313,14 +380,43 @@ class AgentRunner:
             invoke_result = self._graph.invoke(initial_state, config=config)
             state_snapshot = self._graph.get_state(config)
             status = self._derive_status(state_snapshot, invoke_result)
+            duration_ms = (time.time() - t0) * 1000.0
+
             with self._lock:
                 self._active_runs.pop(run_id, None)
+
+            if status == "WAITING_APPROVAL":
+                git_diff = self._extract_git_diff(state_snapshot)
+                pol_res = self._extract_policy_result(state_snapshot)
+                telemetry_collector.on_approval_requested(
+                    run_id=run_id,
+                    organization_id=effective_org,
+                    patch_hash=git_diff.patch_hash if git_diff else None,
+                    risk_score=getattr(pol_res, "risk_score", None),
+                )
+            elif status == "COMPLETED":
+                vals = state_snapshot.values if state_snapshot else {}
+                telemetry_collector.on_run_completed(
+                    run_id=run_id,
+                    organization_id=effective_org,
+                    state_values=vals,
+                    duration_ms=duration_ms,
+                )
+
             return self._build_status_response(run_id, status, state_snapshot)
         except Exception as e:
+            duration_ms = (time.time() - t0) * 1000.0
             state_snapshot = self._try_get_state(config)
             with self._lock:
                 self._active_runs.pop(run_id, None)
                 self._run_errors[run_id] = str(e)
+
+            telemetry_collector.on_run_failed(
+                run_id=run_id,
+                organization_id=effective_org,
+                error_message=str(e),
+                duration_ms=duration_ms,
+            )
             return self._build_status_response(
                 run_id, "FAILED", state_snapshot, error_summary=str(e)
             )
@@ -442,10 +538,29 @@ class AgentRunner:
             )
 
         resume_value = approval_decision.model_dump()
+        effective_org = self._require_org(organization_id, run_id=run_id)
+
+        rec = telemetry_store.get_run(run_id, effective_org)
+        latency_ms = None
+        if rec and rec.created_at:
+            try:
+                req_time = datetime.fromisoformat(rec.created_at)
+                latency_ms = (datetime.now(timezone.utc) - req_time).total_seconds() * 1000.0
+            except Exception:
+                pass
+
+        telemetry_collector.on_approval_decision(
+            run_id=run_id,
+            organization_id=effective_org,
+            approved=approval_decision.approved,
+            reviewer=approval_decision.reviewer,
+            latency_ms=latency_ms,
+        )
 
         with self._lock:
             self._active_runs[run_id] = "RUNNING"
 
+        t_resume = time.time()
         try:
             invoke_result = self._graph.invoke(
                 Command(resume=resume_value),
@@ -453,14 +568,34 @@ class AgentRunner:
             )
             state_snapshot = self._graph.get_state(config)
             status = self._derive_status(state_snapshot, invoke_result)
+            duration_ms = (time.time() - t_resume) * 1000.0
+
             with self._lock:
                 self._active_runs.pop(run_id, None)
+
+            if status == "COMPLETED":
+                vals = state_snapshot.values if state_snapshot else {}
+                telemetry_collector.on_run_completed(
+                    run_id=run_id,
+                    organization_id=effective_org,
+                    state_values=vals,
+                    duration_ms=duration_ms,
+                )
+
             return self._build_status_response(run_id, status, state_snapshot)
         except Exception as e:
+            duration_ms = (time.time() - t_resume) * 1000.0
             state_snapshot = self._try_get_state(config)
             with self._lock:
                 self._active_runs.pop(run_id, None)
                 self._run_errors[run_id] = str(e)
+
+            telemetry_collector.on_run_failed(
+                run_id=run_id,
+                organization_id=effective_org,
+                error_message=str(e),
+                duration_ms=duration_ms,
+            )
             return self._build_status_response(
                 run_id, "FAILED", state_snapshot, error_summary=str(e)
             )

@@ -10,6 +10,12 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      # Without this, TenantManager defaults to development mode and
+      # dev_auth_fallback=True, meaning bare X-User-ID/X-Organization-ID
+      # headers - or no headers at all - resolve to a real identity
+      # instead of being rejected. Never omit this on a real deployment.
+      - key: AUTH_MODE
+        value: production
       - key: GITHUB_TOKEN
         sync: false
       - key: OPENAI_API_KEY

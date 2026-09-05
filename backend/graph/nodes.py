@@ -3,6 +3,8 @@ from backend.schemas.routing import TaskType
 from backend.schemas.knowledge import KnowledgeAnswer
 from backend.schemas.planning import ExecutionPlan
 from backend.observability.telemetry import collect_usage, invoke_structured, merge_usage
+from backend.observability.collector import telemetry_collector
+from backend.schemas.telemetry import TelemetryEventType
 
 from backend.agents.router import route_task
 from backend.agents.planner import create_plan
@@ -15,6 +17,19 @@ from langgraph.types import interrupt
 
 def router_node(state: AgentState) -> dict:
     routing = route_task(state["user_message"])
+
+    run_id = state.get("run_id")
+    if run_id:
+        telemetry_collector.record_event(
+            run_id=run_id,
+            organization_id=state.get("organization_id", "default-org"),
+            event_type=TelemetryEventType.ROUTING_COMPLETED,
+            metadata={
+                "task_type": getattr(routing.task_type, "value", str(routing.task_type)),
+                "requires_planning": getattr(routing, "requires_planning", False),
+                "requires_knowledge": getattr(routing, "requires_knowledge", False),
+            },
+        )
 
     return {
         "routing": routing
@@ -129,6 +144,15 @@ def planner_node(state: AgentState) -> dict:
             state["user_message"],
             state["routing"],
             repo_evidence=repo_evidence,
+        )
+
+    run_id = state.get("run_id")
+    if run_id:
+        telemetry_collector.record_event(
+            run_id=run_id,
+            organization_id=state.get("organization_id", "default-org"),
+            event_type=TelemetryEventType.PLAN_CREATED,
+            metadata={"goal": plan.goal, "steps_count": len(plan.steps)},
         )
 
     return {
@@ -318,6 +342,15 @@ def knowledge_node(state: AgentState) -> dict:
         sufficient_context=is_sufficient,
     )
 
+    run_id = state.get("run_id")
+    if run_id:
+        telemetry_collector.record_event(
+            run_id=run_id,
+            organization_id=state.get("organization_id", "default-org"),
+            event_type=TelemetryEventType.RAG_COMPLETED,
+            metadata={"rag_status": rag_status, "docs_count": len(repo_context)},
+        )
+
     return {
         "knowledge": knowledge,
         "repo_context": repo_context,
@@ -464,6 +497,15 @@ Return a list of precise FilePatches. For each patch, provide the file path, the
                         print(f"Notice: could not write full file change: {e}")
 
 
+    run_id = state.get("run_id")
+    if run_id:
+        telemetry_collector.record_event(
+            run_id=run_id,
+            organization_id=state.get("organization_id", "default-org"),
+            event_type=TelemetryEventType.DEVELOPMENT_COMPLETED,
+            metadata={"patches_count": len(generated_patches)},
+        )
+
     return {
         "developer_result": developer_result,
         "plan": plan,
@@ -514,6 +556,18 @@ def qa_node(state: AgentState) -> dict:
         patches=patches,
         llm_qa_result=llm_qa_result,
     )
+
+    run_id = state.get("run_id")
+    if run_id:
+        telemetry_collector.record_event(
+            run_id=run_id,
+            organization_id=state.get("organization_id", "default-org"),
+            event_type=TelemetryEventType.QA_COMPLETED,
+            metadata={
+                "qa_status": getattr(qa_result, "status", None),
+                "summary": (getattr(qa_result, "summary", "") or "")[:100],
+            },
+        )
 
     return {
         "qa_result": qa_result,
@@ -695,6 +749,15 @@ def revision_node(state: AgentState) -> dict:
     )
     revision_history.add_attempt(attempt)
 
+    run_id = state.get("run_id")
+    if run_id:
+        telemetry_collector.record_event(
+            run_id=run_id,
+            organization_id=state.get("organization_id", "default-org"),
+            event_type=TelemetryEventType.REVISION_COMPLETED,
+            metadata={"revision_count": new_revision_count, "failure_category": failure_category},
+        )
+
     return {
         "developer_result": revised_result,
         "plan": plan,
@@ -823,6 +886,18 @@ def policy_node(state: AgentState) -> dict:
     approval_status = state.get("approval_status")
     if result.decision == PolicyDecision.BLOCK:
         approval_status = "POLICY_BLOCKED"
+
+    run_id = state.get("run_id")
+    if run_id:
+        telemetry_collector.record_event(
+            run_id=run_id,
+            organization_id=state.get("organization_id", "default-org"),
+            event_type=TelemetryEventType.POLICY_EVALUATED,
+            metadata={
+                "decision": getattr(result.decision, "value", str(result.decision)),
+                "risk_score": str(risk_score),
+            },
+        )
 
     return {
         "policy_result": result,
@@ -1022,8 +1097,18 @@ def git_commit_node(state: AgentState) -> dict:
         message=commit_message,
     )
 
+    status_val = "COMMITTED" if success else "COMMIT_FAILED"
+    run_id = state.get("run_id")
+    if run_id:
+        telemetry_collector.record_event(
+            run_id=run_id,
+            organization_id=state.get("organization_id", "default-org"),
+            event_type=TelemetryEventType.COMMIT_COMPLETED,
+            metadata={"status": status_val, "branch": git_diff.branch_name},
+        )
+
     return {
-        "approval_status": "COMMITTED" if success else "COMMIT_FAILED",
+        "approval_status": status_val,
     }
 
 

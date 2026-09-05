@@ -1,6 +1,6 @@
 import uuid
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Request, Response, status, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, Response, status, Depends, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -13,11 +13,22 @@ from backend.api.models import (
     PublishPRResponse,
     RunStatusResponse,
     ResumeRunRequest,
+    RunListResponse,
+    RunEventsResponse,
+    RunEvaluationRequest,
+    AnalyticsOverview,
+    QualityAnalytics,
+    ModelAnalytics,
+    FailureAnalytics,
+    EvaluationSummary,
 )
 from backend.graph.runner import AgentRunner
 from backend.schemas.qa import QAResult
 from backend.schemas.policy import PolicyEvaluationResult
 from backend.schemas.tenant import Permission, Role, TenantContext
+from backend.observability.store import telemetry_store
+from backend.observability.collector import telemetry_collector
+from backend.observability.evaluation import EvaluationEngine
 from backend.security.audit import AuditAction, audit_logger
 from backend.security.auth import (
     AuthenticationError,
@@ -194,11 +205,14 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
             )
 
         run_id = f"run_{uuid.uuid4().hex[:12]}"
-        runner_instance.register_run(
-            run_id=run_id,
-            metadata=request.metadata,
-            organization_id=effective_org,
-        )
+        try:
+            runner_instance.register_run(
+                run_id=run_id,
+                metadata=request.metadata,
+                organization_id=effective_org,
+            )
+        except PermissionError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         background_tasks.add_task(
             runner_instance.start_run,
             run_id=run_id,
@@ -228,6 +242,60 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
             status="RUNNING",
             message="Run dispatched successfully in background",
         )
+
+    @app.get(
+        "/api/v1/runs",
+        response_model=RunListResponse,
+        tags=["Runs"],
+        summary="List engineering runs for caller's organization",
+    )
+    def list_runs(
+        status_filter: Optional[str] = Query(None, alias="status"),
+        project_id: Optional[str] = Query(None),
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0),
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> RunListResponse:
+        if Permission.RUN_READ not in tenant_ctx.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: Role '{tenant_ctx.role.value}' lacks RUN_READ permission.",
+            )
+        runs = telemetry_store.list_runs(
+            organization_id=tenant_ctx.organization_id,
+            status=status_filter,
+            project_id=project_id,
+            limit=limit,
+            offset=offset,
+        )
+        return RunListResponse(
+            runs=runs,
+            total=len(runs),
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.get(
+        "/api/v1/runs/{run_id}/events",
+        response_model=RunEventsResponse,
+        tags=["Runs"],
+        summary="List chronological lifecycle events for an engineering run",
+    )
+    def get_run_events(
+        run_id: str,
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> RunEventsResponse:
+        if Permission.RUN_READ not in tenant_ctx.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: Role '{tenant_ctx.role.value}' lacks RUN_READ permission.",
+            )
+        events = telemetry_store.list_events(run_id=run_id, organization_id=tenant_ctx.organization_id)
+        if not events:
+            rec = telemetry_store.get_run(run_id, tenant_ctx.organization_id)
+            if not rec:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Run '{run_id}' not found.")
+        return RunEventsResponse(run_id=run_id, events=events)
 
     @app.get(
         "/api/v1/runs/{run_id}",
@@ -386,6 +454,8 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
                 status_code=status.HTTP_409_CONFLICT,
                 detail=str(e),
             )
+        except PermissionError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
     # -------------------------------------------------------------------------
     # Audit Logs API (v1)
@@ -607,6 +677,14 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
                 details={"pr_url": pr_res.pr_url, "run_id": run_id, "patch_hash": git_diff.patch_hash},
             )
 
+            telemetry_collector.on_pr_published(
+                run_id=run_id,
+                organization_id=tenant_ctx.organization_id,
+                pr_number=pr_res.pr_number,
+                pr_url=pr_res.pr_url,
+                is_draft=request.draft,
+            )
+
             return PublishPRResponse(
                 pr_number=pr_res.pr_number,
                 pr_url=pr_res.pr_url,
@@ -636,6 +714,114 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
         except GitHubApiError as e:
             audit_logger.log(tenant_ctx.organization_id, tenant_ctx.user_id, AuditAction.GITHUB_OPERATION_FAILED, "github", request.repo_full_name, {"error": e.code})
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"GITHUB_API_FAILURE: {str(e)}")
+
+    # -------------------------------------------------------------------------
+    # Analytics API (v1)
+    # -------------------------------------------------------------------------
+    @app.get(
+        "/api/v1/analytics/overview",
+        response_model=AnalyticsOverview,
+        tags=["Analytics"],
+        summary="Retrieve high-level run and cost analytics for tenant",
+    )
+    def get_analytics_overview(
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> AnalyticsOverview:
+        if Permission.RUN_READ not in tenant_ctx.permissions and Permission.AUDIT_READ not in tenant_ctx.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: Role '{tenant_ctx.role.value}' lacks RUN_READ or AUDIT_READ permission.",
+            )
+        return telemetry_store.get_overview(organization_id=tenant_ctx.organization_id)
+
+    @app.get(
+        "/api/v1/analytics/quality",
+        response_model=QualityAnalytics,
+        tags=["Analytics"],
+        summary="Retrieve QA, security, and revision quality analytics for tenant",
+    )
+    def get_quality_analytics(
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> QualityAnalytics:
+        if Permission.RUN_READ not in tenant_ctx.permissions and Permission.AUDIT_READ not in tenant_ctx.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: Role '{tenant_ctx.role.value}' lacks RUN_READ or AUDIT_READ permission.",
+            )
+        return telemetry_store.get_quality_analytics(organization_id=tenant_ctx.organization_id)
+
+    @app.get(
+        "/api/v1/analytics/models",
+        response_model=ModelAnalytics,
+        tags=["Analytics"],
+        summary="Retrieve provider and model token usage and cost analytics",
+    )
+    def get_model_analytics(
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> ModelAnalytics:
+        if Permission.RUN_READ not in tenant_ctx.permissions and Permission.AUDIT_READ not in tenant_ctx.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: Role '{tenant_ctx.role.value}' lacks RUN_READ or AUDIT_READ permission.",
+            )
+        return telemetry_store.get_model_analytics(organization_id=tenant_ctx.organization_id)
+
+    @app.get(
+        "/api/v1/analytics/failures",
+        response_model=FailureAnalytics,
+        tags=["Analytics"],
+        summary="Retrieve failure category distribution for tenant",
+    )
+    def get_failure_analytics(
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> FailureAnalytics:
+        if Permission.RUN_READ not in tenant_ctx.permissions and Permission.AUDIT_READ not in tenant_ctx.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: Role '{tenant_ctx.role.value}' lacks RUN_READ or AUDIT_READ permission.",
+            )
+        return telemetry_store.get_failure_analytics(organization_id=tenant_ctx.organization_id)
+
+    # -------------------------------------------------------------------------
+    # Evaluation Benchmark API (v1)
+    # -------------------------------------------------------------------------
+    @app.post(
+        "/api/v1/evaluation/run",
+        response_model=EvaluationSummary,
+        tags=["Evaluation"],
+        summary="Execute deterministic evaluation benchmark tasks under tenant boundaries",
+    )
+    def run_evaluation(
+        request: RunEvaluationRequest,
+        runner_instance: AgentRunner = Depends(get_agent_runner),
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> EvaluationSummary:
+        engine = EvaluationEngine(runner=runner_instance)
+        try:
+            return engine.run_benchmark(
+                tenant_ctx=tenant_ctx,
+                tasks=request.tasks,
+                model=request.model,
+                provider=request.provider,
+            )
+        except PermissionError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+    @app.get(
+        "/api/v1/evaluation/results",
+        response_model=List[EvaluationSummary],
+        tags=["Evaluation"],
+        summary="List past evaluation benchmark results for tenant",
+    )
+    def list_evaluations(
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> List[EvaluationSummary]:
+        if Permission.RUN_READ not in tenant_ctx.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: Role '{tenant_ctx.role.value}' lacks RUN_READ permission.",
+            )
+        return telemetry_store.list_evaluations(organization_id=tenant_ctx.organization_id)
 
     # -------------------------------------------------------------------------
     # Static Dashboard Mounting
