@@ -161,3 +161,10 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
 
 # Default application instance for uvicorn/ASGI entrypoints
 app = create_app()
+
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("backend.api.app:app", host="0.0.0.0", port=port, reload=False)

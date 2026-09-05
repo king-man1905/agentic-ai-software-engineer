@@ -1,4 +1,10 @@
-from backend.core.config import LLM_PROVIDER, LLM_MODEL_NAME, NVIDIA_API_KEY, GOOGLE_API_KEY
+from backend.core.config import (
+    LLM_PROVIDER,
+    LLM_MODEL_NAME,
+    NVIDIA_API_KEY,
+    GOOGLE_API_KEY,
+    validate_config,
+)
 
 # Fallback model per provider, used only when LLM_MODEL_NAME isn't set.
 # openai/gpt-oss-20b is the last NVIDIA-hosted model confirmed working
@@ -12,6 +18,7 @@ _DEFAULT_MODELS = {
 
 
 def get_llm():
+    validate_config()
     model = LLM_MODEL_NAME or _DEFAULT_MODELS.get(LLM_PROVIDER)
 
     if LLM_PROVIDER == "nvidia":
