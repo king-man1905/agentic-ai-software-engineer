@@ -14,6 +14,8 @@ from backend.graph.nodes import (
     route_after_knowledge,
     revision_node,
     git_prepare_node,
+    policy_node,
+    route_after_policy,
     approval_node,
     route_after_approval,
     git_commit_node,
@@ -55,6 +57,10 @@ builder.add_node(
 builder.add_node(
     "git_prepare",
     git_prepare_node
+)
+builder.add_node(
+    "policy",
+    policy_node
 )
 builder.add_node(
     "approval",
@@ -120,7 +126,16 @@ builder.add_conditional_edges(
 
 builder.add_edge(
     "git_prepare",
-    "approval"
+    "policy"
+)
+
+builder.add_conditional_edges(
+    "policy",
+    route_after_policy,
+    {
+        "approval": "approval",
+        "cleanup": "cleanup",
+    },
 )
 
 builder.add_conditional_edges(

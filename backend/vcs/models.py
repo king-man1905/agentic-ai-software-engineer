@@ -33,6 +33,10 @@ class GitDiffSummary(BaseModel):
         default_factory=list,
         description="Human-readable explanations for the risk assessment."
     )
+    patch_hash: str = Field(
+        default="",
+        description="SHA-256 cryptographic fingerprint of the unified diff."
+    )
 
     @property
     def is_no_op(self) -> bool:
@@ -54,4 +58,20 @@ class ApprovalDecision(BaseModel):
     rejection_reason: Optional[str] = Field(
         default=None,
         description="Reason for rejection, if the changes were not approved."
+    )
+    patch_hash: Optional[str] = Field(
+        default=None,
+        description="SHA-256 hash of the diff approved by the reviewer."
+    )
+    timestamp: Optional[str] = Field(
+        default=None,
+        description="ISO-8601 timestamp of approval submission."
+    )
+    reviewer_role: Optional[str] = Field(
+        default=None,
+        description="RBAC role of the reviewer (e.g. OWNER, ADMIN, REVIEWER, SECURITY_REVIEWER)."
+    )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="User identifier of the reviewer."
     )

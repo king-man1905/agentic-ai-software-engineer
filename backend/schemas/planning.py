@@ -14,6 +14,21 @@ class PlanStep(BaseModel):
         description="Agent responsible for performing this step."
     )
 
+    files: list[str] = Field(
+        default_factory=list,
+        description="Relevant or target files referenced in this step."
+    )
+
+    symbols: list[str] = Field(
+        default_factory=list,
+        description="Relevant or target symbols referenced in this step."
+    )
+
+    tests: list[str] = Field(
+        default_factory=list,
+        description="Relevant or target test files or cases referenced in this step."
+    )
+
 
 class ExecutionPlan(BaseModel):
     goal: str = Field(

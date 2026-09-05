@@ -36,12 +36,50 @@ def validate_command(cmd: List[str]):
                 raise PermissionError("Invalid python -m command syntax.")
 
 
-def get_sandbox_env() -> dict:
+import contextlib
+import shutil
+import tempfile
+
+
+SENSITIVE_ENV_SUBSTRINGS = [
+    "TOKEN",
+    "SECRET",
+    "KEY",
+    "PASSWORD",
+    "CREDENTIAL",
+    "PRIVATE",
+    "AUTH",
+]
+
+# Essential system/runtime environment variables permitted into the sandbox
+PERMITTED_SYS_VARS = {
+    "PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "TMPDIR",
+    "USER", "USERNAME", "HOME", "USERPROFILE",
+    "PYTHONPATH", "PYTHONHOME", "PYTHONIOENCODING", "PYTHONUTF8",
+    "VIRTUAL_ENV", "LANG", "LC_ALL", "LC_CTYPE",
+    "COMSPEC", "PATHEXT", "OS", "WINDIR", "APPDATA", "LOCALAPPDATA",
+    "ALLUSERSPROFILE", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+    "COMMONPROGRAMFILES", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+}
+
+
+def get_sandbox_env(allow_network: bool = False) -> dict:
     """
-    Retrieves execution env copy with active virtual environment's bin/Scripts directory
-    prepended to PATH.
+    Constructs a hardened, isolated environment for sandbox execution.
+    Strips host credentials, API keys, and secrets to ensure child processes
+    cannot access GitHub tokens, OpenAI/NVIDIA API keys, or cloud credentials.
     """
-    env = os.environ.copy()
+    env = {}
+
+    for k, v in os.environ.items():
+        k_upper = k.upper()
+        # Strictly exclude any variable containing sensitive markers
+        if any(sub in k_upper for sub in SENSITIVE_ENV_SUBSTRINGS):
+            continue
+
+        # Retain permitted system or runtime configuration
+        if k_upper in PERMITTED_SYS_VARS or k_upper.startswith("PYTEST"):
+            env[k] = v
 
     # Prepend virtual environment bin/Scripts directory to PATH
     venv_dir = sys.prefix
@@ -56,7 +94,26 @@ def get_sandbox_env() -> dict:
         path_sep = ";" if os.name == "nt" else ":"
         env["PATH"] = venv_bin + path_sep + env.get("PATH", "")
 
+    if not allow_network:
+        env["PIP_NO_INDEX"] = "1"
+        env["PIP_FIND_LINKS"] = ""
+
     return env
+
+
+@contextlib.contextmanager
+def isolated_workspace(source_dir: str):
+    """
+    Creates an ephemeral copy of a workspace directory for sandboxed test execution.
+    Automatically cleans up the temporary directory upon exit.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="agy_sandbox_")
+    try:
+        if os.path.exists(source_dir):
+            shutil.copytree(source_dir, temp_dir, dirs_exist_ok=True)
+        yield temp_dir
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def parse_pytest_summary(stdout: str) -> Tuple[int, int]:
@@ -124,11 +181,12 @@ class SandboxRunner:
         cmd: List[str],
         cwd: str,
         timeout: float = 30.0,
+        allow_network: bool = False,
     ) -> TestExecutionResult:
         # Validate command against the allowlist
         validate_command(cmd)
 
-        env = get_sandbox_env()
+        env = get_sandbox_env(allow_network=allow_network)
         start_time = time.time()
 
         try:

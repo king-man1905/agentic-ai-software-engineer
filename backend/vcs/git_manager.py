@@ -1,4 +1,5 @@
 import difflib
+import hashlib
 import os
 import subprocess
 import uuid
@@ -371,6 +372,69 @@ class GitWorkspaceManager:
             return False
 
 
+    @staticmethod
+    def compute_patch_hash(unified_diff: str) -> str:
+        """
+        Computes the SHA-256 cryptographic digest of the exact unified diff text.
+        Returns a deterministic 64-character hexadecimal string.
+        """
+        return hashlib.sha256((unified_diff or "").encode("utf-8")).hexdigest()
+
+    @classmethod
+    def verify_workspace_drift(
+        cls,
+        repo_path: str,
+        expected_diff: str,
+        expected_hash: str,
+        files_changed: List[str],
+    ) -> Tuple[bool, str]:
+        """
+        Verifies that the workspace has not drifted from the approved diff before committing.
+        Returns (is_valid, error_message).
+        """
+        if not expected_hash:
+            return True, ""
+
+        # Re-compute hash of expected_diff to ensure internal consistency
+        computed_expected = cls.compute_patch_hash(expected_diff)
+        if expected_hash != computed_expected:
+            return False, (
+                f"Stored patch_hash '{expected_hash}' does not match hash of expected diff '{computed_expected}'."
+            )
+
+        # If workspace does not exist, nothing to drift
+        repo = Path(repo_path)
+        if not repo.exists():
+            return True, ""
+
+        file_changes: Dict[str, Tuple[str, str]] = {}
+        has_baseline = False
+        for fpath in files_changed:
+            abs_path = repo / fpath
+            original = cls._read_head_content(repo_path, fpath)
+            if original:
+                has_baseline = True
+            current = ""
+            if abs_path.exists():
+                try:
+                    with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+                        current = f.read()
+                except Exception:
+                    pass
+            file_changes[fpath] = (original, current)
+
+        if has_baseline:
+            recalculated_diff, _, _ = cls.compute_diff(file_changes)
+            current_hash = cls.compute_patch_hash(recalculated_diff)
+
+            if current_hash != expected_hash:
+                return False, (
+                    f"Workspace drift detected: current diff hash '{current_hash}' "
+                    f"does not match approved patch hash '{expected_hash}'."
+                )
+
+        return True, ""
+
     @classmethod
     def prepare_diff_summary(
         cls,
@@ -383,7 +447,7 @@ class GitWorkspaceManager:
         1. Generate branch name
         2. Create feature branch (best-effort, non-blocking if git unavailable)
         3. Apply patches to workspace
-        4. Compute unified diff
+        4. Compute unified diff and cryptographic patch_hash
         5. Evaluate risk
         6. Return structured GitDiffSummary
         """
@@ -395,9 +459,10 @@ class GitWorkspaceManager:
         # Apply patches and collect before/after content
         file_changes = cls.apply_patches(repo_path, patches)
 
-        # Compute diff
+        # Compute diff and cryptographic hash
         files_changed = list(file_changes.keys())
         unified_diff, lines_added, lines_deleted = cls.compute_diff(file_changes)
+        patch_hash = cls.compute_patch_hash(unified_diff)
 
         # Evaluate risk
         risk_score, risk_reasons = cls.evaluate_risk(
@@ -410,6 +475,8 @@ class GitWorkspaceManager:
             lines_added=lines_added,
             lines_deleted=lines_deleted,
             unified_diff=unified_diff,
+            patch_hash=patch_hash,
             risk_score=risk_score,
             risk_reasons=risk_reasons,
         )
+

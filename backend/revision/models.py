@@ -26,6 +26,34 @@ class RevisionAttempt(BaseModel):
         default="",
         description="Diagnosis of why the failure occurred and targeted instructions for the fix."
     )
+    failed_check: Optional[str] = Field(
+        default=None,
+        description="Name of the check that triggered this revision, e.g. pytest, ast, security, ruff."
+    )
+    failure_category: str = Field(
+        default="TEST_FAILURE",
+        description="Structured category: AST_FAILURE, TEST_FAILURE, LINT_FAILURE, TYPECHECK_FAILURE, SECURITY_FAILURE, TIMEOUT, etc."
+    )
+    previous_patch_hash: Optional[str] = Field(
+        default=None,
+        description="Hash of the patch that failed quality checks."
+    )
+    new_patch_hash: Optional[str] = Field(
+        default=None,
+        description="Hash of the newly revised patch."
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="LLM model used for the revision attempt."
+    )
+    provider: Optional[str] = Field(
+        default=None,
+        description="LLM provider used for the revision attempt."
+    )
+    duration_seconds: float = Field(
+        default=0.0,
+        description="Duration of the revision iteration in seconds."
+    )
 
 
 class RevisionHistory(BaseModel):

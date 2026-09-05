@@ -1,6 +1,55 @@
 import ast
-from typing import List
-from backend.indexer.models import CodeChunk
+import hashlib
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from backend.indexer.models import CodeChunk, IndexingError, IndexingResult
+from backend.indexer.scanner import scan_repository
+
+
+def compute_sha256(content: str) -> str:
+    """Computes SHA-256 hex digest for a string content."""
+    return hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def path_to_module(file_path: str) -> str:
+    """Converts a relative file path to a Python module name."""
+    clean_path = file_path.replace("\\", "/").rstrip("/")
+    if clean_path.endswith(".py"):
+        clean_path = clean_path[:-3]
+    if clean_path.endswith("/__init__"):
+        clean_path = clean_path[:-9]
+    return clean_path.replace("/", ".")
+
+
+def is_test_path(file_path: str) -> bool:
+    """Checks if a file path is a test file."""
+    p = file_path.replace("\\", "/").lower()
+    return "/tests/" in p or p.startswith("tests/") or p.endswith("_test.py") or "/test_" in p or p.startswith("test_")
+
+
+def is_config_path(file_path: str) -> bool:
+    """Checks if a file path is a configuration file."""
+    p = file_path.replace("\\", "/").lower()
+    name = Path(p).name
+    return name in {"settings.py", "config.py", "constants.py", "conftest.py"} or p.endswith(".yaml") or p.endswith(".yml") or p.endswith(".json")
+
+
+def extract_imports(tree: ast.AST) -> List[str]:
+    """Extracts all import statements from an AST."""
+    imports = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    imports.append(f"import {alias.name} as {alias.asname}")
+                else:
+                    imports.append(f"import {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            mod = "." * node.level + (node.module or "")
+            names = ", ".join(alias.name if not alias.asname else f"{alias.name} as {alias.asname}" for alias in node.names)
+            imports.append(f"from {mod} import {names}")
+    return imports
 
 
 def fallback_chunk(
@@ -8,6 +57,7 @@ def fallback_chunk(
     file_path: str,
     chunk_size_lines: int = 100,
     overlap_lines: int = 10,
+    module: Optional[str] = None,
 ) -> List[CodeChunk]:
     """
     Fallback chunker that splits file content into line-based chunks.
@@ -16,6 +66,8 @@ def fallback_chunk(
     """
     lines = content.splitlines()
     total_lines = len(lines)
+    resolved_module = module or path_to_module(file_path)
+    sym_type = "test" if is_test_path(file_path) else ("config" if is_config_path(file_path) else "fallback")
 
     if total_lines == 0:
         return [
@@ -28,6 +80,9 @@ def fallback_chunk(
                 end_line=1,
                 docstring=None,
                 decorators=[],
+                module=resolved_module,
+                symbol_type=sym_type,
+                source_hash=compute_sha256(""),
             )
         ]
 
@@ -48,6 +103,9 @@ def fallback_chunk(
                 end_line=end,
                 docstring=None,
                 decorators=[],
+                module=resolved_module,
+                symbol_type=sym_type,
+                source_hash=compute_sha256(chunk_content),
             )
         )
 
@@ -55,7 +113,7 @@ def fallback_chunk(
             break
 
         start += chunk_size_lines - overlap_lines
-        if start >= end:  # Prevent infinite loop if overlap >= size
+        if start >= end:
             start = end
 
     return chunks
@@ -64,7 +122,7 @@ def fallback_chunk(
 def chunk_python_code(content: str, file_path: str) -> List[CodeChunk]:
     """
     Parses Python source code and extracts ClassDef, FunctionDef, and
-    AsyncFunctionDef symbols into AST-aware CodeChunks.
+    AsyncFunctionDef symbols into AST-aware CodeChunks with rich metadata.
     """
     try:
         tree = ast.parse(content)
@@ -73,39 +131,57 @@ def chunk_python_code(content: str, file_path: str) -> List[CodeChunk]:
 
     lines = content.splitlines()
     chunks = []
+    mod_name = path_to_module(file_path)
+    file_imports = extract_imports(tree)
+    is_test_file = is_test_path(file_path)
 
-    def traverse(node: ast.AST, current_scope: List[str]):
+    def traverse(node: ast.AST, current_scope: List[str], current_class: Optional[str] = None):
         is_class = isinstance(node, ast.ClassDef)
         is_func = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 
         if is_class or is_func:
             name = getattr(node, "name", "")
             qualified_name = ".".join(current_scope + [name])
+            parent_symbol = ".".join(current_scope) if current_scope else None
 
             if is_class:
                 chunk_type = "class"
+                symbol_type = "test" if (is_test_file or name.startswith("Test")) else "class"
+                class_name = name
+                func_name = None
             elif isinstance(node, ast.AsyncFunctionDef):
                 chunk_type = "async_function"
+                if is_test_file or name.startswith("test_"):
+                    symbol_type = "test"
+                elif current_class:
+                    symbol_type = "method"
+                else:
+                    symbol_type = "function"
+                class_name = current_class
+                func_name = name
             else:
                 chunk_type = "function"
+                if is_test_file or name.startswith("test_"):
+                    symbol_type = "test"
+                elif current_class:
+                    symbol_type = "method"
+                else:
+                    symbol_type = "function"
+                class_name = current_class
+                func_name = name
 
-            # Determine start line, adjusting for decorators if present
+            # Determine start line, adjusting for decorators
             start_line = node.lineno
             if hasattr(node, "decorator_list") and node.decorator_list:
                 start_line = min(dec.lineno for dec in node.decorator_list)
 
-            # Determine end line
             end_line = getattr(node, "end_lineno", node.lineno)
-
-            # Extract content lines
             s_idx = max(0, start_line - 1)
             e_idx = min(len(lines), end_line)
             chunk_content = "\n".join(lines[s_idx:e_idx])
 
-            # Get docstring
             docstring = ast.get_docstring(node)
 
-            # Get decorators
             decorators = []
             if hasattr(node, "decorator_list"):
                 for dec in node.decorator_list:
@@ -124,30 +200,45 @@ def chunk_python_code(content: str, file_path: str) -> List[CodeChunk]:
                     end_line=end_line,
                     docstring=docstring,
                     decorators=decorators,
+                    module=mod_name,
+                    symbol_type=symbol_type,
+                    class_name=class_name,
+                    function_name=func_name,
+                    parent_symbol=parent_symbol,
+                    imports=file_imports,
+                    source_hash=compute_sha256(chunk_content),
                 )
             )
+
             new_scope = current_scope + [name]
+            next_class = name if is_class else current_class
         else:
             new_scope = current_scope
+            next_class = current_class
 
-        # Traverse children recursively
         for child in ast.iter_child_nodes(node):
-            traverse(child, new_scope)
+            traverse(child, new_scope, next_class)
 
     traverse(tree, [])
     return chunks
 
 
-def chunk_file(absolute_path: str, relative_path: str) -> List[CodeChunk]:
+def chunk_file_with_error(
+    absolute_path: str, relative_path: str
+) -> Tuple[List[CodeChunk], Optional[IndexingError]]:
     """
-    Reads a file and chunks it. Routes to the AST chunker for Python files,
-    falling back to line-based chunking if there are syntax errors, the file
-    is non-Python, or no AST symbols are defined.
+    Reads a file and chunks it. If a syntax or reading error occurs, returns fallback
+    chunks along with a structured IndexingError so other files continue indexing safely.
     """
     try:
         with open(absolute_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
     except Exception as e:
+        err = IndexingError(
+            file_path=relative_path,
+            error_type="io_error",
+            message=f"Error reading file: {e}",
+        )
         return [
             CodeChunk(
                 file_path=relative_path,
@@ -158,22 +249,60 @@ def chunk_file(absolute_path: str, relative_path: str) -> List[CodeChunk]:
                 end_line=1,
                 docstring=None,
                 decorators=[],
+                module=path_to_module(relative_path),
+                symbol_type="fallback",
+                source_hash=compute_sha256(str(e)),
             )
-        ]
+        ], err
 
     # Non-Python files use fallback chunking
     if not absolute_path.lower().endswith(".py"):
-        return fallback_chunk(content, relative_path)
+        return fallback_chunk(content, relative_path), None
 
     # Python files: attempt AST parsing
     try:
         chunks = chunk_python_code(content, relative_path)
-    except (SyntaxError, ValueError):
-        # Syntax error fallback
-        return fallback_chunk(content, relative_path)
+        if not chunks:
+            return fallback_chunk(content, relative_path), None
+        return chunks, None
+    except (SyntaxError, ValueError) as e:
+        err = IndexingError(
+            file_path=relative_path,
+            error_type="syntax_error",
+            message=f"Syntax error during AST parse: {e}",
+            line_number=getattr(e, "lineno", None),
+        )
+        return fallback_chunk(content, relative_path), err
 
-    # Fallback to line-based if no class/function symbols are defined
-    if not chunks:
-        return fallback_chunk(content, relative_path)
 
+def chunk_file(absolute_path: str, relative_path: str) -> List[CodeChunk]:
+    """
+    Backward-compatible wrapper around chunk_file_with_error.
+    """
+    chunks, _ = chunk_file_with_error(absolute_path, relative_path)
     return chunks
+
+
+def index_repository(
+    project_path: str, max_size_kb: int = 500
+) -> IndexingResult:
+    """
+    Scans and indexes an entire repository directory with AST symbol extraction
+    and resilient error logging.
+    """
+    scanned_files = scan_repository(project_path, max_size_kb=max_size_kb)
+    all_chunks: List[CodeChunk] = []
+    errors: List[IndexingError] = []
+
+    for sf in scanned_files:
+        chunks, err = chunk_file_with_error(sf.absolute_path, sf.relative_path)
+        all_chunks.extend(chunks)
+        if err:
+            errors.append(err)
+
+    return IndexingResult(
+        chunks=all_chunks,
+        errors=errors,
+        total_files=len(scanned_files),
+        indexed_files=len(scanned_files) - len([e for e in errors if e.error_type == "io_error"]),
+    )

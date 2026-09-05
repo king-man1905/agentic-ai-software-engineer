@@ -1,3 +1,4 @@
+from typing import Any, Dict, Optional
 from backend.services.llm import get_llm
 from backend.observability.telemetry import invoke_structured
 from backend.schemas.planning import ExecutionPlan
@@ -6,10 +7,25 @@ from backend.schemas.routing import RoutingDecision
 
 def create_plan(
     user_message: str,
-    routing: RoutingDecision
+    routing: RoutingDecision,
+    repo_evidence: Optional[Dict[str, Any]] = None,
 ) -> ExecutionPlan:
 
     llm = get_llm()
+
+    evidence_block = ""
+    if repo_evidence:
+        files = repo_evidence.get("files") or []
+        symbols = repo_evidence.get("symbols") or []
+        tests = repo_evidence.get("tests") or []
+        evidence_block = f"""
+REPOSITORY EVIDENCE:
+Identified Target Files: {files}
+Identified Symbols: {symbols}
+Related Test Files: {tests}
+
+When available, ground each step by referencing verified files, symbols, and tests in its 'files', 'symbols', and 'tests' fields. Do not invent or force unverified references.
+"""
 
     prompt = f"""
 You are the Planner Agent of an Agentic AI Software Engineer.
@@ -23,7 +39,7 @@ USER REQUEST:
 ROUTING INFORMATION:
 Task type: {routing.task_type.value}
 Requires knowledge: {routing.requires_knowledge}
-
+{evidence_block}
 AVAILABLE EXECUTION AGENTS:
 
 Knowledge:

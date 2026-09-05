@@ -21,11 +21,114 @@ def router_node(state: AgentState) -> dict:
     }
 
 
+def format_categorized_context(chunks: list) -> str:
+    """
+    Groups retrieved CodeChunks into 5 structured sections:
+    PRIMARY IMPLEMENTATION, RELATED CODE, TESTS, DEPENDENCIES, CONFIGURATION.
+    """
+    from backend.indexer.ast_chunker import is_test_path, is_config_path
+
+    primary = []
+    related = []
+    tests = []
+    dependencies = []
+    configs = []
+
+    for chunk in chunks:
+        fp = chunk.file_path.replace("\\", "/").lower()
+        st = getattr(chunk, "symbol_type", "") or ""
+
+        # Collect dependencies from imports
+        if getattr(chunk, "imports", None):
+            for imp in chunk.imports:
+                if imp not in dependencies:
+                    dependencies.append(imp)
+
+        if st == "test" or is_test_path(fp):
+            tests.append(chunk)
+        elif st == "config" or is_config_path(fp):
+            configs.append(chunk)
+        elif chunk.symbol_name and st in {"class", "function", "method"}:
+            primary.append(chunk)
+        else:
+            related.append(chunk)
+
+    sections = []
+
+    if primary:
+        lines = ["[PRIMARY IMPLEMENTATION]"]
+        for c in primary:
+            sym = f" | SYMBOL: {c.symbol_name}" if c.symbol_name else ""
+            lines.append(f"FILE: {c.file_path} (Lines {c.start_line}-{c.end_line}){sym}")
+            lines.append(c.content)
+            lines.append("---")
+        sections.append("\n".join(lines))
+
+    if related:
+        lines = ["[RELATED CODE]"]
+        for c in related:
+            sym = f" | SYMBOL: {c.symbol_name}" if c.symbol_name else ""
+            lines.append(f"FILE: {c.file_path} (Lines {c.start_line}-{c.end_line}){sym}")
+            lines.append(c.content)
+            lines.append("---")
+        sections.append("\n".join(lines))
+
+    if tests:
+        lines = ["[TESTS]"]
+        for c in tests:
+            sym = f" | SYMBOL: {c.symbol_name}" if c.symbol_name else ""
+            lines.append(f"FILE: {c.file_path} (Lines {c.start_line}-{c.end_line}){sym}")
+            lines.append(c.content)
+            lines.append("---")
+        sections.append("\n".join(lines))
+
+    if dependencies:
+        lines = ["[DEPENDENCIES]"]
+        lines.extend(dependencies[:20])
+        lines.append("---")
+        sections.append("\n".join(lines))
+
+    if configs:
+        lines = ["[CONFIGURATION]"]
+        for c in configs:
+            lines.append(f"FILE: {c.file_path} (Lines {c.start_line}-{c.end_line})")
+            lines.append(c.content)
+            lines.append("---")
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
+
+
 def planner_node(state: AgentState) -> dict:
+    repo_context = state.get("repo_context")
+    repo_evidence = None
+    if repo_context:
+        repo_evidence = {
+            "files": list(dict.fromkeys(c.file_path for c in repo_context)),
+            "symbols": list(dict.fromkeys(c.symbol_name for c in repo_context if c.symbol_name)),
+            "tests": list(dict.fromkeys(c.file_path for c in repo_context if getattr(c, "symbol_type", "") == "test" or "test" in c.file_path.lower())),
+        }
+    elif state.get("project_id"):
+        import os
+        from pathlib import Path
+        project_path = Path("workspace") / state["project_id"]
+        if not project_path.exists():
+            project_path = Path(os.getcwd()) / "workspace" / state["project_id"]
+        if project_path.exists():
+            try:
+                from backend.indexer.scanner import scan_repository
+                scanned = scan_repository(str(project_path))
+                files = [sf.relative_path for sf in scanned]
+                tests = [f for f in files if "test" in f.lower()]
+                repo_evidence = {"files": files[:10], "symbols": [], "tests": tests[:5]}
+            except Exception:
+                pass
+
     with collect_usage() as usage:
         plan = create_plan(
             state["user_message"],
             state["routing"],
+            repo_evidence=repo_evidence,
         )
 
     return {
@@ -35,6 +138,9 @@ def planner_node(state: AgentState) -> dict:
 
 
 def knowledge_node(state: AgentState) -> dict:
+    import time
+    start_time = time.time()
+
     project_id = state.get("project_id")
 
     if not project_id:
@@ -45,6 +151,7 @@ def knowledge_node(state: AgentState) -> dict:
                 sufficient_context=False,
             ),
             "repo_context": [],
+            "rag_status": "RAG_INSUFFICIENT_CONTEXT",
         }
 
     try:
@@ -59,23 +166,24 @@ def knowledge_node(state: AgentState) -> dict:
             sufficient_context=False,
         )
 
-
     import os
     from pathlib import Path
     from backend.indexer.scanner import scan_repository
     from backend.indexer.ast_chunker import chunk_file
     from backend.indexer.retriever import SimpleBM25Index, HybridRetriever
     from backend.indexer.models import CodeChunk
+    from backend.rag.evaluator import RetrievalEvaluator, QueryRewriter
+    from backend.schemas.rag import RAGTelemetry, RAGStatus
 
     sparse_candidates = []
     project_path = Path("workspace") / project_id
     if not project_path.exists():
         project_path = Path(os.getcwd()) / "workspace" / project_id
 
+    all_chunks = []
     if project_path.exists():
         try:
             scanned_files = scan_repository(str(project_path))
-            all_chunks = []
             for sf in scanned_files:
                 chunks = chunk_file(sf.absolute_path, sf.relative_path)
                 all_chunks.extend(chunks)
@@ -95,14 +203,17 @@ def knowledge_node(state: AgentState) -> dict:
         for doc in docs:
             dense_candidates.append(
                 CodeChunk(
-                    file_path=doc.metadata.get("source", "unknown"),
-                    chunk_type="dense",
-                    symbol_name=None,
+                    file_path=doc.metadata.get("file") or doc.metadata.get("source", "unknown"),
+                    chunk_type=doc.metadata.get("symbol_type") or "dense",
+                    symbol_name=doc.metadata.get("symbol"),
                     content=doc.page_content,
-                    start_line=doc.metadata.get("start_line", 1),
-                    end_line=doc.metadata.get("end_line", 1),
+                    start_line=doc.metadata.get("line_start") or doc.metadata.get("start_line", 1),
+                    end_line=doc.metadata.get("line_end") or doc.metadata.get("end_line", 1),
                     docstring=None,
                     decorators=[],
+                    module=doc.metadata.get("module"),
+                    symbol_type=doc.metadata.get("symbol_type"),
+                    source_hash=doc.metadata.get("source_hash"),
                 )
             )
     except Exception as e:
@@ -115,10 +226,104 @@ def knowledge_node(state: AgentState) -> dict:
         top_k=4,
     )
     repo_context = [res.chunk for res in search_results]
+    scores = [res.score for res in search_results]
+
+    current_query = state["user_message"]
+    eval_result = RetrievalEvaluator.evaluate(
+        issue_text=state["user_message"],
+        query=current_query,
+        chunks=repo_context,
+        scores=scores,
+    )
+
+    query_rewrite = None
+    attempt = 1
+
+    # Bounded query rewriting if retrieval evaluation is INSUFFICIENT
+    if eval_result.status == "INSUFFICIENT":
+        rewritten = QueryRewriter.rewrite(
+            issue_text=state["user_message"],
+            current_query=current_query,
+            missing_context=eval_result.missing_context,
+            attempt=attempt,
+        )
+        if rewritten and rewritten != current_query:
+            query_rewrite = rewritten
+            attempt += 1
+            if all_chunks:
+                try:
+                    bm25 = SimpleBM25Index(all_chunks)
+                    sparse_pairs = bm25.search(rewritten, top_n=20)
+                    sparse_candidates = [pair[0] for pair in sparse_pairs]
+                except Exception:
+                    pass
+
+            try:
+                if 'vector_store' in locals():
+                    docs = vector_store.similarity_search(rewritten, k=20)
+                    dense_candidates = [
+                        CodeChunk(
+                            file_path=doc.metadata.get("file") or doc.metadata.get("source", "unknown"),
+                            chunk_type=doc.metadata.get("symbol_type") or "dense",
+                            symbol_name=doc.metadata.get("symbol"),
+                            content=doc.page_content,
+                            start_line=doc.metadata.get("line_start") or doc.metadata.get("start_line", 1),
+                            end_line=doc.metadata.get("line_end") or doc.metadata.get("end_line", 1),
+                            docstring=None,
+                            decorators=[],
+                        ) for doc in docs
+                    ]
+            except Exception:
+                pass
+
+            new_search_results = retriever.retrieve(
+                sparse_candidates=sparse_candidates,
+                dense_candidates=dense_candidates,
+                top_k=4,
+            )
+            if new_search_results:
+                repo_context = [res.chunk for res in new_search_results]
+                scores = [res.score for res in new_search_results]
+                eval_result = RetrievalEvaluator.evaluate(
+                    issue_text=state["user_message"],
+                    query=rewritten,
+                    chunks=repo_context,
+                    scores=scores,
+                )
+
+    rag_status = (
+        RAGStatus.RAG_INSUFFICIENT_CONTEXT.value
+        if eval_result.status == "INSUFFICIENT"
+        else RAGStatus.RAG_RETRIEVAL_SUCCESS.value
+    )
+
+    duration = round(time.time() - start_time, 3)
+    telemetry = RAGTelemetry(
+        retrieval_query=state["user_message"],
+        retrieval_attempt=attempt,
+        documents_retrieved=len(sparse_candidates) + len(dense_candidates),
+        scores=[round(s, 4) for s in scores],
+        selected_documents=[c.file_path for c in repo_context],
+        evaluation_status=eval_result.status,
+        evaluation_confidence=eval_result.confidence,
+        query_rewrite=query_rewrite,
+        missing_context=eval_result.missing_context,
+        retrieval_duration_seconds=duration,
+    )
+
+    is_sufficient = eval_result.status != "INSUFFICIENT"
+    knowledge = KnowledgeAnswer(
+        answer=knowledge.answer,
+        sources=list(dict.fromkeys(knowledge.sources + [c.file_path for c in repo_context])),
+        sufficient_context=is_sufficient,
+    )
 
     return {
         "knowledge": knowledge,
         "repo_context": repo_context,
+        "rag_evaluation": eval_result,
+        "rag_telemetry": telemetry,
+        "rag_status": rag_status,
     }
 
 
@@ -168,24 +373,23 @@ def developer_node(state: AgentState) -> dict:
         generated_patches = []
 
         if repo_context:
-            context_str = ""
-            for chunk in repo_context:
-                context_str += f"\nFILE: {chunk.file_path}\n"
-                if chunk.symbol_name:
-                    context_str += f"SYMBOL: {chunk.symbol_name}\n"
-                context_str += f"CONTENT:\n{chunk.content}\n---\n"
+            context_str = format_categorized_context(repo_context)
+            rag_eval = state.get("rag_evaluation")
+            context_warning = ""
+            if rag_eval and getattr(rag_eval, "status", None) == "INSUFFICIENT":
+                context_warning = "\nWARNING: Repository context is evaluated as INSUFFICIENT. Do not invent non-existent files or functions. Only modify verified code.\n"
 
             prompt = f"""
 You are the Developer Agent Patch Generator.
 Your task is to generate precise and safe code patches for the user request and execution plan.
-
+{context_warning}
 USER REQUEST:
 {state["user_message"]}
 
 EXECUTION PLAN:
 {plan.model_dump_json(indent=2)}
 
-REPOSITORY CONTEXT:
+STRUCTURED REPOSITORY CONTEXT:
 {context_str}
 
 Return a list of precise FilePatches. For each patch, provide the file path, the exact original code snippet to be replaced, and the updated code snippet.
@@ -277,7 +481,8 @@ def qa_node(state: AgentState) -> dict:
             success_criteria="Complete requested task directly.",
         )
 
-    qa_result = review_code_changes(
+    # 1. LLM Semantic Review
+    llm_qa_result = review_code_changes(
         user_request=state["user_message"],
         plan=plan,
         developer_result=state["developer_result"],
@@ -286,52 +491,29 @@ def qa_node(state: AgentState) -> dict:
     project_id = state.get("project_id", "test_project")
     import os
     from pathlib import Path
-    from backend.sandbox.runner import SandboxRunner
-    from backend.schemas.qa import QAIssue
+    from backend.qa.pipeline import QualityPipeline
+    from backend.qa.judge import StructuredQAJudge
 
     project_path = Path("workspace") / project_id
     if not project_path.exists():
         project_path = Path(os.getcwd()) / "workspace" / project_id
 
-    test_result = None
-    if project_path.exists():
-        try:
-            cmd = ["python", "-m", "pytest"]
-            test_result = SandboxRunner.run_command(cmd, cwd=str(project_path))
-        except Exception as e:
-            from backend.sandbox.models import TestExecutionResult
-            test_result = TestExecutionResult(
-                success=False,
-                exit_code=-1,
-                passed_count=0,
-                failed_count=0,
-                stdout="",
-                stderr=str(e),
-                duration_seconds=0.0,
-                error_summary=str(e),
-            )
+    patches = state.get("generated_patches") or []
 
-    if test_result:
-        # Fail the validation if test execution fails
-        # Exit code 5 is 'no tests collected' in pytest, which is not treated as a failure.
-        tests_passed = test_result.success or test_result.exit_code == 5
-        if not tests_passed:
-            qa_result.status = "FAIL"
-            qa_result.issues.append(
-                QAIssue(
-                    file_path="tests",
-                    issue=test_result.error_summary or "Pytest run failed.",
-                    severity="HIGH",
-                )
-            )
-            qa_result.summary = (
-                f"Test suite execution failed.\nError Summary: {test_result.error_summary}\n\n"
-                + qa_result.summary
-            )
-        elif test_result.success and test_result.failed_count == 0:
-            qa_result.status = "PASS"
+    # 2. Execute Multi-Check Quality Pipeline (AST, pytest, security, lint, typecheck)
+    checks, test_result = QualityPipeline.run_all(
+        repo_path=str(project_path),
+        patches=patches,
+        timeout=30.0,
+    )
 
-
+    # 3. Structured QA Judge Evaluation with Strict Objective Priority
+    qa_result = StructuredQAJudge.evaluate(
+        checks=checks,
+        test_result=test_result,
+        patches=patches,
+        llm_qa_result=llm_qa_result,
+    )
 
     return {
         "qa_result": qa_result,
@@ -392,11 +574,16 @@ def qa_router(state: AgentState) -> str:
 
 
 def revision_node(state: AgentState) -> dict:
+    import time
+    start_rev = time.time()
+
     from backend.agents.developer import revise_code_changes
     from backend.agents.revision import generate_revision_patches
     from backend.revision.models import RevisionAttempt, RevisionHistory
     from backend.revision.analyzer import ErrorTraceAnalyzer
     from backend.schemas.developer import DeveloperResult
+    from backend.vcs.git_manager import GitWorkspaceManager
+    from backend.core.config import LLM_MODEL_NAME, LLM_PROVIDER
 
     revision_count = state.get("revision_count", 0)
 
@@ -465,12 +652,32 @@ def revision_node(state: AgentState) -> dict:
             except Exception as e:
                 print(f"Revision patch generation notice: {e}")
 
-    # 7. Record this revision attempt
+    # 7. Record this revision attempt with structured telemetry
     new_revision_count = revision_count + 1
     applied_patch = generated_patches[0] if generated_patches else None
     diagnosis_summary = analysis.diagnosis or (
         qa_result.summary if qa_result else "Revision performed based on test feedback."
     )
+
+    # Identify failed check & category
+    failed_check = None
+    failure_category = getattr(qa_result, "failure_category", None) or "TEST_FAILURE"
+    if qa_result and getattr(qa_result, "checks", None):
+        failed_obj = next((c for c in qa_result.checks if c.status == "FAIL"), None)
+        if failed_obj:
+            failed_check = failed_obj.name
+
+    existing_patch = state.get("generated_patches", [None])[0] if state.get("generated_patches") else None
+    previous_patch_hash = state.get("patch_hash") or (
+        state.get("git_diff").patch_hash if state.get("git_diff") else None
+    ) or (
+        GitWorkspaceManager.compute_patch_hash(existing_patch.updated_code_snippet)
+        if existing_patch and existing_patch.updated_code_snippet else None
+    )
+
+    new_patch_hash = None
+    if applied_patch and applied_patch.updated_code_snippet:
+        new_patch_hash = GitWorkspaceManager.compute_patch_hash(applied_patch.updated_code_snippet)
 
     attempt = RevisionAttempt(
         attempt_number=new_revision_count,
@@ -478,6 +685,13 @@ def revision_node(state: AgentState) -> dict:
         error_traceback=analysis.error_traceback,
         applied_patch=applied_patch,
         diagnosis=diagnosis_summary,
+        failed_check=failed_check,
+        failure_category=failure_category,
+        previous_patch_hash=previous_patch_hash,
+        new_patch_hash=new_patch_hash,
+        model=LLM_MODEL_NAME or LLM_PROVIDER,
+        provider=LLM_PROVIDER,
+        duration_seconds=round(time.time() - start_rev, 2),
     )
     revision_history.add_attempt(attempt)
 
@@ -513,6 +727,7 @@ def git_prepare_node(state: AgentState) -> dict:
     if not patches or not project_path.exists():
         # No patches to stage or no workspace; produce an empty diff summary
         branch_name = GitWorkspaceManager.generate_branch_name(task_id)
+        empty_hash = GitWorkspaceManager.compute_patch_hash("")
         return {
             "git_diff": GitDiffSummary(
                 branch_name=branch_name,
@@ -520,9 +735,11 @@ def git_prepare_node(state: AgentState) -> dict:
                 lines_added=0,
                 lines_deleted=0,
                 unified_diff="",
+                patch_hash=empty_hash,
                 risk_score="LOW",
                 risk_reasons=["No file patches to apply."],
             ),
+            "patch_hash": empty_hash,
         }
 
     try:
@@ -533,37 +750,123 @@ def git_prepare_node(state: AgentState) -> dict:
         )
     except Exception as e:
         branch_name = GitWorkspaceManager.generate_branch_name(task_id)
+        empty_hash = GitWorkspaceManager.compute_patch_hash("")
         diff_summary = GitDiffSummary(
             branch_name=branch_name,
             files_changed=[p.file_path for p in patches],
             lines_added=0,
             lines_deleted=0,
             unified_diff="",
+            patch_hash=empty_hash,
             risk_score="MEDIUM",
             risk_reasons=[f"Diff preparation encountered an error: {e}"],
         )
 
     return {
         "git_diff": diff_summary,
+        "patch_hash": diff_summary.patch_hash,
     }
+
+
+def policy_node(state: AgentState) -> dict:
+    """
+    Evaluates organization policy on staged changes and test results
+    prior to Human-in-the-Loop approval gate and Git mutation.
+    """
+    from backend.policy.evaluator import PolicyEvaluator
+    from backend.schemas.policy import PolicyConfig, PolicyDecision
+
+    policy_config = state.get("policy_config")
+    if policy_config is None:
+        policy_config = PolicyConfig()
+
+    git_diff = state.get("git_diff")
+    qa_result = state.get("qa_result")
+    project_id = state.get("project_id")
+
+    changed_files = git_diff.files_changed if git_diff else []
+    lines_added = git_diff.lines_added if git_diff else 0
+    lines_deleted = git_diff.lines_deleted if git_diff else 0
+    risk_score = git_diff.risk_score if git_diff else "LOW"
+    risk_reasons = git_diff.risk_reasons if git_diff else []
+    branch_name = git_diff.branch_name if git_diff else None
+
+    result = PolicyEvaluator.evaluate(
+        policy=policy_config,
+        repository=project_id,
+        branch=branch_name,
+        changed_files=changed_files,
+        lines_added=lines_added,
+        lines_deleted=lines_deleted,
+        risk_score=risk_score,
+        risk_reasons=risk_reasons,
+        quality_results=qa_result,
+        revision_count=state.get("revision_count", 0),
+    )
+
+    failed_checks = []
+    if qa_result and getattr(qa_result, "checks", None):
+        failed_checks = [c.name for c in qa_result.checks if c.status == "FAIL"]
+
+    telemetry = PolicyEvaluator.create_telemetry(
+        result=result,
+        risk_score=risk_score,
+        repository=project_id,
+        branch=branch_name,
+        changed_files=changed_files,
+        lines_added=lines_added,
+        lines_deleted=lines_deleted,
+        required_checks=policy_config.required_quality_checks,
+        failed_checks=failed_checks,
+    )
+
+    approval_status = state.get("approval_status")
+    if result.decision == PolicyDecision.BLOCK:
+        approval_status = "POLICY_BLOCKED"
+
+    return {
+        "policy_result": result,
+        "policy_telemetry": telemetry,
+        "approval_status": approval_status,
+    }
+
+
+def route_after_policy(state: AgentState) -> str:
+    """
+    Routes after policy evaluation:
+    - If policy decision is BLOCK, route immediately to cleanup (prevents Git mutation).
+    - If policy decision is ALLOW or REVIEW, route to approval gate.
+    """
+    from backend.schemas.policy import PolicyDecision
+
+    policy_result = state.get("policy_result")
+    if policy_result and policy_result.decision == PolicyDecision.BLOCK:
+        return "cleanup"
+
+    return "approval"
 
 
 def approval_node(state: AgentState) -> dict:
     """
     Human-in-the-Loop approval gate. Pauses execution via LangGraph interrupt()
-    presenting the Git diff summary and risk assessment, then resumes with
-    an ApprovalDecision.
+    presenting the Git diff summary, cryptographic patch_hash, policy evaluation,
+    and risk assessment, then resumes with an ApprovalDecision bound to the patch hash.
     """
     from backend.vcs.models import ApprovalDecision
 
     git_diff = state.get("git_diff")
     developer_result = state.get("developer_result")
+    policy_result = state.get("policy_result")
+    patch_hash = git_diff.patch_hash if git_diff else ""
 
     interrupt_payload = {
         "task": "approval_required",
         "diff": git_diff.model_dump() if git_diff else None,
+        "patch_hash": patch_hash,
         "developer_result": developer_result.model_dump() if developer_result else None,
-        "message": "Review the proposed code changes, diff, and risk assessment.",
+        "policy": policy_result.model_dump() if policy_result else None,
+        "policy_decision": policy_result.decision.value if policy_result else None,
+        "message": "Review the proposed code changes, diff, policy compliance, and risk assessment.",
     }
 
     decision = interrupt(interrupt_payload)
@@ -579,18 +882,89 @@ def approval_node(state: AgentState) -> dict:
         rejection_reason = decision if isinstance(decision, str) else "Rejected by reviewer."
         approval = ApprovalDecision(approved=False, rejection_reason=rejection_reason)
 
+    # Cryptographic Approval Integrity Check:
+    # If the approval decision explicitly specifies a patch_hash and it does not match
+    # the staged diff's hash, mark approval invalid and reject publication.
+    if approval.approved and approval.patch_hash and patch_hash:
+        if approval.patch_hash != patch_hash:
+            approval = ApprovalDecision(
+                approved=False,
+                reviewer=approval.reviewer,
+                rejection_reason=(
+                    f"PATCH_HASH_MISMATCH: Approved diff hash '{approval.patch_hash}' "
+                    f"does not match staged diff hash '{patch_hash}'."
+                ),
+                patch_hash=approval.patch_hash,
+                timestamp=approval.timestamp,
+                reviewer_role=approval.reviewer_role,
+                user_id=approval.user_id,
+            )
+            return {
+                "approval": approval,
+                "approval_status": "PATCH_HASH_MISMATCH",
+            }
+
+    # RBAC Authorization Check:
+    if approval.approved and approval.reviewer_role:
+        from backend.schemas.tenant import Role
+        from backend.security.rbac import can_approve_changes
+
+        try:
+            role = Role(approval.reviewer_role)
+        except Exception:
+            role = None
+
+        if role is not None:
+            risk_val = None
+            if policy_result and hasattr(policy_result, "risk_score"):
+                risk_val = float(policy_result.risk_score)
+            elif git_diff and git_diff.risk_score:
+                if git_diff.risk_score.upper() == "HIGH":
+                    risk_val = 80.0
+                elif git_diff.risk_score.upper() == "MEDIUM":
+                    risk_val = 50.0
+                else:
+                    risk_val = 20.0
+
+            authorized, auth_reason = can_approve_changes(
+                role=role,
+                risk_score=risk_val,
+                is_security_sensitive=bool(
+                    policy_result and getattr(policy_result, "decision", None) == "REQUIRE_APPROVAL"
+                ),
+            )
+            if not authorized:
+                approval = ApprovalDecision(
+                    approved=False,
+                    reviewer=approval.reviewer,
+                    rejection_reason=f"APPROVAL_UNAUTHORIZED: {auth_reason}",
+                    patch_hash=approval.patch_hash,
+                    timestamp=approval.timestamp,
+                    reviewer_role=approval.reviewer_role,
+                    user_id=approval.user_id,
+                )
+                return {
+                    "approval": approval,
+                    "approval_status": "APPROVAL_UNAUTHORIZED",
+                }
+
+    status_label = "APPROVED" if approval.approved else "REJECTED"
     return {
         "approval": approval,
-        "approval_status": "APPROVED" if approval.approved else "REJECTED",
+        "approval_status": status_label,
     }
 
 
 def route_after_approval(state: AgentState) -> str:
     """
     Routes after human approval decision:
-    - approved -> git_commit
-    - rejected -> cleanup
+    - approved -> git_commit (provided policy decision is not BLOCK)
+    - rejected or policy blocked -> cleanup
     """
+    policy_result = state.get("policy_result")
+    if policy_result and getattr(policy_result, "decision", None) == "BLOCK":
+        return "cleanup"
+
     approval = state.get("approval")
     if approval is not None and approval.approved:
         return "git_commit"
@@ -603,6 +977,8 @@ def git_commit_node(state: AgentState) -> dict:
     Skips committing entirely when the diff is a no-op (no files actually
     changed) - e.g. the developer agent found nothing to fix - so an empty
     or junk commit is never pushed or turned into a PR.
+
+    Cryptographically validates workspace drift prior to commit.
     """
     from backend.vcs.git_manager import GitWorkspaceManager
     import os
@@ -619,13 +995,26 @@ def git_commit_node(state: AgentState) -> dict:
     if not project_path.exists():
         project_path = Path(os.getcwd()) / "workspace" / project_id
 
+    # Pre-commit drift and tamper verification:
+    # Ensure working tree diff still matches the approved patch_hash
+    if git_diff.patch_hash:
+        is_valid, drift_err = GitWorkspaceManager.verify_workspace_drift(
+            repo_path=str(project_path),
+            expected_diff=git_diff.unified_diff,
+            expected_hash=git_diff.patch_hash,
+            files_changed=git_diff.files_changed,
+        )
+        if not is_valid:
+            return {
+                "approval_status": "PATCH_HASH_MISMATCH",
+            }
+
     commit_message = f"agent: apply approved changes for {project_id}"
     developer_result = state.get("developer_result")
     if developer_result:
         commit_message = f"agent: {developer_result.summary[:80]}"
 
-    git_diff = state.get("git_diff")
-    if git_diff and git_diff.branch_name:
+    if git_diff.branch_name:
         GitWorkspaceManager.create_feature_branch(str(project_path), git_diff.branch_name)
 
     success = GitWorkspaceManager.stage_and_commit(
@@ -633,10 +1022,10 @@ def git_commit_node(state: AgentState) -> dict:
         message=commit_message,
     )
 
-
     return {
         "approval_status": "COMMITTED" if success else "COMMIT_FAILED",
     }
+
 
 
 def cleanup_node(state: AgentState) -> dict:

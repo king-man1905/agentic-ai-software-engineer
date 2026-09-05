@@ -26,6 +26,8 @@ def solve_issue_and_open_pr(
     draft: bool = True,
     runner: Optional[AgentRunner] = None,
     client: Optional[GitHubClient] = None,
+    organization_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Optional[GitHubPRResult]:
     """
     Ingests a GitHub issue, executes the agent workflow, and opens an
@@ -44,10 +46,16 @@ def solve_issue_and_open_pr(
         draft: Whether to open PR as a draft.
         runner: Optional injected AgentRunner instance (for testing).
         client: Optional injected GitHubClient instance (for testing).
+        organization_id: Optional tenant organization identifier for authorization.
+        user_id: Optional user identifier initiating the operation.
 
     Returns:
         GitHubPRResult if PR is created successfully, None otherwise.
     """
+    if organization_id:
+        from backend.security.tenant import tenant_manager
+        tenant_manager.authorize_repository_access(organization_id, repo, branch=base_branch)
+
     github_client = client or GitHubClient(token=token)
     agent_runner = runner or AgentRunner()
 
@@ -100,6 +108,8 @@ def solve_issue_and_open_pr(
         user_message=user_message,
         project_id=resolved_project_id,
         metadata={"github_repo": repo, "issue_number": issue_number},
+        organization_id=organization_id,
+        user_id=user_id,
     )
 
     git_diff = status_res.git_diff
@@ -107,7 +117,7 @@ def solve_issue_and_open_pr(
     metrics = None
 
     try:
-        state_values = agent_runner.get_state_values(run_id)
+        state_values = agent_runner.get_state_values(run_id, organization_id=organization_id)
         test_result = state_values.get("test_result")
         metrics = state_values.get("metrics")
         if not git_diff:
@@ -132,11 +142,13 @@ def solve_issue_and_open_pr(
                 approval_decision=ApprovalDecision(
                     approved=True,
                     reviewer="autonomous_github_bot",
+                    patch_hash=git_diff.patch_hash if git_diff else None,
                 ),
+                organization_id=organization_id,
             )
             print(f"[+] Post-approval status: {status_res.status}", flush=True)
             try:
-                state_values = agent_runner.get_state_values(run_id)
+                state_values = agent_runner.get_state_values(run_id, organization_id=organization_id)
                 if not git_diff:
                     git_diff = state_values.get("git_diff")
             except Exception:
@@ -208,6 +220,18 @@ def solve_issue_and_open_pr(
     )
 
     print(f"[+] Pull Request #{pr_result.pr_number} successfully opened: {pr_result.pr_url}", flush=True)
+
+    if organization_id:
+        from backend.security.audit import audit_logger, AuditAction
+        audit_logger.log(
+            organization_id=organization_id,
+            user_id=user_id or "github_bot",
+            action=AuditAction.PR_CREATED,
+            resource_type="github_pr",
+            resource_id=f"{repo}#{pr_result.pr_number}",
+            details={"pr_url": pr_result.pr_url, "run_id": run_id, "patch_hash": git_diff.patch_hash if git_diff else ""},
+        )
+
     return pr_result
 
 

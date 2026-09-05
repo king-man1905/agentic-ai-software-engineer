@@ -6,6 +6,7 @@ class TestExecutionResult(BaseModel):
     """
     Represents the structured outcome of running a test suite.
     """
+    __test__ = False
     success: bool = Field(description="Whether the command exited successfully (code 0).")
     exit_code: int = Field(description="Process exit code.")
     passed_count: int = Field(description="Number of passing test cases parsed from stdout.")

@@ -1,0 +1,66 @@
+from backend.schemas.tenant import (
+    Membership,
+    Organization,
+    Permission,
+    Repository,
+    Role,
+    TenantContext,
+    User,
+)
+from backend.security.audit import (
+    AuditAction,
+    AuditEvent,
+    AuditLogger,
+    audit_logger,
+    sanitize_audit_details,
+)
+from backend.security.auth import (
+    ApiKeyRecord,
+    AuthManager,
+    AuthMode,
+    AuthenticationError,
+    AuthenticationExpiredError,
+    AuthenticationInvalidError,
+    AuthenticationRequiredError,
+    RepositoryAccessDeniedError,
+    TenantAccessDeniedError,
+    auth_manager,
+)
+from backend.security.rbac import (
+    ROLE_PERMISSIONS,
+    can_approve_changes,
+    get_permissions,
+    has_permission,
+)
+from backend.security.tenant import TenantManager, tenant_manager
+
+__all__ = [
+    "Role",
+    "Permission",
+    "Organization",
+    "User",
+    "Membership",
+    "Repository",
+    "TenantContext",
+    "ROLE_PERMISSIONS",
+    "get_permissions",
+    "has_permission",
+    "can_approve_changes",
+    "TenantManager",
+    "tenant_manager",
+    "AuditAction",
+    "AuditEvent",
+    "AuditLogger",
+    "audit_logger",
+    "sanitize_audit_details",
+    "AuthMode",
+    "ApiKeyRecord",
+    "AuthManager",
+    "auth_manager",
+    "AuthenticationError",
+    "AuthenticationRequiredError",
+    "AuthenticationInvalidError",
+    "AuthenticationExpiredError",
+    "TenantAccessDeniedError",
+    "RepositoryAccessDeniedError",
+]

@@ -10,10 +10,61 @@ from backend.sandbox.models import TestExecutionResult
 from backend.vcs.models import GitDiffSummary
 
 
+class GitHubError(Exception):
+    """Base exception for structured GitHub integration failures."""
+    def __init__(self, message: str, code: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.status_code = status_code
+
+
+class GitHubAuthError(GitHubError, PermissionError, ValueError):
+    """Raised when GitHub authentication fails (bad or missing token)."""
+    def __init__(self, message: str = "GitHub API authentication failed.", status_code: int = 401):
+        super().__init__(message, code="GITHUB_AUTH_FAILURE", status_code=status_code)
+
+
+class GitHubPermissionError(GitHubError, PermissionError):
+    """Raised when GitHub permissions are insufficient."""
+    def __init__(self, message: str = "GitHub API permission denied.", status_code: int = 403):
+        super().__init__(message, code="GITHUB_PERMISSION_DENIED", status_code=status_code)
+
+
+class GitHubNotFoundError(GitHubError, FileNotFoundError):
+    """Raised when target repository or issue is not found."""
+    def __init__(self, message: str = "GitHub resource not found.", status_code: int = 404):
+        super().__init__(message, code="GITHUB_REPO_NOT_FOUND", status_code=status_code)
+
+
+class GitHubBranchConflictError(GitHubError):
+    """Raised when branch collision or merge conflict occurs."""
+    def __init__(self, message: str = "GitHub branch conflict.", status_code: int = 409):
+        super().__init__(message, code="GITHUB_BRANCH_CONFLICT", status_code=status_code)
+
+
+class GitHubRateLimitError(GitHubError, PermissionError):
+    """Raised when GitHub rate limits or secondary abuse limits are exceeded."""
+    def __init__(self, message: str = "GitHub API rate limit exceeded.", status_code: int = 429):
+        super().__init__(message, code="GITHUB_RATE_LIMIT", status_code=status_code)
+
+
+class GitHubApiError(GitHubError):
+    """Raised on internal GitHub service errors or network failures."""
+    def __init__(self, message: str = "GitHub API service error.", status_code: int = 500):
+        super().__init__(message, code="GITHUB_API_FAILURE", status_code=status_code)
+
+
+class GitHubPRCreationError(GitHubError, ValueError):
+    """Raised when PR payload is unprocessable or PR creation fails."""
+    def __init__(self, message: str = "GitHub PR creation unprocessable.", status_code: int = 422):
+        super().__init__(message, code="PR_CREATION_FAILURE", status_code=status_code)
+
+
 class GitHubClient:
     """
     Client for interacting with GitHub REST APIs (Issues, Pull Requests)
-    using httpx with structured error handling and PR formatting.
+    using httpx with structured error handling, token isolation, and PR formatting.
     """
 
     def __init__(
@@ -26,47 +77,63 @@ class GitHubClient:
         self.base_url = base_url.rstrip("/")
         self._client = http_client
 
-    def _get_headers(self) -> Dict[str, str]:
-        if not self.token:
-            raise ValueError(
+    def _get_headers(self, token_override: Optional[str] = None) -> Dict[str, str]:
+        active_token = token_override or self.token
+        if not active_token:
+            raise GitHubAuthError(
                 "GITHUB_TOKEN environment variable or token parameter is required."
             )
         return {
             "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {active_token}",
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-    def fetch_issue(self, repo_full_name: str, issue_number: int) -> GitHubIssuePayload:
+    def fetch_issue(
+        self,
+        repo_full_name: str,
+        issue_number: int,
+        token_override: Optional[str] = None,
+    ) -> GitHubIssuePayload:
         """
         Fetches an issue by repository and issue number.
-
-        Args:
-            repo_full_name: Repository in 'owner/repo' format.
-            issue_number: Issue number.
-
-        Returns:
-            GitHubIssuePayload with extracted issue metadata and labels.
-
-        Raises:
-            ValueError: If token is missing.
-            PermissionError: If unauthorized (401/403).
-            FileNotFoundError: If issue or repository is not found (404).
-            httpx.HTTPStatusError: On other HTTP failures.
         """
-        headers = self._get_headers()
+        headers = self._get_headers(token_override=token_override)
         url = f"{self.base_url}/repos/{repo_full_name}/issues/{issue_number}"
 
         client = self._client or httpx.Client(timeout=30.0)
         try:
             response = client.get(url, headers=headers)
-            if response.status_code in (401, 403):
-                raise PermissionError(
-                    f"GitHub API authorization failed ({response.status_code}): {response.text}"
+            if response.status_code == 401:
+                raise GitHubAuthError(
+                    f"GitHub API authorization failed (401): {response.text}",
+                    status_code=401,
+                )
+            if response.status_code == 403:
+                txt = response.text.lower()
+                if "rate limit" in txt or "secondary rate" in txt:
+                    raise GitHubRateLimitError(
+                        f"GitHub API rate limit exceeded (403): {response.text}",
+                        status_code=403,
+                    )
+                raise GitHubPermissionError(
+                    f"GitHub API authorization failed (403): {response.text}",
+                    status_code=403,
                 )
             if response.status_code == 404:
-                raise FileNotFoundError(
-                    f"Issue #{issue_number} in repository '{repo_full_name}' was not found (404)."
+                raise GitHubNotFoundError(
+                    f"Issue #{issue_number} in repository '{repo_full_name}' was not found (404).",
+                    status_code=404,
+                )
+            if response.status_code == 429:
+                raise GitHubRateLimitError(
+                    f"GitHub API rate limit exceeded (429): {response.text}",
+                    status_code=429,
+                )
+            if response.status_code >= 500:
+                raise GitHubApiError(
+                    f"GitHub API service error ({response.status_code}): {response.text}",
+                    status_code=response.status_code,
                 )
             response.raise_for_status()
 
@@ -98,28 +165,12 @@ class GitHubClient:
         head_branch: str,
         base_branch: str = "main",
         draft: bool = True,
+        token_override: Optional[str] = None,
     ) -> GitHubPRResult:
         """
         Creates a new Pull Request on the target repository.
-
-        Args:
-            repo_full_name: Repository in 'owner/repo' format.
-            title: Title of the pull request.
-            body: Pull request description.
-            head_branch: Head branch containing the changes.
-            base_branch: Base target branch to merge into.
-            draft: Whether the pull request is created in draft mode.
-
-        Returns:
-            GitHubPRResult with PR number, URL, and metadata.
-
-        Raises:
-            ValueError: If token is missing or request is unprocessable (422).
-            PermissionError: If unauthorized (401/403).
-            FileNotFoundError: If repository or head branch not found (404).
-            httpx.HTTPStatusError: On other HTTP failures.
         """
-        headers = self._get_headers()
+        headers = self._get_headers(token_override=token_override)
         url = f"{self.base_url}/repos/{repo_full_name}/pulls"
 
         payload = {
@@ -133,17 +184,46 @@ class GitHubClient:
         client = self._client or httpx.Client(timeout=30.0)
         try:
             response = client.post(url, headers=headers, json=payload)
-            if response.status_code in (401, 403):
-                raise PermissionError(
-                    f"GitHub API authorization failed ({response.status_code}): {response.text}"
+            if response.status_code == 401:
+                raise GitHubAuthError(
+                    f"GitHub API authorization failed (401): {response.text}",
+                    status_code=401,
+                )
+            if response.status_code == 403:
+                txt = response.text.lower()
+                if "rate limit" in txt or "secondary rate" in txt:
+                    raise GitHubRateLimitError(
+                        f"GitHub API rate limit exceeded (403): {response.text}",
+                        status_code=403,
+                    )
+                raise GitHubPermissionError(
+                    f"GitHub API authorization failed (403): {response.text}",
+                    status_code=403,
                 )
             if response.status_code == 404:
-                raise FileNotFoundError(
-                    f"Repository '{repo_full_name}' or branch '{head_branch}' was not found (404)."
+                raise GitHubNotFoundError(
+                    f"Repository '{repo_full_name}' or branch '{head_branch}' was not found (404).",
+                    status_code=404,
+                )
+            if response.status_code == 409:
+                raise GitHubBranchConflictError(
+                    f"GitHub branch conflict (409): {response.text}",
+                    status_code=409,
                 )
             if response.status_code == 422:
-                raise ValueError(
-                    f"GitHub PR creation unprocessable (422): {response.text}"
+                raise GitHubPRCreationError(
+                    f"GitHub PR creation unprocessable (422): {response.text}",
+                    status_code=422,
+                )
+            if response.status_code == 429:
+                raise GitHubRateLimitError(
+                    f"GitHub API rate limit exceeded (429): {response.text}",
+                    status_code=429,
+                )
+            if response.status_code >= 500:
+                raise GitHubApiError(
+                    f"GitHub API service error ({response.status_code}): {response.text}",
+                    status_code=response.status_code,
                 )
             response.raise_for_status()
 
