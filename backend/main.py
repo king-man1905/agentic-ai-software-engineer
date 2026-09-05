@@ -1,23 +1,8 @@
 """
 DEPRECATION NOTICE:
-===================
-This module (`backend/main.py`) contains legacy, synchronous endpoints from the early
-proof-of-concept phase and is retained solely for backward compatibility.
-
-For production execution, use the official API Gateway and Human-in-the-Loop (HITL)
-engine located at:
-    `backend.api.app:app` (defined in `backend/api/app.py`)
-
-Production features provided by `backend/api/app.py`:
-    - Asynchronous background task dispatch via `POST /api/v1/runs` (HTTP 202 Accepted)
-    - Full LangGraph state machine with durable checkpointer persistence
-    - HITL approval gate (`/api/v1/runs/{run_id}/resume`)
-    - Heuristic risk assessment and unified diff generation
-    - Built-in HITL Control Panel mounted at `/dashboard/`
-    - Structured correlation ID tracking (`X-Request-ID`)
-
-To run the production server:
-    uvicorn backend.api.app:app --reload --port 8000
+This is a legacy entrypoint from early development.
+The production, stateful LangGraph API gateway with Human-in-the-Loop (HITL) 
+governance is located at `backend/api/app.py`.
 """
 
 from fastapi import FastAPI

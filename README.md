@@ -6,7 +6,7 @@ Deterministic, stateful multi-agent pipeline with AST pre-flight checks, isolate
 ![LangGraph](https://img.shields.io/badge/orchestration-LangGraph-1c1c1c)
 ![FastAPI](https://img.shields.io/badge/api-FastAPI-009688)
 ![Tests](https://img.shields.io/badge/tests-165%20passed-brightgreen)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 
 ## Why this exists
 
