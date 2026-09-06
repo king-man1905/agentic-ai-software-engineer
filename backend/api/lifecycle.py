@@ -149,6 +149,20 @@ class LifecycleManager:
         if not git_ready:
             all_ok = False
 
+        # 6. Storage durability disclosure
+        from backend.core.config import is_demo_mode
+        demo = is_demo_mode()
+        checks["storage_durability"] = {
+            "ready": True,
+            "deployment_mode": "demo" if demo else "production",
+            "persistent": not demo,
+            "notice": (
+                "DEMO_EPHEMERAL_STORAGE: State is stored on ephemeral container filesystem and will not survive restarts."
+                if demo
+                else "DURABLE_STORAGE: Persistent storage attached."
+            ),
+        }
+
         uptime_seconds = (
             round(time.time() - self.startup_time, 2)
             if self.startup_time is not None
@@ -159,6 +173,7 @@ class LifecycleManager:
             "status": "ready" if all_ok else "not_ready",
             "is_ready": all_ok,
             "lifecycle_state": self._state.value,
+            "deployment_mode": "demo" if demo else "production",
             "uptime_seconds": uptime_seconds,
             "checks": checks,
         }

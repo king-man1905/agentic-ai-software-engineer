@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: agentic-ai-software-engineer-demo
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn backend.api.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    # =========================================================================
+    # RENDER FREE TIER DEMO CONFIGURATION
+    # =========================================================================
+    # 1. Render's free tier web services DO NOT support persistent disks.
+    #    Therefore, the 'disk:' declaration present in production render.yaml
+    #    is omitted here.
+    # 2. Ephemeral Storage Notice:
+    #    Checkpoints (workspace/checkpoints.db), telemetry (workspace/telemetry.db),
+    #    and idempotency records (workspace/idempotency.db) reside in the container's
+    #    local filesystem (/opt/render/project/src/workspace). These will reset
+    #    whenever the free tier container restarts, spins down after 15 minutes of
+    #    inactivity, or redeploys.
+    # 3. Security Invariants Preserved:
+    #    - AUTH_MODE=production enforces API key authentication (Bearer token).
+    #    - Tenant isolation, RBAC permissions, and HITL approval gates remain active.
+    #    - Policy checks, QA pipeline, and sandbox execution remain active.
+    #    - Secrets remain configured in the Render Dashboard (sync: false).
+    # =========================================================================
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DEPLOYMENT_MODE
+        value: demo
+      - key: AUTH_MODE
+        value: production
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        sync: false
+      - key: LLM_REQUEST_TIMEOUT_SECONDS
+        value: "60"

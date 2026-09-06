@@ -12,6 +12,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "60.0"))
 WORKSPACE_LOCK_TIMEOUT_SECONDS = float(os.getenv("WORKSPACE_LOCK_TIMEOUT_SECONDS", "30.0"))
 SHUTDOWN_DRAIN_TIMEOUT_SECONDS = float(os.getenv("SHUTDOWN_DRAIN_TIMEOUT_SECONDS", "30.0"))
+DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "production").strip().lower()
+
+
+def is_demo_mode() -> bool:
+    """Returns True ONLY when DEPLOYMENT_MODE is explicitly configured as 'demo'.
+    Production mode is the default and fails closed."""
+    return os.getenv("DEPLOYMENT_MODE", DEPLOYMENT_MODE).strip().lower() == "demo"
 
 
 def validate_config(provider: str | None = None):

@@ -225,7 +225,8 @@ class AgentRunner:
                 break
 
         e = last_error
-        if self._is_production_mode():
+        from backend.core.config import is_demo_mode
+        if self._is_production_mode() and not is_demo_mode():
             telemetry_collector.record_event(
                 run_id="system",
                 organization_id="system",
@@ -237,6 +238,8 @@ class AgentRunner:
         allow_volatile = os.getenv("ALLOW_VOLATILE_CHECKPOINTER", "false").lower() in ("true", "1")
         if allow_volatile:
             return MemorySaver()
+        if is_demo_mode():
+            raise RuntimeError(f"DEMO_CHECKPOINT_INIT_FAILED: {str(e)}") from e
         raise RuntimeError(f"CHECKPOINT_INIT_FAILED: {str(e)}") from e
 
     # ------------------------------------------------------------------
@@ -885,6 +888,16 @@ class AgentRunner:
             if isinstance(self._checkpointer, MemorySaver):
                 return True
             return False
+
+    @property
+    def is_ephemeral(self) -> bool:
+        """Returns True if the runner is operating in ephemeral storage mode (e.g. demo mode or in-memory)."""
+        from backend.core.config import is_demo_mode
+        return (
+            is_demo_mode()
+            or self._checkpoint_db_path == ":memory:"
+            or isinstance(self._checkpointer, MemorySaver)
+        )
 
     def drain(
         self,

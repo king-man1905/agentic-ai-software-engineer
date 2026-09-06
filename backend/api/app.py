@@ -254,11 +254,17 @@ def create_app(
     # -------------------------------------------------------------------------
     @app.get("/health", tags=["Health"])
     def health_check():
-        return {
+        from backend.core.config import is_demo_mode
+        demo = is_demo_mode()
+        data = {
             "status": "healthy",
             "service": "agentic-ai-software-engineer-api",
             "version": "1.0.0",
+            "deployment_mode": "demo" if demo else "production",
         }
+        if demo:
+            data["storage_notice"] = "DEMO_EPHEMERAL_STORAGE: Local persistence does not survive container restarts."
+        return data
 
     @app.get("/health/ready", tags=["Health"])
     def readiness_check(
