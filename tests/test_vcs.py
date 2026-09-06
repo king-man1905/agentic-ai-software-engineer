@@ -602,7 +602,9 @@ class TestGraphCompilation:
         Verify the full LangGraph StateGraph compiles successfully
         with all new nodes and edges.
         """
-        from backend.graph.graph import graph
+        from langgraph.checkpoint.memory import MemorySaver
+        from backend.graph.runner import _build_graph
+        graph = _build_graph(MemorySaver())
         assert graph is not None
 
         # Verify all node names exist in the compiled graph

@@ -8,18 +8,34 @@ from typing import Dict, List, Optional, Tuple
 
 from backend.developer.models import FilePatch
 from backend.developer.patcher import SafePatcher
+from backend.policy.patterns import (
+    DEPENDENCY_MANIFEST_PATTERNS,
+    CI_CD_PATTERNS,
+    INFRA_CONFIG_PATTERNS,
+)
 from backend.vcs.models import GitDiffSummary
 
 
-# File patterns that trigger elevated risk assessment
-HIGH_RISK_PATTERNS = [
-    ".env", ".env.", "alembic/", "migrations/", "migration/",
-    "docker-compose", "Dockerfile", "Makefile",
-    ".github/", ".gitlab-ci", "Jenkinsfile",
+# File patterns that trigger elevated risk assessment. Reuses the same
+# dependency-manifest/CI/infra-config patterns the policy engine recognizes
+# (backend/policy/patterns.py) instead of re-typing them, restricted to the
+# subset this heuristic has always flagged - the shared list is a superset
+# covering a few ecosystems (package-lock.json, Gemfile, pom.xml,
+# build.gradle, .circleci/, .travis.yml, azure-pipelines.yml, alembic.ini)
+# this risk heuristic never scored as elevated risk, and widening that
+# scope here is a policy-adjacent behavior change out of scope for this
+# refactor - plus two migration-path patterns unique to this module.
+_RISK_HEURISTIC_SUBSET = {
+    "requirements.txt", "package.json", "yarn.lock", "poetry.lock", "Pipfile",
     "setup.py", "setup.cfg", "pyproject.toml",
-    "requirements.txt", "package.json", "yarn.lock",
-    "poetry.lock", "Pipfile",
-]
+    ".github/", ".gitlab-ci", "Jenkinsfile",
+    "docker-compose", "Dockerfile", "Makefile", ".env", ".env.",
+}
+HIGH_RISK_PATTERNS = [
+    p
+    for p in DEPENDENCY_MANIFEST_PATTERNS + CI_CD_PATTERNS + INFRA_CONFIG_PATTERNS
+    if p in _RISK_HEURISTIC_SUBSET
+] + ["alembic/", "migrations/", "migration/"]
 
 CONFIG_EXTENSIONS = [
     ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".json",
@@ -33,6 +49,30 @@ def _git_env() -> Dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
     }
+
+
+def _run_git(
+    args: List[str],
+    repo_path: str,
+    check: bool = True,
+    timeout: float = 60,
+) -> subprocess.CompletedProcess:
+    """
+    Runs a `git` subprocess with the standard non-interactive environment,
+    capturing text output. Centralizes the invocation shape every git
+    operation in this module previously repeated individually - behavior
+    (env, timeout, capture_output, text mode) is unchanged, only the
+    repetition is removed.
+    """
+    return subprocess.run(
+        ["git"] + args,
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=check,
+        env=_git_env(),
+        timeout=timeout,
+    )
 
 
 class GitWorkspaceManager:
@@ -67,27 +107,11 @@ class GitWorkspaceManager:
         Returns True on success, False on failure.
         """
         try:
-            subprocess.run(
-                ["git", "checkout", "-b", branch_name],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=_git_env(),
-                timeout=60,
-            )
+            _run_git(["checkout", "-b", branch_name], repo_path)
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
             try:
-                subprocess.run(
-                    ["git", "checkout", branch_name],
-                    cwd=repo_path,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    env=_git_env(),
-                    timeout=60,
-                )
+                _run_git(["checkout", branch_name], repo_path)
                 return True
             except Exception:
                 return False
@@ -105,14 +129,7 @@ class GitWorkspaceManager:
         Returns "" if there's no commit history yet or the file is new.
         """
         try:
-            result = subprocess.run(
-                ["git", "show", f"HEAD:{file_path}"],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                env=_git_env(),
-                timeout=60,
-            )
+            result = _run_git(["show", f"HEAD:{file_path}"], repo_path, check=False)
             if result.returncode == 0:
                 return result.stdout
         except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -285,24 +302,8 @@ class GitWorkspaceManager:
         Stages all changes and creates a commit. Returns True on success.
         """
         try:
-            subprocess.run(
-                ["git", "add", "."],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=_git_env(),
-                timeout=60,
-            )
-            subprocess.run(
-                ["git", "commit", "-m", message],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=_git_env(),
-                timeout=60,
-            )
+            _run_git(["add", "."], repo_path)
+            _run_git(["commit", "-m", message], repo_path)
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
             return False
@@ -314,15 +315,7 @@ class GitWorkspaceManager:
         Returns True on success, False on failure.
         """
         try:
-            subprocess.run(
-                ["git", "push", "-u", remote, branch_name],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=_git_env(),
-                timeout=60,
-            )
+            _run_git(["push", "-u", remote, branch_name], repo_path)
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             if hasattr(e, "stderr") and e.stderr:
@@ -338,35 +331,12 @@ class GitWorkspaceManager:
         try:
             # Try 'main' first, fallback to 'master'
             fallback_branch = "main"
-            result = subprocess.run(
-                ["git", "rev-parse", "--verify", "main"],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                env=_git_env(),
-                timeout=60,
-            )
+            result = _run_git(["rev-parse", "--verify", "main"], repo_path, check=False)
             if result.returncode != 0:
                 fallback_branch = "master"
 
-            subprocess.run(
-                ["git", "checkout", fallback_branch],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=_git_env(),
-                timeout=60,
-            )
-            subprocess.run(
-                ["git", "branch", "-D", branch_name],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=_git_env(),
-                timeout=60,
-            )
+            _run_git(["checkout", fallback_branch], repo_path)
+            _run_git(["branch", "-D", branch_name], repo_path)
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
             return False

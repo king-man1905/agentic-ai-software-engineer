@@ -3,6 +3,7 @@ TelemetryCollector: High-level operational manager for telemetry ingestion and l
 Binds graph lifecycle checkpoints, node events, token accounting, and pricing to the persistent TelemetryStore.
 """
 
+import contextlib
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -16,6 +17,22 @@ from backend.schemas.telemetry import (
     TelemetryEvent,
     TelemetryEventType,
 )
+
+
+@contextlib.contextmanager
+def _telemetry_guard(warning: str):
+    """
+    Ensures a telemetry operation never raises out to its caller - every
+    on_* method below has always had this fail-safe contract (a telemetry
+    capture error must never crash the engineering run); this just removes
+    the repeated try/except/print boilerplate that enforced it individually
+    in each method. Prints the exact same "[Telemetry] Warning: ...: {e}"
+    message any given call site printed before this refactor.
+    """
+    try:
+        yield
+    except Exception as e:
+        print(f"[Telemetry] Warning: {warning}: {e}", flush=True)
 
 
 class TelemetryCollector:
@@ -81,7 +98,7 @@ class TelemetryCollector:
             user_message=user_message,
             status="QUEUED",
         )
-        try:
+        with _telemetry_guard("failed to record on_run_created"):
             self.store.create_or_update_run(record)
             self.record_event(
                 run_id=run_id,
@@ -89,8 +106,6 @@ class TelemetryCollector:
                 event_type=TelemetryEventType.RUN_CREATED,
                 metadata={"user_message": (user_message or "")[:100], "repository": effective_repo},
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed to record on_run_created: {e}", flush=True)
         return record
 
     def on_run_started(
@@ -104,7 +119,7 @@ class TelemetryCollector:
         """Called when graph execution commences in the background worker."""
         effective_org = self._resolve_org(run_id, organization_id, tenant_id)
         now_iso = datetime.now(timezone.utc).isoformat()
-        try:
+        with _telemetry_guard("failed to record on_run_started"):
             rec = self.store.get_run(run_id, effective_org)
             if not rec:
                 rec = self.on_run_created(
@@ -121,8 +136,6 @@ class TelemetryCollector:
                 organization_id=effective_org,
                 event_type=TelemetryEventType.RUN_STARTED,
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed to record on_run_started: {e}", flush=True)
 
     def on_node_started(
         self,
@@ -317,7 +330,7 @@ class TelemetryCollector:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Records an arbitrary ordered lifecycle event."""
-        try:
+        with _telemetry_guard(f"failed to record event {event_type}"):
             event = TelemetryEvent(
                 run_id=run_id,
                 organization_id=organization_id,
@@ -326,8 +339,6 @@ class TelemetryCollector:
                 safe_metadata=metadata or {},
             )
             self.store.record_event(event)
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed to record event {event_type}: {e}", flush=True)
 
     def on_approval_requested(
         self,
@@ -339,7 +350,7 @@ class TelemetryCollector:
     ) -> None:
         """Called when HITL interrupt is triggered prior to git_commit."""
         effective_org = self._resolve_org(run_id, organization_id, tenant_id)
-        try:
+        with _telemetry_guard("failed on_approval_requested"):
             rec = self.store.get_run(run_id, effective_org)
             if rec:
                 rec.status = "WAITING_APPROVAL"
@@ -355,8 +366,6 @@ class TelemetryCollector:
                 event_type=TelemetryEventType.APPROVAL_REQUESTED,
                 metadata={"patch_hash": patch_hash, "risk_score": risk_score},
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_approval_requested: {e}", flush=True)
 
     def on_waiting_approval(
         self,
@@ -379,7 +388,7 @@ class TelemetryCollector:
     ) -> None:
         """Called when a reviewer resumes a run."""
         effective_org = self._resolve_org(run_id, organization_id, tenant_id)
-        try:
+        with _telemetry_guard("failed on_approval_decision"):
             rec = self.store.get_run(run_id, effective_org)
             if rec:
                 rec.approval_status = "APPROVED" if approved else "REJECTED"
@@ -403,8 +412,6 @@ class TelemetryCollector:
                 duration_ms=latency_ms,
                 metadata={"reviewer": reviewer, "approved": approved},
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_approval_decision: {e}", flush=True)
 
     def on_run_completed(
         self,
@@ -420,7 +427,7 @@ class TelemetryCollector:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         state = state_values or {}
-        try:
+        with _telemetry_guard("failed on_run_completed"):
             rec = self.store.get_run(run_id, effective_org)
             if not rec:
                 rec = RunRecord(run_id=run_id, organization_id=effective_org)
@@ -500,8 +507,6 @@ class TelemetryCollector:
                     "total_cost": rec.estimated_total_cost,
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_run_completed: {e}", flush=True)
 
     def on_run_failed(
         self,
@@ -516,7 +521,7 @@ class TelemetryCollector:
         effective_org = self._resolve_org(run_id, organization_id, tenant_id)
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
-        try:
+        with _telemetry_guard("failed on_run_failed"):
             rec = self.store.get_run(run_id, effective_org)
             if not rec:
                 rec = RunRecord(run_id=run_id, organization_id=effective_org)
@@ -544,8 +549,6 @@ class TelemetryCollector:
                     "failure_category": rec.failure_category.value if rec.failure_category else None,
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_run_failed: {e}", flush=True)
 
     def on_pr_published(
         self,
@@ -558,7 +561,7 @@ class TelemetryCollector:
     ) -> None:
         """Called when a Pull Request is successfully published to GitHub."""
         effective_org = self._resolve_org(run_id, organization_id, tenant_id)
-        try:
+        with _telemetry_guard("failed on_pr_published"):
             rec = self.store.get_run(run_id, effective_org)
             if not rec:
                 # No RunRecord yet for this run_id (e.g. a run whose
@@ -579,8 +582,6 @@ class TelemetryCollector:
                 event_type=TelemetryEventType.PR_CREATED,
                 metadata={"pr_number": pr_number, "pr_url": pr_url, "is_draft": is_draft},
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_pr_published: {e}", flush=True)
 
     def on_provider_fallback(
         self,
@@ -597,7 +598,7 @@ class TelemetryCollector:
     ) -> None:
         """Emits structured PROVIDER_FALLBACK resilience event with sanitized metadata."""
         effective_org = self._resolve_org(run_id, organization_id, tenant_id)
-        try:
+        with _telemetry_guard("failed on_provider_fallback"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
@@ -615,8 +616,6 @@ class TelemetryCollector:
                     "model": model,
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_provider_fallback: {e}", flush=True)
 
     def on_workspace_lock_acquired(
         self,
@@ -627,7 +626,7 @@ class TelemetryCollector:
     ) -> None:
         """Records WORKSPACE_LOCK_ACQUIRED event with sanitized timing metadata."""
         effective_org = self._resolve_org(run_id, organization_id)
-        try:
+        with _telemetry_guard("failed on_workspace_lock_acquired"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
@@ -641,8 +640,6 @@ class TelemetryCollector:
                     "outcome": "ACQUIRED",
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_workspace_lock_acquired: {e}", flush=True)
 
     def on_workspace_lock_released(
         self,
@@ -653,7 +650,7 @@ class TelemetryCollector:
     ) -> None:
         """Records WORKSPACE_LOCK_RELEASED event with sanitized timing metadata."""
         effective_org = self._resolve_org(run_id, organization_id)
-        try:
+        with _telemetry_guard("failed on_workspace_lock_released"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
@@ -667,8 +664,6 @@ class TelemetryCollector:
                     "outcome": "RELEASED",
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_workspace_lock_released: {e}", flush=True)
 
     def on_workspace_lock_timeout(
         self,
@@ -679,7 +674,7 @@ class TelemetryCollector:
     ) -> None:
         """Records WORKSPACE_LOCK_TIMEOUT event with sanitized timing metadata."""
         effective_org = self._resolve_org(run_id, organization_id)
-        try:
+        with _telemetry_guard("failed on_workspace_lock_timeout"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
@@ -693,8 +688,6 @@ class TelemetryCollector:
                     "outcome": "TIMEOUT",
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_workspace_lock_timeout: {e}", flush=True)
 
     def on_idempotency_replay(
         self,
@@ -715,15 +708,13 @@ class TelemetryCollector:
         }
         if metadata:
             meta.update(metadata)
-        try:
+        with _telemetry_guard("failed on_idempotency_replay"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
                 event_type=TelemetryEventType.IDEMPOTENCY_REPLAY,
                 metadata=meta,
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_idempotency_replay: {e}", flush=True)
 
     def on_idempotency_conflict(
         self,
@@ -746,15 +737,13 @@ class TelemetryCollector:
         }
         if metadata:
             meta.update(metadata)
-        try:
+        with _telemetry_guard("failed on_idempotency_conflict"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
                 event_type=TelemetryEventType.IDEMPOTENCY_CONFLICT,
                 metadata=meta,
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_idempotency_conflict: {e}", flush=True)
 
     def on_pr_reconciled(
         self,
@@ -766,7 +755,7 @@ class TelemetryCollector:
     ) -> None:
         """Records PR_RECONCILIATION event when an existing PR is matched."""
         effective_org = self._resolve_org(run_id, organization_id)
-        try:
+        with _telemetry_guard("failed on_pr_reconciled"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
@@ -780,8 +769,6 @@ class TelemetryCollector:
                     "outcome": "RECONCILED",
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_pr_reconciled: {e}", flush=True)
 
     def classify_error(self, msg: str) -> FailureCategory:
         """Maps freeform or exception strings to standard FailureCategory."""
@@ -839,7 +826,7 @@ class TelemetryCollector:
     ) -> None:
         """Records RUN_CANCEL_REQUESTED - the request, not necessarily the outcome."""
         effective_org = self._resolve_org(run_id, organization_id)
-        try:
+        with _telemetry_guard("failed on_cancel_requested"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
@@ -851,8 +838,6 @@ class TelemetryCollector:
                     "reason": reason,
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_cancel_requested: {e}", flush=True)
 
     def on_run_cancelled(
         self,
@@ -863,7 +848,7 @@ class TelemetryCollector:
     ) -> None:
         """Records RUN_CANCELLED once execution has actually stopped."""
         effective_org = self._resolve_org(run_id, organization_id)
-        try:
+        with _telemetry_guard("failed on_run_cancelled"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
@@ -875,8 +860,6 @@ class TelemetryCollector:
                     "reason": reason,
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_run_cancelled: {e}", flush=True)
 
     def on_run_stuck(
         self,
@@ -889,7 +872,7 @@ class TelemetryCollector:
     ) -> None:
         """Records RUN_STUCK - an observation, not a mutation of the run."""
         effective_org = self._resolve_org(run_id, organization_id)
-        try:
+        with _telemetry_guard("failed on_run_stuck"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
@@ -903,8 +886,6 @@ class TelemetryCollector:
                     "threshold_seconds": threshold_seconds,
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_run_stuck: {e}", flush=True)
 
     def on_sandbox_cancelled(
         self,
@@ -914,7 +895,7 @@ class TelemetryCollector:
     ) -> None:
         """Records SANDBOX_CANCELLED when a sandbox subprocess was terminated for cancellation."""
         effective_org = self._resolve_org(run_id, organization_id)
-        try:
+        with _telemetry_guard("failed on_sandbox_cancelled"):
             self.record_event(
                 run_id=run_id,
                 organization_id=effective_org,
@@ -922,8 +903,6 @@ class TelemetryCollector:
                 duration_ms=round(duration_seconds * 1000.0, 2) if duration_seconds is not None else None,
                 metadata={"run_id": run_id, "organization_id": effective_org},
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_sandbox_cancelled: {e}", flush=True)
 
     def on_shutdown_started(
         self,
@@ -932,7 +911,7 @@ class TelemetryCollector:
         organization_id: str = "system",
     ) -> None:
         """Records SHUTDOWN_STARTED when graceful shutdown sequence commences."""
-        try:
+        with _telemetry_guard("failed on_shutdown_started"):
             self.record_event(
                 run_id="system_shutdown",
                 organization_id=organization_id,
@@ -942,8 +921,6 @@ class TelemetryCollector:
                     "drain_timeout_seconds": drain_timeout_seconds,
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_shutdown_started: {e}", flush=True)
 
     def on_shutdown_completed(
         self,
@@ -952,7 +929,7 @@ class TelemetryCollector:
         organization_id: str = "system",
     ) -> None:
         """Records SHUTDOWN_COMPLETED when graceful shutdown finishes successfully."""
-        try:
+        with _telemetry_guard("failed on_shutdown_completed"):
             self.record_event(
                 run_id="system_shutdown",
                 organization_id=organization_id,
@@ -963,8 +940,6 @@ class TelemetryCollector:
                     "duration_seconds": duration_seconds,
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_shutdown_completed: {e}", flush=True)
 
     def on_shutdown_interrupted(
         self,
@@ -973,7 +948,7 @@ class TelemetryCollector:
         organization_id: str = "system",
     ) -> None:
         """Records SHUTDOWN_INTERRUPTED if shutdown encounters an unhandled error or timeout."""
-        try:
+        with _telemetry_guard("failed on_shutdown_interrupted"):
             self.record_event(
                 run_id="system_shutdown",
                 organization_id=organization_id,
@@ -983,8 +958,6 @@ class TelemetryCollector:
                     "active_runs": active_runs,
                 },
             )
-        except Exception as e:
-            print(f"[Telemetry] Warning: failed on_shutdown_interrupted: {e}", flush=True)
 
 
 # Platform singleton collector

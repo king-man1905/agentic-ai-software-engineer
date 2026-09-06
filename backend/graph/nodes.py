@@ -185,18 +185,6 @@ def knowledge_node(state: AgentState) -> dict:
             "rag_status": "RAG_INSUFFICIENT_CONTEXT",
         }
 
-    try:
-        knowledge = answer_from_project(
-            project_id=project_id,
-            question=state["user_message"],
-        )
-    except Exception as e:
-        knowledge = KnowledgeAnswer(
-            answer=f"Vector store not indexed yet: {e}",
-            sources=[],
-            sufficient_context=False,
-        )
-
     import os
     from pathlib import Path
     from backend.indexer.scanner import scan_repository
@@ -226,6 +214,14 @@ def knowledge_node(state: AgentState) -> dict:
         except Exception as e:
             print(f"BM25 retrieval error: {e}")
 
+    # Dense retrieval is run once here (k=20, for hybrid BM25+dense fusion
+    # below) and its top results are handed to answer_from_project instead
+    # of it loading the same FAISS index and re-running the same query a
+    # second time. `docs` stays None (not just empty) if this attempt
+    # raises before assignment, so answer_from_project can tell "retrieval
+    # genuinely failed" apart from "retrieval succeeded with zero matches"
+    # and fall back to its own retrieval/error-handling accordingly.
+    docs = None
     dense_candidates = []
     try:
         from backend.rag.retriever import load_project_index
@@ -249,6 +245,19 @@ def knowledge_node(state: AgentState) -> dict:
             )
     except Exception as e:
         print(f"Vector search retrieval error: {e}")
+
+    try:
+        knowledge = answer_from_project(
+            project_id=project_id,
+            question=state["user_message"],
+            documents=docs,
+        )
+    except Exception as e:
+        knowledge = KnowledgeAnswer(
+            answer=f"Vector store not indexed yet: {e}",
+            sources=[],
+            sufficient_context=False,
+        )
 
     retriever = HybridRetriever()
     search_results = retriever.retrieve(

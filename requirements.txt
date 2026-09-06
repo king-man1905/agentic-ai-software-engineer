@@ -2,7 +2,6 @@ fastapi
 uvicorn[standard]
 httpx
 pydantic
-pydantic-settings
 python-dotenv
 langchain
 langchain-google-genai
@@ -13,6 +12,4 @@ langgraph
 langgraph-checkpoint-sqlite
 faiss-cpu
 pytest
-pandas
-sqlalchemy
 langchain-openai

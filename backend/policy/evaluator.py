@@ -7,6 +7,11 @@ from backend.policy.path_filter import (
     matches_protected_path,
     normalize_path,
 )
+from backend.policy.patterns import (
+    DEPENDENCY_MANIFEST_PATTERNS as DEPENDENCY_PATTERNS,
+    CI_CD_PATTERNS as CI_PATTERNS,
+    INFRA_CONFIG_PATTERNS as CONFIG_PATTERNS,
+)
 from backend.schemas.policy import (
     PolicyConfig,
     PolicyDecision,
@@ -15,41 +20,6 @@ from backend.schemas.policy import (
     PolicyTelemetry,
 )
 from backend.schemas.qa import QAResult
-
-
-DEPENDENCY_PATTERNS = [
-    "requirements.txt",
-    "package.json",
-    "package-lock.json",
-    "yarn.lock",
-    "Pipfile",
-    "Pipfile.lock",
-    "poetry.lock",
-    "pyproject.toml",
-    "setup.py",
-    "setup.cfg",
-    "Gemfile",
-    "pom.xml",
-    "build.gradle",
-]
-
-CI_PATTERNS = [
-    ".github/",
-    ".gitlab-ci",
-    "Jenkinsfile",
-    ".circleci/",
-    ".travis.yml",
-    "azure-pipelines.yml",
-]
-
-CONFIG_PATTERNS = [
-    "docker-compose",
-    "Dockerfile",
-    "Makefile",
-    ".env",
-    ".env.",
-    "alembic.ini",
-]
 
 
 class PolicyEvaluator:

@@ -1,3 +1,7 @@
+from typing import List, Optional
+
+from langchain_core.documents import Document
+
 from backend.services.llm import get_llm
 from backend.observability.telemetry import invoke_structured
 from backend.rag.retriever import retrieve_project_context
@@ -8,13 +12,24 @@ def answer_from_project(
     project_id: str,
     question: str,
     k: int = 4,
+    documents: Optional[List[Document]] = None,
 ) -> KnowledgeAnswer:
-
-    documents = retrieve_project_context(
-        project_id=project_id,
-        query=question,
-        k=k,
-    )
+    """
+    Answers a question using project context. If `documents` is already
+    available - e.g. the caller (knowledge_node) already ran its own dense
+    retrieval pass over the same project/query for hybrid search - it is
+    reused directly instead of loading the vector index and re-running an
+    identical similarity search a second time. Pass None (the default) to
+    have this function perform its own retrieval, as before.
+    """
+    if documents is None:
+        documents = retrieve_project_context(
+            project_id=project_id,
+            query=question,
+            k=k,
+        )
+    else:
+        documents = documents[:k]
 
     if not documents:
         return KnowledgeAnswer(
