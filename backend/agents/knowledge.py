@@ -1,4 +1,5 @@
 from backend.services.llm import get_llm
+from backend.observability.telemetry import invoke_structured
 from backend.rag.retriever import retrieve_project_context
 from backend.schemas.knowledge import KnowledgeAnswer
 
@@ -39,10 +40,6 @@ def answer_from_project(
 
     llm = get_llm()
 
-    structured_llm = llm.with_structured_output(
-        KnowledgeAnswer
-    )
-
     prompt = f"""
 You are the Knowledge Agent of an Agentic AI Software Engineer.
 
@@ -72,4 +69,4 @@ RULES:
 Return the structured answer.
 """
 
-    return structured_llm.invoke(prompt)
+    return invoke_structured(llm, KnowledgeAnswer, prompt)

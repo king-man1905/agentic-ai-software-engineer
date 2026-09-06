@@ -26,7 +26,24 @@ from backend.schemas.telemetry import (
     RunRecord,
     TelemetryEvent,
     TelemetryEventType,
+    TERMINAL_RUN_STATUSES,
+    WATCHDOG_TRACKED_STATUSES,
 )
+
+# Columns added after the original `runs` table shipped. CREATE TABLE IF NOT
+# EXISTS is a no-op against an existing table, so a real migration step is
+# needed for any store already on disk (e.g. workspace/telemetry.db from a
+# prior deployment) - not just for brand new ones.
+_CANCELLATION_COLUMNS = {
+    "cancel_requested": "INTEGER DEFAULT 0",
+    "cancellation_requested_at": "TEXT",
+    "cancellation_requested_by": "TEXT",
+    "cancellation_reason": "TEXT",
+    "cancelled_at": "TEXT",
+    "last_activity_at": "TEXT",
+    "current_phase": "TEXT",
+    "stuck_at": "TEXT",
+}
 
 
 class TelemetryStore:
@@ -46,12 +63,38 @@ class TelemetryStore:
         # RLock, not Lock: get_quality_analytics() calls get_rag_analytics()
         # while still holding the lock, which would self-deadlock a plain Lock.
         self._lock = threading.RLock()
+        self._closed = False
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("TelemetryStore is closed.")
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def close(self) -> None:
+        """Closes the telemetry store gracefully and idempotently."""
+        with self._lock:
+            self._closed = True
+
+    def reopen(self) -> None:
+        """Re-arms the telemetry store if closed."""
+        with self._lock:
+            self._closed = False
+
+    def is_ready(self) -> bool:
+        """Verifies database connectivity and readiness."""
+        with self._lock:
+            if self._closed:
+                return False
+        try:
+            with self._lock, self._get_conn() as conn:
+                cursor = conn.execute("SELECT 1;")
+                return cursor.fetchone() is not None
+        except Exception:
+            return False
 
     def _init_db(self) -> None:
         with self._lock, self._get_conn() as conn:
@@ -98,10 +141,19 @@ class TelemetryStore:
                     estimated_input_cost REAL,
                     estimated_output_cost REAL,
                     estimated_total_cost REAL,
-                    currency TEXT DEFAULT 'USD'
+                    currency TEXT DEFAULT 'USD',
+                    cancel_requested INTEGER DEFAULT 0,
+                    cancellation_requested_at TEXT,
+                    cancellation_requested_by TEXT,
+                    cancellation_reason TEXT,
+                    cancelled_at TEXT,
+                    last_activity_at TEXT,
+                    current_phase TEXT,
+                    stuck_at TEXT
                 );
                 """
             )
+            self._migrate_runs_table(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -125,11 +177,23 @@ class TelemetryStore:
                 );
                 """
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_stuck ON runs (status, stuck_at);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_org_created ON runs (organization_id, created_at);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_org_status ON runs (organization_id, status);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON events (run_id, timestamp);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_org ON events (organization_id, timestamp);")
             conn.commit()
+
+    def _migrate_runs_table(self, conn: sqlite3.Connection) -> None:
+        """Adds any cancellation/watchdog columns missing from an existing
+        `runs` table (e.g. a telemetry.db created before Phase 8 Step 5).
+        CREATE TABLE IF NOT EXISTS alone would silently skip these on a
+        pre-existing table."""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(runs);").fetchall()}
+        for column, decl in _CANCELLATION_COLUMNS.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {decl};")
+        conn.commit()
 
     def reset(self) -> None:
         """Clears all records for clean test isolation."""
@@ -160,7 +224,9 @@ class TelemetryStore:
                     approval_latency_ms, approval_reviewer, approval_decision,
                     patch_hash, commit_status, github_status,
                     pr_status, pr_url, pr_number, input_tokens, output_tokens, total_tokens,
-                    estimated_input_cost, estimated_output_cost, estimated_total_cost, currency
+                    estimated_input_cost, estimated_output_cost, estimated_total_cost, currency,
+                    cancel_requested, cancellation_requested_at, cancellation_requested_by,
+                    cancellation_reason, cancelled_at, last_activity_at, current_phase, stuck_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?,
@@ -170,7 +236,8 @@ class TelemetryStore:
                     ?, ?, ?,
                     ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?
+                    ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(run_id) DO UPDATE SET
                     organization_id=excluded.organization_id,
@@ -210,7 +277,15 @@ class TelemetryStore:
                     estimated_input_cost=coalesce(excluded.estimated_input_cost, runs.estimated_input_cost),
                     estimated_output_cost=coalesce(excluded.estimated_output_cost, runs.estimated_output_cost),
                     estimated_total_cost=coalesce(excluded.estimated_total_cost, runs.estimated_total_cost),
-                    currency=excluded.currency;
+                    currency=excluded.currency,
+                    cancel_requested=max(excluded.cancel_requested, runs.cancel_requested),
+                    cancellation_requested_at=coalesce(excluded.cancellation_requested_at, runs.cancellation_requested_at),
+                    cancellation_requested_by=coalesce(excluded.cancellation_requested_by, runs.cancellation_requested_by),
+                    cancellation_reason=coalesce(excluded.cancellation_reason, runs.cancellation_reason),
+                    cancelled_at=coalesce(excluded.cancelled_at, runs.cancelled_at),
+                    last_activity_at=coalesce(excluded.last_activity_at, runs.last_activity_at),
+                    current_phase=coalesce(excluded.current_phase, runs.current_phase),
+                    stuck_at=coalesce(excluded.stuck_at, runs.stuck_at);
                 """,
                 (
                     record.run_id, record.organization_id, record.user_id, record.repository, record.branch, sanitized_msg,
@@ -222,6 +297,8 @@ class TelemetryStore:
                     record.patch_hash, record.commit_status, record.github_status,
                     record.pr_status, record.pr_url, record.pr_number, record.input_tokens, record.output_tokens, record.total_tokens,
                     record.estimated_input_cost, record.estimated_output_cost, record.estimated_total_cost, record.currency,
+                    1 if record.cancel_requested else 0, record.cancellation_requested_at, record.cancellation_requested_by,
+                    record.cancellation_reason, record.cancelled_at, record.last_activity_at, record.current_phase, record.stuck_at,
                 ),
             )
             conn.commit()
@@ -271,7 +348,176 @@ class TelemetryStore:
     def _row_to_run_record(self, row: sqlite3.Row) -> RunRecord:
         d = dict(row)
         d["approval_required"] = bool(d.get("approval_required", 0))
+        d["cancel_requested"] = bool(d.get("cancel_requested", 0))
         return RunRecord(**d)
+
+    # =========================================================================
+    # Cancellation (Phase 8 Step 5)
+    # =========================================================================
+    #
+    # All transitions here are single, atomic SQLite UPDATE statements with a
+    # WHERE clause that only matches rows in the expected state - the
+    # equivalent of a compare-and-swap. `cursor.rowcount` tells the caller
+    # whether *this* call actually made the change, which is what makes it
+    # safe for concurrent callers (two API requests, or two watchdog
+    # instances) to race on the same run without a separate lock: only one
+    # UPDATE can ever match and mutate the row.
+
+    def request_cancellation(
+        self,
+        run_id: str,
+        organization_id: Optional[str],
+        reason: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> str:
+        """
+        Atomically requests cancellation of a run. Returns one of:
+          "REQUESTED"         - this call recorded the request
+          "ALREADY_CANCELLED" - the run was already CANCELLED (idempotent)
+          "ALREADY_TERMINAL"  - the run already finished in some other way
+          "NOT_FOUND"         - no such run for this organization
+        Never overwrites a run that's already in a terminal state, and never
+        requests cancellation twice for the same already-cancelled run.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._get_conn() as conn:
+            existing = self._get_run_row(conn, run_id, organization_id)
+            if not existing:
+                return "NOT_FOUND"
+            if existing["status"] == "CANCELLED":
+                return "ALREADY_CANCELLED"
+            if existing["status"] in TERMINAL_RUN_STATUSES:
+                return "ALREADY_TERMINAL"
+
+            # WAITING_APPROVAL has no in-flight execution to wait for -
+            # cancellation is immediate. Actively executing states move to
+            # CANCELLING and rely on cooperative checks to finalize it.
+            new_status = "CANCELLED" if existing["status"] == "WAITING_APPROVAL" else "CANCELLING"
+            cursor = conn.execute(
+                """
+                UPDATE runs SET
+                    cancel_requested = 1,
+                    cancellation_requested_at = ?,
+                    cancellation_requested_by = ?,
+                    cancellation_reason = ?,
+                    status = ?,
+                    cancelled_at = CASE WHEN ? = 'CANCELLED' THEN ? ELSE cancelled_at END
+                WHERE run_id = ? AND organization_id = ? AND cancel_requested = 0
+                  AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'BLOCKED');
+                """,
+                (
+                    now_iso, actor, reason, new_status,
+                    new_status, now_iso,
+                    run_id, existing["organization_id"],
+                ),
+            )
+            conn.commit()
+            return "REQUESTED" if cursor.rowcount > 0 else "ALREADY_TERMINAL"
+
+    def mark_cancelled(self, run_id: str, organization_id: Optional[str]) -> bool:
+        """
+        Finalizes a run as CANCELLED once execution has actually stopped.
+        Returns True only if this call performed the transition (guards
+        against a run that raced to COMPLETED/FAILED in the meantime -
+        the final status must reflect what truly happened, never a lie).
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._get_conn() as conn:
+            existing = self._get_run_row(conn, run_id, organization_id)
+            if not existing:
+                return False
+            cursor = conn.execute(
+                """
+                UPDATE runs SET status = 'CANCELLED', cancelled_at = ?
+                WHERE run_id = ? AND organization_id = ?
+                  AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'BLOCKED');
+                """,
+                (now_iso, run_id, existing["organization_id"]),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def is_cancel_requested(self, run_id: str, organization_id: Optional[str] = None) -> bool:
+        """Cheap read for cooperative cancellation checks inside graph nodes."""
+        with self._lock, self._get_conn() as conn:
+            row = self._get_run_row(conn, run_id, organization_id)
+            return bool(row and (row["cancel_requested"] or row["status"] == "CANCELLED"))
+
+    def is_cancelled(self, run_id: str, organization_id: Optional[str] = None) -> bool:
+        with self._lock, self._get_conn() as conn:
+            row = self._get_run_row(conn, run_id, organization_id)
+            return bool(row and row["status"] == "CANCELLED")
+
+    def update_activity(
+        self,
+        run_id: str,
+        organization_id: Optional[str],
+        phase: Optional[str] = None,
+    ) -> None:
+        """
+        Records a heartbeat at a meaningful lifecycle boundary (node
+        started/completed, revision, approval, git op, sandbox run) so the
+        watchdog can distinguish a genuinely stuck run from a slow-but-active
+        one. Intentionally not called on every tiny internal operation.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._get_conn() as conn:
+            if organization_id:
+                conn.execute(
+                    "UPDATE runs SET last_activity_at = ?, current_phase = coalesce(?, current_phase) "
+                    "WHERE run_id = ? AND organization_id = ?;",
+                    (now_iso, phase, run_id, organization_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE runs SET last_activity_at = ?, current_phase = coalesce(?, current_phase) "
+                    "WHERE run_id = ?;",
+                    (now_iso, phase, run_id),
+                )
+            conn.commit()
+
+    def mark_stuck(self, run_id: str, organization_id: Optional[str]) -> bool:
+        """
+        Atomically flags a run as stuck. Returns True only for the caller
+        that actually wins the race - if two watchdog instances (or two
+        passes) both observe the same stale run, only one UPDATE can match
+        `stuck_at IS NULL`, so only one proceeds to emit telemetry / request
+        cancellation.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._get_conn() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET stuck_at = ? WHERE run_id = ? AND organization_id = ? AND stuck_at IS NULL;",
+                (now_iso, run_id, organization_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def list_active_runs(self) -> List[RunRecord]:
+        """
+        Cross-tenant listing of runs in a non-terminal, watchdog-relevant
+        state. Internal/system use only (the watchdog) - never expose this
+        through the tenant-scoped API, which always filters by
+        organization_id.
+        """
+        placeholders = ",".join("?" for _ in WATCHDOG_TRACKED_STATUSES)
+        with self._lock, self._get_conn() as conn:
+            cursor = conn.execute(
+                f"SELECT * FROM runs WHERE status IN ({placeholders});",
+                tuple(WATCHDOG_TRACKED_STATUSES),
+            )
+            return [self._row_to_run_record(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _get_run_row(conn: sqlite3.Connection, run_id: str, organization_id: Optional[str]) -> Optional[sqlite3.Row]:
+        if organization_id:
+            cursor = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ? AND organization_id = ?;",
+                (run_id, organization_id),
+            )
+        else:
+            cursor = conn.execute("SELECT * FROM runs WHERE run_id = ?;", (run_id,))
+        return cursor.fetchone()
 
     # =========================================================================
     # Event Log

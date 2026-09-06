@@ -103,6 +103,21 @@ def merge_usage(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Dic
     }
 
 
+_current_run_context: "contextvars.ContextVar[Optional[Dict[str, str]]]" = contextvars.ContextVar(
+    "_current_run_context", default=None
+)
+
+
+@contextmanager
+def run_context(run_id: str, organization_id: str = "default-org"):
+    """Context manager setting active run_id and organization_id for LLM and resilience telemetry."""
+    token = _current_run_context.set({"run_id": run_id, "organization_id": organization_id})
+    try:
+        yield
+    finally:
+        _current_run_context.reset(token)
+
+
 @contextmanager
 def collect_usage():
     """
@@ -116,16 +131,36 @@ def collect_usage():
         _current_usage.reset(token)
 
 
-def invoke_structured(llm, schema, prompt: str) -> Any:
+def _infer_provider(llm: Any) -> str:
+    """Infers provider identifier from client attributes or class name."""
+    if hasattr(llm, "_provider") and getattr(llm, "_provider"):
+        return str(getattr(llm, "_provider")).lower()
+    if hasattr(llm, "provider") and getattr(llm, "provider"):
+        return str(getattr(llm, "provider")).lower()
+    cls_name = type(llm).__name__.lower()
+    if "nvidia" in cls_name:
+        return "nvidia"
+    if "google" in cls_name or "gemini" in cls_name:
+        return "gemini"
+    if "openai" in cls_name:
+        return "openai"
+    from backend.core.config import LLM_PROVIDER
+    return (LLM_PROVIDER or "nvidia").lower()
+
+
+def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
     """
-    Invokes `llm` for structured `schema` output, same as
-    `llm.with_structured_output(schema).invoke(prompt)`, except it also
-    records token usage (into whatever `collect_usage()` block is active,
-    if any) before returning just the parsed result. Preserves the original
-    fail-fast behavior: a parsing failure still raises.
+    Performs the structured output invocation against a single provider instance.
+    Records token usage into the active collect_usage() block if present.
     """
     import time
     import re
+    from backend.services.errors import (
+        classify_llm_exception,
+        LLMAuthenticationError,
+        LLMInvalidRequestError,
+        LLMTimeoutError,
+    )
 
     model_name = getattr(llm, "model", None) or getattr(llm, "model_name", "unknown")
     schema_name = getattr(schema, "__name__", str(schema))
@@ -153,7 +188,6 @@ def invoke_structured(llm, schema, prompt: str) -> Any:
                 else:
                     raise inner_exc
 
-
             if isinstance(result, dict):
                 if result.get("parsing_error") is not None:
                     raise result["parsing_error"]
@@ -167,6 +201,9 @@ def invoke_structured(llm, schema, prompt: str) -> Any:
                             collector.update(merge_usage(collector, call_usage))
                     print(f"[LLM] Response received in {time.time()-t0:.2f}s", flush=True)
                     return result["parsed"]
+            elif result is not None:
+                print(f"[LLM] Response received in {time.time()-t0:.2f}s", flush=True)
+                return result
 
             # Direct fallback if with_structured_output produced None or failed
             raw = llm.invoke(prompt)
@@ -199,13 +236,16 @@ def invoke_structured(llm, schema, prompt: str) -> Any:
                 return schema.model_validate_json(conv_res.content)
             return conv_res.content
 
-
-
         except Exception as e:
-            if ("429" in str(e) or "Too Many Requests" in str(e)) and attempt < 4:
-                time.sleep(2 * (attempt + 1))
+            # Fast fail on non-retriable exceptions
+            classified = classify_llm_exception(e)
+            if isinstance(classified, (LLMAuthenticationError, LLMInvalidRequestError, LLMTimeoutError)):
+                raise classified
+
+            if ("429" in str(e) or "Too Many Requests" in str(e)) and attempt < 2:
+                time.sleep(1 * (attempt + 1))
                 continue
-            if ("guided_json" in str(e) or "[400]" in str(e)) and attempt < 4:
+            if ("guided_json" in str(e) or "[400]" in str(e)) and attempt < 2:
                 try:
                     raw = llm.invoke(prompt)
                     match = re.search(r"\{.*\}", raw.content, re.DOTALL)
@@ -213,5 +253,123 @@ def invoke_structured(llm, schema, prompt: str) -> Any:
                         return schema.model_validate_json(match.group(0))
                 except Exception:
                     pass
-            raise
+            raise classified
+
+
+def invoke_structured(
+    llm: Any,
+    schema: Any,
+    prompt: str,
+    run_id: Optional[str] = None,
+    organization_id: Optional[str] = None,
+) -> Any:
+    """
+    Invokes `llm` for structured `schema` output with bounded request timeout,
+    token telemetry recording, structured error classification, and bounded safe provider fallback.
+
+    Maximum provider attempts: 2 (Primary -> Fallback -> Structured Error).
+    Fallback is ONLY allowed for explicitly classified transient failures and timeouts.
+    Authentication errors, invalid requests, and policy/schema failures NEVER trigger fallback.
+    """
+    import time
+    from backend.services.errors import (
+        classify_llm_exception,
+        is_fallback_eligible,
+        LLMTimeoutError,
+        LLMRateLimitError,
+    )
+    from backend.services.llm import get_llm, get_fallback_provider
+    from backend.observability.collector import telemetry_collector
+
+    primary_provider = _infer_provider(llm)
+    t0 = time.time()
+
+    # Attempt 1: Primary Provider
+    try:
+        return _invoke_single_provider(llm, schema, prompt)
+    except Exception as primary_exc:
+        elapsed_ms = (time.time() - t0) * 1000.0
+        classified_primary = classify_llm_exception(primary_exc, provider=primary_provider)
+        classified_primary.elapsed_ms = elapsed_ms
+
+        # Check fallback eligibility (ONLY transient / timeout / rate limit)
+        if not is_fallback_eligible(classified_primary):
+            print(
+                f"[LLM] Primary provider '{primary_provider}' failed with non-transient error: "
+                f"{type(classified_primary).__name__}. Failing closed immediately without fallback.",
+                flush=True,
+            )
+            raise classified_primary
+
+        fallback_provider = get_fallback_provider(primary=primary_provider)
+        if not fallback_provider or fallback_provider == primary_provider:
+            print(
+                f"[LLM] Primary provider '{primary_provider}' failed with {type(classified_primary).__name__}, "
+                f"but no alternative fallback provider is configured. Failing closed.",
+                flush=True,
+            )
+            raise classified_primary
+
+        # Resolve tenant/run context for sanitized resilience telemetry
+        run_ctx = _current_run_context.get() or {}
+        effective_run_id = run_id or run_ctx.get("run_id", "adhoc-run")
+        effective_org_id = organization_id or run_ctx.get("organization_id", "default-org")
+
+        if isinstance(classified_primary, LLMTimeoutError):
+            failure_cat = "LLM_TIMEOUT"
+        elif isinstance(classified_primary, LLMRateLimitError):
+            failure_cat = "LLM_RATE_LIMIT"
+        else:
+            failure_cat = "LLM_TRANSIENT_FAILURE"
+
+        # Emit PROVIDER_FALLBACK resilience event (Attempt 1 -> Attempt 2)
+        telemetry_collector.on_provider_fallback(
+            run_id=effective_run_id,
+            organization_id=effective_org_id,
+            primary_provider=primary_provider,
+            fallback_provider=fallback_provider,
+            failure_category=failure_cat,
+            failure_type=type(classified_primary).__name__,
+            attempt_number=1,
+            elapsed_ms=elapsed_ms,
+            model=getattr(llm, "model", None) or getattr(llm, "model_name", None),
+        )
+
+        print(
+            f"[LLM] SAFE PROVIDER FALLBACK: Primary provider '{primary_provider}' failed with "
+            f"{type(classified_primary).__name__} after {elapsed_ms:.1f}ms. "
+            f"Switching to fallback provider '{fallback_provider}' (attempt 2 of 2)...",
+            flush=True,
+        )
+
+        # Attempt 2: Fallback Provider
+        try:
+            fallback_llm = get_llm(provider=fallback_provider)
+        except Exception as init_exc:
+            print(
+                f"[LLM] Failed to initialize fallback provider '{fallback_provider}': {init_exc}. "
+                f"Total provider attempts exhausted.",
+                flush=True,
+            )
+            raise classified_primary
+
+        t1 = time.time()
+        try:
+            result = _invoke_single_provider(fallback_llm, schema, prompt)
+            print(
+                f"[LLM] Fallback provider '{fallback_provider}' succeeded in {time.time()-t1:.2f}s.",
+                flush=True,
+            )
+            return result
+        except Exception as fallback_exc:
+            fb_elapsed_ms = (time.time() - t1) * 1000.0
+            classified_fallback = classify_llm_exception(fallback_exc, provider=fallback_provider)
+            classified_fallback.elapsed_ms = fb_elapsed_ms
+            print(
+                f"[LLM] Fallback provider '{fallback_provider}' also failed with "
+                f"{type(classified_fallback).__name__}. Maximum provider attempts (2) reached. "
+                f"Raising final structured error.",
+                flush=True,
+            )
+            raise classified_fallback
 

@@ -246,13 +246,24 @@ class TestHITLLifecycleWithAPI:
         assert final_get.status_code == 200
         assert final_get.json()["status"] == "COMPLETED"
 
-        # 5. Attempting to resume already completed run returns 409 Conflict
-        conflict_resp = client.post(
+        # 5. Resuming an already-completed run with the SAME decision is now
+        # an idempotent replay (Phase 8 Step 4), not a 409 - a client retry
+        # after a dropped response must not error just because the first
+        # attempt actually succeeded.
+        replay_resp = client.post(
             f"/api/v1/runs/{run_id}/resume",
             json={"approved": True},
         )
+        assert replay_resp.status_code == 200
+        assert replay_resp.json()["status"] == "COMPLETED"
+
+        # 6. A *different* decision on that same completed run is still a
+        # genuine conflict, not silently accepted as a replay.
+        conflict_resp = client.post(
+            f"/api/v1/runs/{run_id}/resume",
+            json={"approved": False, "rejection_reason": "changed my mind"},
+        )
         assert conflict_resp.status_code == 409
-        assert "not awaiting approval" in conflict_resp.json()["detail"]
 
     def test_full_hitl_rejection_lifecycle(self, client_and_runner):
         client, runner = client_and_runner

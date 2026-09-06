@@ -560,12 +560,18 @@ class TelemetryCollector:
         effective_org = self._resolve_org(run_id, organization_id, tenant_id)
         try:
             rec = self.store.get_run(run_id, effective_org)
-            if rec:
-                rec.pr_status = "PUBLISHED"
-                rec.pr_number = pr_number
-                rec.pr_url = pr_url
-                rec.github_status = "SUCCESS"
-                self.store.create_or_update_run(rec)
+            if not rec:
+                # No RunRecord yet for this run_id (e.g. a run whose
+                # creation telemetry was never recorded, or a caller that
+                # publishes a PR for a run created outside this collector).
+                # Create one rather than silently dropping the PR status -
+                # a later idempotency check reading this run must see it.
+                rec = RunRecord(run_id=run_id, organization_id=effective_org)
+            rec.pr_status = "PUBLISHED"
+            rec.pr_number = pr_number
+            rec.pr_url = pr_url
+            rec.github_status = "SUCCESS"
+            self.store.create_or_update_run(rec)
 
             self.record_event(
                 run_id=run_id,
@@ -576,6 +582,207 @@ class TelemetryCollector:
         except Exception as e:
             print(f"[Telemetry] Warning: failed on_pr_published: {e}", flush=True)
 
+    def on_provider_fallback(
+        self,
+        run_id: str,
+        organization_id: str = "default-org",
+        primary_provider: str = "",
+        fallback_provider: str = "",
+        failure_category: str = "LLM_TIMEOUT",
+        failure_type: str = "",
+        attempt_number: int = 1,
+        elapsed_ms: float = 0.0,
+        model: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> None:
+        """Emits structured PROVIDER_FALLBACK resilience event with sanitized metadata."""
+        effective_org = self._resolve_org(run_id, organization_id, tenant_id)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.PROVIDER_FALLBACK,
+                duration_ms=elapsed_ms,
+                metadata={
+                    "run_id": run_id,
+                    "organization_id": effective_org,
+                    "primary_provider": primary_provider,
+                    "fallback_provider": fallback_provider,
+                    "failure_category": failure_category,
+                    "failure_type": failure_type,
+                    "attempt_number": attempt_number,
+                    "elapsed_ms": elapsed_ms,
+                    "model": model,
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_provider_fallback: {e}", flush=True)
+
+    def on_workspace_lock_acquired(
+        self,
+        run_id: str,
+        organization_id: str = "default-org",
+        resource_id: str = "default",
+        wait_duration_ms: float = 0.0,
+    ) -> None:
+        """Records WORKSPACE_LOCK_ACQUIRED event with sanitized timing metadata."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.WORKSPACE_LOCK_ACQUIRED,
+                duration_ms=round(wait_duration_ms, 2),
+                metadata={
+                    "run_id": run_id,
+                    "organization_id": effective_org,
+                    "resource_id": resource_id,
+                    "wait_duration_ms": round(wait_duration_ms, 2),
+                    "outcome": "ACQUIRED",
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_workspace_lock_acquired: {e}", flush=True)
+
+    def on_workspace_lock_released(
+        self,
+        run_id: str,
+        organization_id: str = "default-org",
+        resource_id: str = "default",
+        held_duration_ms: float = 0.0,
+    ) -> None:
+        """Records WORKSPACE_LOCK_RELEASED event with sanitized timing metadata."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.WORKSPACE_LOCK_RELEASED,
+                duration_ms=round(held_duration_ms, 2),
+                metadata={
+                    "run_id": run_id,
+                    "organization_id": effective_org,
+                    "resource_id": resource_id,
+                    "held_duration_ms": round(held_duration_ms, 2),
+                    "outcome": "RELEASED",
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_workspace_lock_released: {e}", flush=True)
+
+    def on_workspace_lock_timeout(
+        self,
+        run_id: str,
+        organization_id: str = "default-org",
+        resource_id: str = "default",
+        wait_duration_ms: float = 0.0,
+    ) -> None:
+        """Records WORKSPACE_LOCK_TIMEOUT event with sanitized timing metadata."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.WORKSPACE_LOCK_TIMEOUT,
+                duration_ms=round(wait_duration_ms, 2),
+                metadata={
+                    "run_id": run_id,
+                    "organization_id": effective_org,
+                    "resource_id": resource_id,
+                    "wait_duration_ms": round(wait_duration_ms, 2),
+                    "outcome": "TIMEOUT",
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_workspace_lock_timeout: {e}", flush=True)
+
+    def on_idempotency_replay(
+        self,
+        run_id: str,
+        organization_id: str,
+        operation: str,
+        key_hash: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Records IDEMPOTENCY_REPLAY event with sanitized metadata."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        meta = {
+            "run_id": run_id,
+            "organization_id": effective_org,
+            "operation": operation,
+            "key_hash": key_hash,
+            "outcome": "REPLAY",
+        }
+        if metadata:
+            meta.update(metadata)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.IDEMPOTENCY_REPLAY,
+                metadata=meta,
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_idempotency_replay: {e}", flush=True)
+
+    def on_idempotency_conflict(
+        self,
+        run_id: str,
+        organization_id: str,
+        operation: str,
+        key_hash: Optional[str] = None,
+        reason: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Records IDEMPOTENCY_CONFLICT event with sanitized metadata."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        meta = {
+            "run_id": run_id,
+            "organization_id": effective_org,
+            "operation": operation,
+            "key_hash": key_hash,
+            "reason": reason,
+            "outcome": "CONFLICT",
+        }
+        if metadata:
+            meta.update(metadata)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.IDEMPOTENCY_CONFLICT,
+                metadata=meta,
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_idempotency_conflict: {e}", flush=True)
+
+    def on_pr_reconciled(
+        self,
+        run_id: str,
+        organization_id: str,
+        pr_number: int,
+        pr_url: str,
+        reconciliation_source: str = "github_reconciliation",
+    ) -> None:
+        """Records PR_RECONCILIATION event when an existing PR is matched."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.PR_RECONCILIATION,
+                metadata={
+                    "run_id": run_id,
+                    "organization_id": effective_org,
+                    "pr_number": pr_number,
+                    "pr_url": pr_url,
+                    "reconciliation_source": reconciliation_source,
+                    "outcome": "RECONCILED",
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_pr_reconciled: {e}", flush=True)
+
     def classify_error(self, msg: str) -> FailureCategory:
         """Maps freeform or exception strings to standard FailureCategory."""
         return self._infer_failure_category(msg)
@@ -583,6 +790,14 @@ class TelemetryCollector:
     def _infer_failure_category(self, msg: str) -> FailureCategory:
         """Maps freeform or exception strings to standard FailureCategory."""
         m = (msg or "").lower()
+        if "workspace_lock_timeout" in m or "workspace lock timeout" in m:
+            return FailureCategory.WORKSPACE_LOCK_TIMEOUT
+        if "llmtimeouterror" in m or ("llm" in m and ("timeout" in m or "timed out" in m)):
+            return FailureCategory.LLM_TIMEOUT
+        if "llmtransienterror" in m or ("llm" in m and "transient" in m):
+            return FailureCategory.LLM_TRANSIENT_FAILURE
+        if "llmpermanenterror" in m or "llmerror" in m:
+            return FailureCategory.LLM_PERMANENT_FAILURE
         if "auth" in m or "unauthorized" in m:
             return FailureCategory.AUTHENTICATION_FAILURE
         if "tenant" in m or "cross-tenant" in m:
@@ -610,6 +825,166 @@ class TelemetryCollector:
         if "pull request" in m:
             return FailureCategory.PR_CREATION_FAILURE
         return FailureCategory.INTERNAL_ERROR
+
+    # ------------------------------------------------------------------
+    # Cancellation & Watchdog (Phase 8 Step 5)
+    # ------------------------------------------------------------------
+
+    def on_cancel_requested(
+        self,
+        run_id: str,
+        organization_id: str = "default-org",
+        actor: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Records RUN_CANCEL_REQUESTED - the request, not necessarily the outcome."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.RUN_CANCEL_REQUESTED,
+                metadata={
+                    "run_id": run_id,
+                    "organization_id": effective_org,
+                    "actor": actor,
+                    "reason": reason,
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_cancel_requested: {e}", flush=True)
+
+    def on_run_cancelled(
+        self,
+        run_id: str,
+        organization_id: str = "default-org",
+        current_phase: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Records RUN_CANCELLED once execution has actually stopped."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.RUN_CANCELLED,
+                metadata={
+                    "run_id": run_id,
+                    "organization_id": effective_org,
+                    "current_phase": current_phase,
+                    "reason": reason,
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_run_cancelled: {e}", flush=True)
+
+    def on_run_stuck(
+        self,
+        run_id: str,
+        organization_id: str = "default-org",
+        status: Optional[str] = None,
+        current_phase: Optional[str] = None,
+        last_activity_at: Optional[str] = None,
+        threshold_seconds: Optional[float] = None,
+    ) -> None:
+        """Records RUN_STUCK - an observation, not a mutation of the run."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.RUN_STUCK,
+                metadata={
+                    "run_id": run_id,
+                    "organization_id": effective_org,
+                    "status": status,
+                    "current_phase": current_phase,
+                    "last_activity_at": last_activity_at,
+                    "threshold_seconds": threshold_seconds,
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_run_stuck: {e}", flush=True)
+
+    def on_sandbox_cancelled(
+        self,
+        run_id: str,
+        organization_id: str = "default-org",
+        duration_seconds: Optional[float] = None,
+    ) -> None:
+        """Records SANDBOX_CANCELLED when a sandbox subprocess was terminated for cancellation."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        try:
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.SANDBOX_CANCELLED,
+                duration_ms=round(duration_seconds * 1000.0, 2) if duration_seconds is not None else None,
+                metadata={"run_id": run_id, "organization_id": effective_org},
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_sandbox_cancelled: {e}", flush=True)
+
+    def on_shutdown_started(
+        self,
+        active_runs: int = 0,
+        drain_timeout_seconds: Optional[float] = None,
+        organization_id: str = "system",
+    ) -> None:
+        """Records SHUTDOWN_STARTED when graceful shutdown sequence commences."""
+        try:
+            self.record_event(
+                run_id="system_shutdown",
+                organization_id=organization_id,
+                event_type=TelemetryEventType.SHUTDOWN_STARTED,
+                metadata={
+                    "active_runs": active_runs,
+                    "drain_timeout_seconds": drain_timeout_seconds,
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_shutdown_started: {e}", flush=True)
+
+    def on_shutdown_completed(
+        self,
+        duration_seconds: Optional[float] = None,
+        cancelled_runs: int = 0,
+        organization_id: str = "system",
+    ) -> None:
+        """Records SHUTDOWN_COMPLETED when graceful shutdown finishes successfully."""
+        try:
+            self.record_event(
+                run_id="system_shutdown",
+                organization_id=organization_id,
+                event_type=TelemetryEventType.SHUTDOWN_COMPLETED,
+                duration_ms=round(duration_seconds * 1000.0, 2) if duration_seconds is not None else None,
+                metadata={
+                    "cancelled_runs": cancelled_runs,
+                    "duration_seconds": duration_seconds,
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_shutdown_completed: {e}", flush=True)
+
+    def on_shutdown_interrupted(
+        self,
+        reason: str = "",
+        active_runs: int = 0,
+        organization_id: str = "system",
+    ) -> None:
+        """Records SHUTDOWN_INTERRUPTED if shutdown encounters an unhandled error or timeout."""
+        try:
+            self.record_event(
+                run_id="system_shutdown",
+                organization_id=organization_id,
+                event_type=TelemetryEventType.SHUTDOWN_INTERRUPTED,
+                metadata={
+                    "reason": reason,
+                    "active_runs": active_runs,
+                },
+            )
+        except Exception as e:
+            print(f"[Telemetry] Warning: failed on_shutdown_interrupted: {e}", flush=True)
 
 
 # Platform singleton collector

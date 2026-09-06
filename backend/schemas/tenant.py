@@ -40,6 +40,11 @@ class Permission(str, Enum):
     RUN_APPROVE = "RUN_APPROVE"
     SECURITY_APPROVE = "SECURITY_APPROVE"
 
+    # Run cancellation - distinct from RUN_APPROVE: stopping work is a
+    # lighter-weight action than approving/rejecting its outcome, so it's
+    # granted to anyone who can create or approve runs, not just approvers.
+    RUN_CANCEL = "RUN_CANCEL"
+
     # Audit log inspection
     AUDIT_READ = "AUDIT_READ"
 

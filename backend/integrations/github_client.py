@@ -239,6 +239,96 @@ class GitHubClient:
             if self._client is None:
                 client.close()
 
+    def find_pull_request(
+        self,
+        repo_full_name: str,
+        head_branch: str,
+        base_branch: Optional[str] = None,
+        state: str = "all",
+        token_override: Optional[str] = None,
+    ) -> Optional[GitHubPRResult]:
+        """
+        Finds an existing Pull Request matching the given head_branch (and optional base_branch).
+        Queries GET /repos/{repo_full_name}/pulls with state and head filters.
+        """
+        headers = self._get_headers(token_override=token_override)
+        url = f"{self.base_url}/repos/{repo_full_name}/pulls"
+
+        client = self._client or httpx.Client(timeout=30.0)
+        try:
+            owner = repo_full_name.split("/")[0] if "/" in repo_full_name else ""
+            params = {"state": state}
+            if owner and ":" not in head_branch:
+                params["head"] = f"{owner}:{head_branch}"
+            else:
+                params["head"] = head_branch
+
+            if base_branch:
+                params["base"] = base_branch
+
+            response = client.get(url, headers=headers, params=params)
+            if response.status_code == 404:
+                return None
+            if response.status_code == 401:
+                raise GitHubAuthError(
+                    f"GitHub API authorization failed (401): {response.text}",
+                    status_code=401,
+                )
+            if response.status_code == 403:
+                txt = response.text.lower()
+                if "rate limit" in txt or "secondary rate" in txt:
+                    raise GitHubRateLimitError(
+                        f"GitHub API rate limit exceeded (403): {response.text}",
+                        status_code=403,
+                    )
+                raise GitHubPermissionError(
+                    f"GitHub API authorization failed (403): {response.text}",
+                    status_code=403,
+                )
+            if response.status_code == 429:
+                raise GitHubRateLimitError(
+                    f"GitHub API rate limit exceeded (429): {response.text}",
+                    status_code=429,
+                )
+            if response.status_code >= 500:
+                raise GitHubApiError(
+                    f"GitHub API service error ({response.status_code}): {response.text}",
+                    status_code=response.status_code,
+                )
+            response.raise_for_status()
+
+            data = response.json()
+            if not isinstance(data, list) or len(data) == 0:
+                # If owner:branch filter returned nothing, retry with raw head_branch
+                if params.get("head") != head_branch:
+                    fallback_params = dict(params)
+                    fallback_params["head"] = head_branch
+                    resp_fallback = client.get(url, headers=headers, params=fallback_params)
+                    if resp_fallback.status_code == 200:
+                        fb_data = resp_fallback.json()
+                        if isinstance(fb_data, list) and len(fb_data) > 0:
+                            data = fb_data
+
+            if isinstance(data, list):
+                for pr in data:
+                    pr_head = pr.get("head", {}).get("ref") if isinstance(pr.get("head"), dict) else pr.get("head")
+                    pr_base = pr.get("base", {}).get("ref") if isinstance(pr.get("base"), dict) else pr.get("base")
+                    clean_head = head_branch.split(":")[-1]
+                    if pr_head == head_branch or pr_head == clean_head:
+                        if base_branch and pr_base and pr_base != base_branch:
+                            continue
+                        return GitHubPRResult(
+                            pr_number=pr.get("number", 0),
+                            pr_url=pr.get("html_url", ""),
+                            head_branch=pr_head or clean_head,
+                            base_branch=pr_base or base_branch or "main",
+                            is_draft=pr.get("draft", False),
+                        )
+            return None
+        finally:
+            if self._client is None:
+                client.close()
+
     @staticmethod
     def format_pr_description(
         issue: GitHubIssuePayload,

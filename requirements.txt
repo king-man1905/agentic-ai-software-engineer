@@ -10,7 +10,9 @@ langchain-nvidia-ai-endpoints
 langchain-text-splitters
 langchain-community
 langgraph
+langgraph-checkpoint-sqlite
 faiss-cpu
 pytest
 pandas
 sqlalchemy
+langchain-openai

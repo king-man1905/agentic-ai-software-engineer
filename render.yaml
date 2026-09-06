@@ -7,6 +7,19 @@ services:
     startCommand: uvicorn backend.api.app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
+    # Render's native (non-Docker) Python runtime checks out the repo to
+    # /opt/render/project/src and runs both buildCommand and startCommand
+    # from there - the app never os.chdir()s, and every durable store
+    # (backend/observability/store.py, backend/graph/runner.py,
+    # backend/security/idempotency.py) resolves "workspace/..." as a
+    # relative path against that same directory. Mounting the disk exactly
+    # there, rather than at some other absolute path, is what makes
+    # checkpoints.db, telemetry.db, and idempotency.db survive a restart
+    # or redeploy instead of resetting to an empty ephemeral directory.
+    disk:
+      name: agent-workspace
+      mountPath: /opt/render/project/src/workspace
+      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
@@ -26,3 +39,5 @@ services:
         sync: false
       - key: LLM_PROVIDER
         sync: false
+      - key: LLM_REQUEST_TIMEOUT_SECONDS
+        value: "60"

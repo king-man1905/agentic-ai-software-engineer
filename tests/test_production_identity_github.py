@@ -38,14 +38,29 @@ from backend.security.auth import (
 )
 from backend.security.tenant import tenant_manager
 from backend.vcs.models import ApprovalDecision, GitDiffSummary
+from backend.observability.collector import telemetry_collector
+from backend.observability.store import telemetry_store
 
 
 @pytest.fixture(autouse=True)
-def clean_security_state(monkeypatch):
-    """Resets tenant state, auth mode, and mocks LLM nodes before each test."""
+def clean_security_state(tmp_path, monkeypatch):
+    """Resets tenant state, auth mode, telemetry store, and mocks LLM nodes before each test."""
     tenant_manager.reset()
     tenant_manager.set_mode(AuthMode.DEVELOPMENT, fallback=True)
     audit_logger.clear()
+
+    # Several tests use fixed literal run_ids (e.g. "test-run-publish-42").
+    # workspace/telemetry.db is a real file that persists across separate
+    # pytest invocations, not just across tests within one run - without
+    # isolating it here, a run_id's PR/telemetry state from an earlier
+    # invocation of the suite leaks into a later one. Mutating the
+    # singletons' own db_path/store in place (rather than reassigning the
+    # module attribute) ensures every importer sees the same isolated store.
+    test_db = str(tmp_path / "test_production_identity_telemetry.db")
+    from backend.observability.store import TelemetryStore
+    test_store = TelemetryStore(test_db)
+    monkeypatch.setattr(telemetry_store, "db_path", test_db)
+    monkeypatch.setattr(telemetry_collector, "store", test_store)
 
     monkeypatch.setattr(
         "backend.graph.nodes.route_task",

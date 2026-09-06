@@ -5,6 +5,7 @@ from backend.observability.telemetry import (
     extract_usage,
     invoke_structured,
     merge_usage,
+    run_context,
 )
 from backend.observability.pricing import (
     PricingRate,
@@ -40,6 +41,7 @@ __all__ = [
     "extract_usage",
     "invoke_structured",
     "merge_usage",
+    "run_context",
     "PricingRate",
     "ModelPricingManager",
     "pricing_manager",

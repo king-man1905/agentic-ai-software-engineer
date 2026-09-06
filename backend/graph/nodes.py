@@ -5,6 +5,7 @@ from backend.schemas.planning import ExecutionPlan
 from backend.observability.telemetry import collect_usage, invoke_structured, merge_usage
 from backend.observability.collector import telemetry_collector
 from backend.schemas.telemetry import TelemetryEventType
+from backend.graph.cancellation import check_cancelled, mark_activity
 
 from backend.agents.router import route_task
 from backend.agents.planner import create_plan
@@ -16,6 +17,8 @@ from langgraph.types import interrupt
 
 
 def router_node(state: AgentState) -> dict:
+    check_cancelled(state)
+    mark_activity(state, "router")
     routing = route_task(state["user_message"])
 
     run_id = state.get("run_id")
@@ -115,6 +118,8 @@ def format_categorized_context(chunks: list) -> str:
 
 
 def planner_node(state: AgentState) -> dict:
+    check_cancelled(state)
+    mark_activity(state, "planner")
     repo_context = state.get("repo_context")
     repo_evidence = None
     if repo_context:
@@ -162,6 +167,8 @@ def planner_node(state: AgentState) -> dict:
 
 
 def knowledge_node(state: AgentState) -> dict:
+    check_cancelled(state)
+    mark_activity(state, "knowledge")
     import time
     start_time = time.time()
 
@@ -361,6 +368,8 @@ def knowledge_node(state: AgentState) -> dict:
 
 
 def developer_node(state: AgentState) -> dict:
+    check_cancelled(state)
+    mark_activity(state, "developer")
     plan = state.get("plan")
     if plan is None:
         plan = ExecutionPlan(
@@ -515,6 +524,8 @@ Return a list of precise FilePatches. For each patch, provide the file path, the
 
 
 def qa_node(state: AgentState) -> dict:
+    check_cancelled(state)
+    mark_activity(state, "qa")
     plan = state.get("plan")
     if plan is None:
         plan = ExecutionPlan(
@@ -543,10 +554,17 @@ def qa_node(state: AgentState) -> dict:
     patches = state.get("generated_patches") or []
 
     # 2. Execute Multi-Check Quality Pipeline (AST, pytest, security, lint, typecheck)
+    run_id = state.get("run_id")
+    org_id = state.get("organization_id")
+    cancel_check = None
+    if run_id:
+        from backend.observability.store import telemetry_store as _telemetry_store
+        cancel_check = lambda: _telemetry_store.is_cancel_requested(run_id, org_id)
     checks, test_result = QualityPipeline.run_all(
         repo_path=str(project_path),
         patches=patches,
         timeout=30.0,
+        cancel_check=cancel_check,
     )
 
     # 3. Structured QA Judge Evaluation with Strict Objective Priority
@@ -628,6 +646,8 @@ def qa_router(state: AgentState) -> str:
 
 
 def revision_node(state: AgentState) -> dict:
+    check_cancelled(state)
+    mark_activity(state, "revision")
     import time
     start_rev = time.time()
 
@@ -773,6 +793,8 @@ def git_prepare_node(state: AgentState) -> dict:
     Prepares a Git diff summary by applying validated patches to the workspace,
     computing unified diffs, and evaluating risk.
     """
+    check_cancelled(state)
+    mark_activity(state, "git_prepare")
     from backend.vcs.git_manager import GitWorkspaceManager
     from backend.vcs.models import GitDiffSummary
     import os
@@ -836,6 +858,8 @@ def policy_node(state: AgentState) -> dict:
     Evaluates organization policy on staged changes and test results
     prior to Human-in-the-Loop approval gate and Git mutation.
     """
+    check_cancelled(state)
+    mark_activity(state, "policy")
     from backend.policy.evaluator import PolicyEvaluator
     from backend.schemas.policy import PolicyConfig, PolicyDecision
 
@@ -927,6 +951,8 @@ def approval_node(state: AgentState) -> dict:
     presenting the Git diff summary, cryptographic patch_hash, policy evaluation,
     and risk assessment, then resumes with an ApprovalDecision bound to the patch hash.
     """
+    check_cancelled(state)
+    mark_activity(state, "approval")
     from backend.vcs.models import ApprovalDecision
 
     git_diff = state.get("git_diff")
@@ -1055,6 +1081,8 @@ def git_commit_node(state: AgentState) -> dict:
 
     Cryptographically validates workspace drift prior to commit.
     """
+    check_cancelled(state)
+    mark_activity(state, "git_commit")
     from backend.vcs.git_manager import GitWorkspaceManager
     import os
     from pathlib import Path
@@ -1088,6 +1116,11 @@ def git_commit_node(state: AgentState) -> dict:
     developer_result = state.get("developer_result")
     if developer_result:
         commit_message = f"agent: {developer_result.summary[:80]}"
+
+    # Final check immediately before the irreversible mutation: a
+    # cancellation that arrived while drift verification ran above must
+    # still stop the commit, not just be noticed at the top of the node.
+    check_cancelled(state)
 
     if git_diff.branch_name:
         GitWorkspaceManager.create_feature_branch(str(project_path), git_diff.branch_name)

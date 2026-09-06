@@ -33,8 +33,20 @@ from backend.security.rbac import (
     has_permission,
 )
 from backend.security.tenant import TenantManager, tenant_manager
+from backend.security.idempotency import (
+    IdempotencyConflictError,
+    IdempotencyStore,
+    compute_fingerprint,
+    compute_key_hash,
+    idempotency_store,
+)
 
 __all__ = [
+    "IdempotencyStore",
+    "IdempotencyConflictError",
+    "idempotency_store",
+    "compute_key_hash",
+    "compute_fingerprint",
     "Role",
     "Permission",
     "Organization",

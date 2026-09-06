@@ -4,7 +4,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from backend.developer.models import FilePatch
 from backend.developer.patcher import SafePatcher
@@ -94,6 +94,7 @@ class QualityPipeline:
         cls,
         repo_path: str,
         timeout: float = 30.0,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Tuple[QualityCheck, Optional[TestExecutionResult]]:
         """
         Executes pytest in the sandbox. Returns QualityCheck and TestExecutionResult.
@@ -115,7 +116,9 @@ class QualityPipeline:
 
         try:
             cmd = ["python", "-m", "pytest"]
-            test_result = SandboxRunner.run_command(cmd, cwd=str(repo), timeout=timeout)
+            test_result = SandboxRunner.run_command(
+                cmd, cwd=str(repo), timeout=timeout, cancel_check=cancel_check
+            )
         except Exception as e:
             duration_ms = int((time.time() - start) * 1000)
             test_result = TestExecutionResult(
@@ -378,6 +381,7 @@ class QualityPipeline:
         repo_path: str,
         patches: List[FilePatch],
         timeout: float = 30.0,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Tuple[List[QualityCheck], Optional[TestExecutionResult]]:
         """
         Executes all configured quality checks in sequence.
@@ -389,7 +393,7 @@ class QualityPipeline:
         ast_check = cls.check_ast(repo_path, patches)
 
         # 2. Pytest Execution
-        pytest_check, test_result = cls.check_pytest(repo_path, timeout=timeout)
+        pytest_check, test_result = cls.check_pytest(repo_path, timeout=timeout, cancel_check=cancel_check)
 
         # 3. Static Security Scan
         security_check = cls.check_security(repo_path, patches)

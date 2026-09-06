@@ -35,7 +35,6 @@ def revise_code_with_traceback(
     failing tests, and previous revision attempt history.
     """
     llm = get_llm()
-    structured_llm = llm.with_structured_output(DeveloperResult)
 
     if error_analysis is None:
         if test_result is not None:
@@ -111,7 +110,7 @@ REVISION RULES:
 Return a structured DeveloperResult.
 """
 
-    return structured_llm.invoke(prompt)
+    return invoke_structured(llm, DeveloperResult, prompt)
 
 
 def generate_revision_patches(

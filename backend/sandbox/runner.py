@@ -3,8 +3,16 @@ import re
 import sys
 import time
 import subprocess
-from typing import List, Tuple, Optional
+from typing import Callable, List, Tuple, Optional
 from backend.sandbox.models import TestExecutionResult
+
+# How often to poll the subprocess for completion, and how it notices a
+# cancellation or timeout without blocking indefinitely on communicate().
+_POLL_INTERVAL_SECONDS = 0.2
+# Grace period after terminate() before escalating to kill() - long enough
+# for pytest/python to flush and exit cleanly, short enough to never hang
+# a cancellation or timeout indefinitely.
+_TERMINATE_GRACE_SECONDS = 5.0
 
 
 def validate_command(cmd: List[str]):
@@ -177,12 +185,36 @@ class SandboxRunner:
     """
 
     @staticmethod
+    def _terminate_safely(proc: subprocess.Popen) -> Tuple[str, str]:
+        """
+        Terminates a subprocess, waiting a bounded grace period before
+        escalating to kill(). Always waits for the process to actually
+        exit so it's never left as an orphan.
+        """
+        try:
+            proc.terminate()
+            stdout, stderr = proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        return stdout or "", stderr or ""
+
+    @staticmethod
     def run_command(
         cmd: List[str],
         cwd: str,
         timeout: float = 30.0,
         allow_network: bool = False,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> TestExecutionResult:
+        """
+        Runs `cmd` under the sandbox allowlist and environment, polling for
+        completion so a cancellation request (checked via `cancel_check`)
+        can terminate the process instead of only a fixed timeout. Uses
+        Popen rather than subprocess.run specifically so the process can be
+        signaled mid-execution - shell=False and the command allowlist are
+        unchanged from before.
+        """
         # Validate command against the allowlist
         validate_command(cmd)
 
@@ -190,56 +222,14 @@ class SandboxRunner:
         start_time = time.time()
 
         try:
-            # Enforce shell=False (Strict requirement)
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=cwd,
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 shell=False,
-                timeout=timeout,
-            )
-
-            duration = time.time() - start_time
-            stdout = result.stdout or ""
-            stderr = result.stderr or ""
-            exit_code = result.returncode
-
-            # Extract metrics
-            passed_count, failed_count = parse_pytest_summary(stdout)
-            error_summary = extract_failures_and_errors(stdout)
-
-            # Fallback if no pytest failures block is parsed but code is non-zero
-            if not error_summary and exit_code != 0:
-                error_summary = stderr.strip() or stdout.strip()
-                if len(error_summary) > 500:
-                    error_summary = error_summary[:500] + "... [truncated]"
-
-            success = exit_code == 0
-
-            return TestExecutionResult(
-                success=success,
-                exit_code=exit_code,
-                passed_count=passed_count,
-                failed_count=failed_count,
-                stdout=stdout,
-                stderr=stderr,
-                duration_seconds=duration,
-                error_summary=error_summary if error_summary else None,
-            )
-
-        except subprocess.TimeoutExpired as e:
-            duration = time.time() - start_time
-            return TestExecutionResult(
-                success=False,
-                exit_code=-1,
-                passed_count=0,
-                failed_count=0,
-                stdout=e.stdout or "",
-                stderr=e.stderr or "",
-                duration_seconds=duration,
-                error_summary=f"Timeout expired after {timeout} seconds.",
             )
         except Exception as e:
             duration = time.time() - start_time
@@ -253,3 +243,80 @@ class SandboxRunner:
                 duration_seconds=duration,
                 error_summary=str(e),
             )
+
+        cancelled = False
+        timed_out = False
+        stdout = stderr = ""
+        try:
+            while True:
+                try:
+                    stdout, stderr = proc.communicate(timeout=_POLL_INTERVAL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    elapsed = time.time() - start_time
+                    if elapsed > timeout:
+                        timed_out = True
+                        stdout, stderr = SandboxRunner._terminate_safely(proc)
+                        break
+                    if cancel_check is not None and cancel_check():
+                        cancelled = True
+                        stdout, stderr = SandboxRunner._terminate_safely(proc)
+                        break
+                    continue
+        finally:
+            # Belt-and-suspenders: never return with the process still
+            # alive, whatever exit path was taken above.
+            if proc.poll() is None:
+                stdout, stderr = SandboxRunner._terminate_safely(proc)
+
+        duration = time.time() - start_time
+        stdout = stdout or ""
+        stderr = stderr or ""
+        exit_code = proc.returncode if proc.returncode is not None else -1
+
+        if cancelled:
+            return TestExecutionResult(
+                success=False,
+                exit_code=-1,
+                passed_count=0,
+                failed_count=0,
+                stdout=stdout,
+                stderr=stderr,
+                duration_seconds=duration,
+                error_summary="Cancelled by user request.",
+            )
+
+        if timed_out:
+            return TestExecutionResult(
+                success=False,
+                exit_code=-1,
+                passed_count=0,
+                failed_count=0,
+                stdout=stdout,
+                stderr=stderr,
+                duration_seconds=duration,
+                error_summary=f"Timeout expired after {timeout} seconds.",
+            )
+
+        # Extract metrics
+        passed_count, failed_count = parse_pytest_summary(stdout)
+        error_summary = extract_failures_and_errors(stdout)
+
+        # Fallback if no pytest failures block is parsed but code is non-zero
+        if not error_summary and exit_code != 0:
+            error_summary = stderr.strip() or stdout.strip()
+            if len(error_summary) > 500:
+                error_summary = error_summary[:500] + "... [truncated]"
+
+        success = exit_code == 0
+
+        return TestExecutionResult(
+            success=success,
+            exit_code=exit_code,
+            passed_count=passed_count,
+            failed_count=failed_count,
+            stdout=stdout,
+            stderr=stderr,
+            duration_seconds=duration,
+            error_summary=error_summary if error_summary else None,
+        )

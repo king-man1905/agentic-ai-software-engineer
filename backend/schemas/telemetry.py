@@ -4,6 +4,15 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, computed_field
 
+# Statuses past which a run can never be mutated again (cancelled, resumed,
+# committed, etc.). Shared by cancellation, resume, and watchdog logic so
+# they all agree on what "still active" means.
+TERMINAL_RUN_STATUSES = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}
+
+# Statuses the stuck-run watchdog considers for staleness. WAITING_APPROVAL
+# is included but uses a much longer threshold - see watchdog.py.
+WATCHDOG_TRACKED_STATUSES = {"RUNNING", "REVISING", "WAITING_APPROVAL", "PUBLISHING", "CANCELLING"}
+
 
 class FailureCategory(str, Enum):
     """
@@ -24,6 +33,10 @@ class FailureCategory(str, Enum):
     GITHUB_RATE_LIMIT = "GITHUB_RATE_LIMIT"
     GITHUB_BRANCH_CONFLICT = "GITHUB_BRANCH_CONFLICT"
     PR_CREATION_FAILURE = "PR_CREATION_FAILURE"
+    LLM_TIMEOUT = "LLM_TIMEOUT"
+    LLM_TRANSIENT_FAILURE = "LLM_TRANSIENT_FAILURE"
+    LLM_PERMANENT_FAILURE = "LLM_PERMANENT_FAILURE"
+    WORKSPACE_LOCK_TIMEOUT = "WORKSPACE_LOCK_TIMEOUT"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
@@ -55,8 +68,22 @@ class TelemetryEventType(str, Enum):
     GITHUB_OPERATION_COMPLETED = "GITHUB_OPERATION_COMPLETED"
     GITHUB_PR_PUBLISHED = "GITHUB_PR_PUBLISHED"
     PR_CREATED = "PR_CREATED"
+    PROVIDER_FALLBACK = "PROVIDER_FALLBACK"
+    WORKSPACE_LOCK_ACQUIRED = "WORKSPACE_LOCK_ACQUIRED"
+    WORKSPACE_LOCK_RELEASED = "WORKSPACE_LOCK_RELEASED"
+    WORKSPACE_LOCK_TIMEOUT = "WORKSPACE_LOCK_TIMEOUT"
+    IDEMPOTENCY_REPLAY = "IDEMPOTENCY_REPLAY"
+    IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
+    PR_RECONCILIATION = "PR_RECONCILIATION"
+    RUN_CANCEL_REQUESTED = "RUN_CANCEL_REQUESTED"
+    RUN_CANCELLED = "RUN_CANCELLED"
+    RUN_STUCK = "RUN_STUCK"
+    SANDBOX_CANCELLED = "SANDBOX_CANCELLED"
     RUN_COMPLETED = "RUN_COMPLETED"
     RUN_FAILED = "RUN_FAILED"
+    SHUTDOWN_STARTED = "SHUTDOWN_STARTED"
+    SHUTDOWN_COMPLETED = "SHUTDOWN_COMPLETED"
+    SHUTDOWN_INTERRUPTED = "SHUTDOWN_INTERRUPTED"
 
 
 class TelemetryEvent(BaseModel):
@@ -137,6 +164,20 @@ class RunRecord(BaseModel):
     currency: str = "USD"
     approval_reviewer: Optional[str] = None
     approval_decision: Optional[str] = None
+
+    # Cancellation (Phase 8 Step 5) - durable, survives runner recreation.
+    cancel_requested: bool = False
+    cancellation_requested_at: Optional[str] = None
+    cancellation_requested_by: Optional[str] = None
+    cancellation_reason: Optional[str] = None
+    cancelled_at: Optional[str] = None
+
+    # Watchdog / heartbeat (Phase 8 Step 5). `stuck_at` is an observation
+    # flag layered on top of `status`, not a replacement for it - a run
+    # can be RUNNING and stuck at the same time.
+    last_activity_at: Optional[str] = None
+    current_phase: Optional[str] = None
+    stuck_at: Optional[str] = None
 
     @property
     def tenant_id(self) -> str:

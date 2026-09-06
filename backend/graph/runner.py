@@ -8,11 +8,17 @@ Key design notes for LangGraph 1.2.10:
 - Resumption is performed via graph.invoke(Command(resume=value), config=config).
 """
 
+import os
+from pathlib import Path
+import sqlite3
 import threading
 import uuid
 from typing import Any, Dict, Optional
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.types import Command
 
 import time
@@ -21,16 +27,64 @@ from datetime import datetime, timezone
 from backend.api.models import RunStatusResponse
 from backend.graph.state import AgentState
 from backend.vcs.models import ApprovalDecision, GitDiffSummary
-from backend.schemas.qa import QAResult
-from backend.schemas.policy import PolicyEvaluationResult
+from backend.schemas.qa import QAResult, QAIssue
+from backend.schemas.policy import (
+    PolicyConfig,
+    PolicyDecision,
+    PolicyEvaluationResult,
+    PolicyTelemetry,
+    PolicyViolation,
+)
+from backend.schemas.routing import RoutingDecision, TaskType
+from backend.schemas.planning import ExecutionPlan, PlanStep
+from backend.schemas.knowledge import KnowledgeAnswer
+from backend.schemas.developer import DeveloperResult, FileChange
+from backend.indexer.models import CodeChunk
+from backend.developer.models import FilePatch
+from backend.sandbox.models import TestExecutionResult
+from backend.revision.models import RevisionHistory
+from backend.schemas.rag import RetrievalEvaluation, RAGTelemetry
 from backend.observability.collector import telemetry_collector
 from backend.observability.store import telemetry_store
+from backend.observability.telemetry import run_context
 from backend.schemas.telemetry import TelemetryEventType
 from backend.security.auth import AuthMode
 from backend.security.tenant import tenant_manager
+from backend.vcs.workspace_lock import (
+    WorkspaceLockManager,
+    WorkspaceLockTimeoutError,
+    workspace_lock_manager,
+)
+from backend.graph.cancellation import RunCancelledException
+
+_SERIALIZATION_CLASSES = [
+    GitDiffSummary,
+    ApprovalDecision,
+    PolicyEvaluationResult,
+    PolicyDecision,
+    PolicyViolation,
+    PolicyConfig,
+    PolicyTelemetry,
+    QAResult,
+    QAIssue,
+    RoutingDecision,
+    TaskType,
+    ExecutionPlan,
+    PlanStep,
+    KnowledgeAnswer,
+    DeveloperResult,
+    FileChange,
+    CodeChunk,
+    FilePatch,
+    TestExecutionResult,
+    RevisionHistory,
+    RetrievalEvaluation,
+    RAGTelemetry,
+]
+_ALLOWLIST = {(cls.__module__, cls.__name__) for cls in _SERIALIZATION_CLASSES}
 
 
-def _build_graph(checkpointer: MemorySaver):
+def _build_graph(checkpointer: BaseCheckpointSaver):
     """
     Build and compile the StateGraph with the given checkpointer.
     Isolated from the module-level graph to allow per-runner checkpointers.
@@ -114,23 +168,76 @@ def _build_graph(checkpointer: MemorySaver):
 
 class AgentRunner:
     """
-    Thread-safe agent runner with durable MemorySaver checkpointer.
+    Thread-safe agent runner with durable SQLite-backed checkpointer.
 
-    Each AgentRunner instance owns its own checkpointer so concurrent
-    runners and test instances are fully isolated from one another.
-    The checkpointer backend can be swapped to SqliteSaver or
-    PostgresSaver by changing the factory in __init__.
+    Each AgentRunner instance maintains its own SQLite connection to checkpoints.db
+    with WAL mode and busy timeout enabled, ensuring graph state survives server
+    restarts and concurrent runners are safely supported.
     """
 
-    def __init__(self):
-        self._checkpointer = MemorySaver()
+    def __init__(
+        self,
+        checkpoint_db_path: Optional[str] = None,
+        lock_manager: Optional[WorkspaceLockManager] = None,
+    ):
+        if checkpoint_db_path is None:
+            checkpoint_db_path = os.getenv("CHECKPOINT_DB_PATH", "workspace/checkpoints.db")
+        self._checkpoint_db_path = checkpoint_db_path
+        self._lock_manager: WorkspaceLockManager = lock_manager or workspace_lock_manager
+        self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.Lock()
+        self._checkpointer: BaseCheckpointSaver = self._init_checkpointer(checkpoint_db_path)
         self._graph = _build_graph(self._checkpointer)
         # Track metadata supplied at run-creation time (not stored in graph state)
         self._run_metadata: Dict[str, Dict[str, Any]] = {}
         self._run_tenants: Dict[str, str] = {}
         self._active_runs: Dict[str, str] = {}
         self._run_errors: Dict[str, str] = {}
-        self._lock = threading.Lock()
+
+    def _init_checkpointer(self, db_path: str) -> BaseCheckpointSaver:
+        """
+        Initializes the durable SQLite checkpointer with WAL mode and concurrency settings.
+        Fails safely in production without silently falling back to volatile MemorySaver.
+        """
+        last_error = None
+        for attempt in range(5):
+            try:
+                if db_path != ":memory:":
+                    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(
+                    db_path,
+                    timeout=30.0,
+                    check_same_thread=False,
+                )
+                conn.execute("PRAGMA busy_timeout=30000;")
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                self._conn = conn
+                serde = JsonPlusSerializer(allowed_msgpack_modules=_ALLOWLIST)
+                checkpointer = SqliteSaver(conn, serde=serde)
+                checkpointer.setup()
+                return checkpointer
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as oe:
+                last_error = oe
+                time.sleep(0.05 * (attempt + 1))
+            except Exception as e:
+                last_error = e
+                break
+
+        e = last_error
+        if self._is_production_mode():
+            telemetry_collector.record_event(
+                run_id="system",
+                organization_id="system",
+                event_type=TelemetryEventType.RUN_FAILED,
+                metadata={"error": f"DURABLE_CHECKPOINT_INIT_FAILED: {str(e)}"},
+            )
+            raise RuntimeError(f"DURABLE_CHECKPOINT_INIT_FAILED: {str(e)}") from e
+
+        allow_volatile = os.getenv("ALLOW_VOLATILE_CHECKPOINTER", "false").lower() in ("true", "1")
+        if allow_volatile:
+            return MemorySaver()
+        raise RuntimeError(f"CHECKPOINT_INIT_FAILED: {str(e)}") from e
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -245,6 +352,7 @@ class AgentRunner:
         self,
         organization_id: Optional[str],
         run_id: Optional[str] = None,
+        state_snapshot=None,
     ) -> str:
         """
         Resolves the organization to use for a call, refusing to invent
@@ -260,6 +368,17 @@ class AgentRunner:
             return organization_id
         if run_id:
             tracked = self._run_tenants.get(run_id)
+            if not tracked and state_snapshot and state_snapshot.values:
+                tracked = state_snapshot.values.get("organization_id")
+                if tracked:
+                    with self._lock:
+                        self._run_tenants[run_id] = tracked
+            if not tracked:
+                rec = telemetry_store.get_run(run_id)
+                if rec and rec.organization_id:
+                    tracked = rec.organization_id
+                    with self._lock:
+                        self._run_tenants[run_id] = tracked
             if tracked:
                 return tracked
         if self._is_production_mode():
@@ -285,6 +404,15 @@ class AgentRunner:
         assigned_org = self._run_tenants.get(run_id)
         if not assigned_org and state_snapshot and state_snapshot.values:
             assigned_org = state_snapshot.values.get("organization_id")
+            if assigned_org:
+                with self._lock:
+                    self._run_tenants[run_id] = assigned_org
+        if not assigned_org:
+            rec = telemetry_store.get_run(run_id)
+            if rec and rec.organization_id:
+                assigned_org = rec.organization_id
+                with self._lock:
+                    self._run_tenants[run_id] = assigned_org
         if assigned_org and assigned_org != organization_id:
             raise KeyError(f"Run not found: {run_id}")
 
@@ -374,10 +502,13 @@ class AgentRunner:
         if repository_id:
             initial_state["repository_id"] = repository_id
 
+        resource_id = project_id or repository_id or "default"
         config = self._config(run_id)
 
         try:
-            invoke_result = self._graph.invoke(initial_state, config=config)
+            with self._lock_manager.acquire(effective_org, resource_id, run_id):
+                with run_context(run_id, effective_org):
+                    invoke_result = self._graph.invoke(initial_state, config=config)
             state_snapshot = self._graph.get_state(config)
             status = self._derive_status(state_snapshot, invoke_result)
             duration_ms = (time.time() - t0) * 1000.0
@@ -404,6 +535,24 @@ class AgentRunner:
                 )
 
             return self._build_status_response(run_id, status, state_snapshot)
+        except RunCancelledException as ce:
+            # Cooperative cancellation unwound out of graph.invoke() - this
+            # is a clean stop, not a failure. The workspace lock is already
+            # released by the `with self._lock_manager.acquire(...)` block
+            # above unwinding through its `finally`.
+            duration_ms = (time.time() - t0) * 1000.0
+            state_snapshot = self._try_get_state(config)
+            with self._lock:
+                self._active_runs.pop(run_id, None)
+
+            telemetry_store.mark_cancelled(run_id, effective_org)
+            telemetry_collector.on_run_cancelled(
+                run_id=run_id,
+                organization_id=effective_org,
+                current_phase=self._extract_current_node(state_snapshot),
+                reason=ce.reason,
+            )
+            return self._build_status_response(run_id, "CANCELLED", state_snapshot)
         except Exception as e:
             duration_ms = (time.time() - t0) * 1000.0
             state_snapshot = self._try_get_state(config)
@@ -447,6 +596,20 @@ class AgentRunner:
         with self._lock:
             is_active = run_id in self._active_runs
             error_msg = self._run_errors.get(run_id)
+
+        # CANCELLED/CANCELLING is authoritative from the durable store, not
+        # derivable from the checkpoint: LangGraph's own state.next still
+        # reflects whatever node would have run next, since cancellation
+        # unwinds out of graph.invoke() rather than advancing it. Without
+        # this, a later poll after cancellation would resurrect a stale
+        # WAITING_APPROVAL/etc. guess instead of the true outcome.
+        effective_org_for_cancel = organization_id or self._run_tenants.get(run_id)
+        try:
+            durable_status = telemetry_store.get_run(run_id, effective_org_for_cancel)
+        except Exception:
+            durable_status = None
+        if durable_status and durable_status.status in ("CANCELLED", "CANCELLING"):
+            return self._build_status_response(run_id, durable_status.status, state_snapshot)
 
         if error_msg and (state_snapshot is None or not state_snapshot.values):
             return self._build_status_response(
@@ -531,6 +694,16 @@ class AgentRunner:
         if state_snapshot is None or not state_snapshot.values:
             raise KeyError(f"Run not found: {run_id}")
 
+        effective_org = self._require_org(organization_id, run_id=run_id, state_snapshot=state_snapshot)
+
+        # A cancelled run must never resume, even though the checkpoint
+        # itself still looks "paused" (state.next is untouched by
+        # cancelling a WAITING_APPROVAL run - only the durable status
+        # changes). The durable store is authoritative here, not the
+        # checkpoint's own interrupt marker.
+        if telemetry_store.is_cancelled(run_id, effective_org):
+            raise ValueError(f"Run '{run_id}' has been cancelled and cannot be resumed.")
+
         if not state_snapshot.next:
             raise ValueError(
                 f"Run '{run_id}' is not awaiting approval "
@@ -538,7 +711,6 @@ class AgentRunner:
             )
 
         resume_value = approval_decision.model_dump()
-        effective_org = self._require_org(organization_id, run_id=run_id)
 
         rec = telemetry_store.get_run(run_id, effective_org)
         latency_ms = None
@@ -560,12 +732,17 @@ class AgentRunner:
         with self._lock:
             self._active_runs[run_id] = "RUNNING"
 
+        values = state_snapshot.values or {}
+        resource_id = values.get("project_id") or values.get("repository_id") or "default"
+
         t_resume = time.time()
         try:
-            invoke_result = self._graph.invoke(
-                Command(resume=resume_value),
-                config=config,
-            )
+            with self._lock_manager.acquire(effective_org, resource_id, run_id):
+                with run_context(run_id, effective_org):
+                    invoke_result = self._graph.invoke(
+                        Command(resume=resume_value),
+                        config=config,
+                    )
             state_snapshot = self._graph.get_state(config)
             status = self._derive_status(state_snapshot, invoke_result)
             duration_ms = (time.time() - t_resume) * 1000.0
@@ -583,6 +760,20 @@ class AgentRunner:
                 )
 
             return self._build_status_response(run_id, status, state_snapshot)
+        except RunCancelledException as ce:
+            duration_ms = (time.time() - t_resume) * 1000.0
+            state_snapshot = self._try_get_state(config)
+            with self._lock:
+                self._active_runs.pop(run_id, None)
+
+            telemetry_store.mark_cancelled(run_id, effective_org)
+            telemetry_collector.on_run_cancelled(
+                run_id=run_id,
+                organization_id=effective_org,
+                current_phase=self._extract_current_node(state_snapshot),
+                reason=ce.reason,
+            )
+            return self._build_status_response(run_id, "CANCELLED", state_snapshot)
         except Exception as e:
             duration_ms = (time.time() - t_resume) * 1000.0
             state_snapshot = self._try_get_state(config)
@@ -600,9 +791,164 @@ class AgentRunner:
                 run_id, "FAILED", state_snapshot, error_summary=str(e)
             )
 
+    def cancel_run(
+        self,
+        run_id: str,
+        organization_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> RunStatusResponse:
+        """
+        Requests cancellation of a run.
+
+        For a run paused at WAITING_APPROVAL, cancellation is immediate -
+        there is no in-flight execution to wait for, so the durable store
+        transitions straight to CANCELLED and `resume_run` is permanently
+        blocked for this run_id from then on.
+
+        For an actively executing run (RUNNING/REVISING), this only
+        *requests* cancellation (durable `cancel_requested` flag, status
+        CANCELLING); the executing background thread notices at its next
+        node boundary via `check_cancelled()` and finalizes to CANCELLED
+        itself. This method does not wait for that to happen.
+
+        Raises:
+            KeyError: If run_id is not found or belongs to another tenant.
+            ValueError: If the run has already reached a terminal state
+                other than CANCELLED (COMPLETED/FAILED/BLOCKED) - a
+                completed run cannot retroactively be cancelled.
+        """
+        self._check_tenant_access(run_id, organization_id)
+        config = self._config(run_id)
+        state_snapshot = self._try_get_state(config)
+        self._check_tenant_access(run_id, organization_id, state_snapshot)
+
+        effective_org = self._require_org(organization_id, run_id=run_id, state_snapshot=state_snapshot)
+
+        outcome = telemetry_store.request_cancellation(
+            run_id=run_id, organization_id=effective_org, reason=reason, actor=actor,
+        )
+
+        if outcome == "NOT_FOUND":
+            raise KeyError(f"Run not found: {run_id}")
+        if outcome == "ALREADY_TERMINAL":
+            raise ValueError(
+                f"Run '{run_id}' has already reached a terminal state and cannot be cancelled."
+            )
+
+        # ALREADY_CANCELLED and REQUESTED both return the current
+        # (idempotent) state - repeated cancellation is a no-op, not an error.
+        if outcome == "REQUESTED":
+            telemetry_collector.on_cancel_requested(
+                run_id=run_id, organization_id=effective_org, actor=actor, reason=reason,
+            )
+            rec = telemetry_store.get_run(run_id, effective_org)
+            if rec and rec.status == "CANCELLED":
+                # Was WAITING_APPROVAL - already finalized, no execution to wait for.
+                telemetry_collector.on_run_cancelled(
+                    run_id=run_id,
+                    organization_id=effective_org,
+                    current_phase=self._extract_current_node(state_snapshot),
+                    reason=reason,
+                )
+
+        rec = telemetry_store.get_run(run_id, effective_org)
+        status_val = rec.status if rec else "CANCELLING"
+        return self._build_status_response(run_id, status_val, state_snapshot)
+
     def _try_get_state(self, config: Dict[str, Any]):
         """Best-effort state retrieval; returns None on failure."""
         try:
             return self._graph.get_state(config)
         except Exception:
             return None
+
+    def get_active_runs(self) -> Dict[str, str]:
+        """Returns a snapshot of currently executing runs."""
+        with self._lock:
+            return dict(self._active_runs)
+
+    def get_active_run_count(self) -> int:
+        """Returns the number of currently executing runs."""
+        with self._lock:
+            return len(self._active_runs)
+
+    def is_ready(self) -> bool:
+        """Verifies runner readiness and checkpointer database connectivity."""
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    cursor = self._conn.execute("SELECT 1;")
+                    return cursor.fetchone() is not None
+                except Exception:
+                    return False
+            if isinstance(self._checkpointer, MemorySaver):
+                return True
+            return False
+
+    def drain(
+        self,
+        timeout_seconds: float = 30.0,
+        poll_interval_seconds: float = 0.25,
+    ) -> Dict[str, Any]:
+        """
+        Drains in-flight active runs during application shutdown.
+        Waits up to timeout_seconds for active runs to complete normally.
+        If timeout expires, triggers cooperative cancellation for remaining
+        active runs and allows a brief grace period for cleanup.
+        """
+        start_time = time.time()
+        cancelled_runs = []
+        deadline = start_time + max(0.0, timeout_seconds)
+
+        while time.time() < deadline:
+            active = self.get_active_runs()
+            if not active:
+                return {
+                    "drained": True,
+                    "active_runs_remaining": [],
+                    "cancelled_runs": cancelled_runs,
+                    "duration_seconds": time.time() - start_time,
+                }
+            time.sleep(min(poll_interval_seconds, max(0.01, deadline - time.time())))
+
+        # Drain timed out - cooperatively cancel remaining active runs
+        remaining = self.get_active_runs()
+        for run_id in list(remaining.keys()):
+            try:
+                org_id = self._run_tenants.get(run_id)
+                self.cancel_run(
+                    run_id=run_id,
+                    organization_id=org_id,
+                    reason="Server shutdown drain deadline exceeded",
+                    actor="system_shutdown",
+                )
+                cancelled_runs.append(run_id)
+            except Exception:
+                pass
+
+        # Bounded grace period for cancellations to unwind
+        grace_deadline = time.time() + min(3.0, max(0.5, timeout_seconds * 0.1))
+        while time.time() < grace_deadline:
+            active = self.get_active_runs()
+            if not active:
+                break
+            time.sleep(0.1)
+
+        final_active = list(self.get_active_runs().keys())
+        return {
+            "drained": len(final_active) == 0,
+            "active_runs_remaining": final_active,
+            "cancelled_runs": cancelled_runs,
+            "duration_seconds": time.time() - start_time,
+        }
+
+    def close(self) -> None:
+        """Closes the underlying SQLite connection if open."""
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None

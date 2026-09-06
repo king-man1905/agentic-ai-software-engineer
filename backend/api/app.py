@@ -1,12 +1,19 @@
+import asyncio
+import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Request, Response, status, Depends, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, Request, Response, status, Depends, BackgroundTasks, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+
+from backend.api.lifecycle import AppLifecycleState, LifecycleManager
+from backend.core.config import SHUTDOWN_DRAIN_TIMEOUT_SECONDS
 
 from backend.api.models import (
     ApiKeyResponse,
     AuditEventView,
+    CancelRunRequest,
     CreateApiKeyRequest,
     CreateRunRequest,
     PublishPRRequest,
@@ -37,6 +44,11 @@ from backend.security.auth import (
     AuthenticationRequiredError,
     RepositoryAccessDeniedError,
     TenantAccessDeniedError,
+)
+from backend.security.idempotency import (
+    IdempotencyConflictError,
+    compute_key_hash,
+    idempotency_store,
 )
 from backend.security.rbac import can_approve_changes
 from backend.security.tenant import tenant_manager
@@ -112,18 +124,99 @@ def get_tenant_context(request: Request) -> TenantContext:
         )
 
 
-def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """
-    Factory creating a configured FastAPI application gateway.
+    Production lifespan context manager.
+    Coordinates startup validation and graceful draining during shutdown.
     """
+    lifecycle: LifecycleManager = getattr(app.state, "lifecycle", None)
+    if lifecycle is None:
+        lifecycle = LifecycleManager(initial_state=AppLifecycleState.READY)
+        app.state.lifecycle = lifecycle
+
+    if hasattr(telemetry_store, "reopen"):
+        telemetry_store.reopen()
+
+    runner: Optional[AgentRunner] = getattr(app.state, "runner", None)
+
+    # 1. Startup validation
+    lifecycle.set_state(AppLifecycleState.STARTING)
+    lifecycle.check_readiness(runner=runner, store=telemetry_store)
+    lifecycle.set_state(AppLifecycleState.READY)
+
+    try:
+        yield
+    finally:
+        # 2. Graceful Shutdown & Drain
+        lifecycle.set_state(AppLifecycleState.DRAINING)
+        active_count = runner.get_active_run_count() if runner else 0
+        telemetry_collector.on_shutdown_started(
+            active_runs=active_count,
+            drain_timeout_seconds=lifecycle.drain_timeout_seconds,
+        )
+
+        t0 = time.time()
+        cancelled_count = 0
+        try:
+            if runner:
+                drain_res = await asyncio.to_thread(
+                    runner.drain,
+                    timeout_seconds=lifecycle.drain_timeout_seconds,
+                )
+                cancelled_count = len(drain_res.get("cancelled_runs", []))
+        except Exception as e:
+            telemetry_collector.on_shutdown_interrupted(
+                reason=f"Drain error: {str(e)}",
+                active_runs=runner.get_active_run_count() if runner else 0,
+            )
+
+        duration = time.time() - t0
+        lifecycle.set_state(AppLifecycleState.STOPPED)
+
+        try:
+            telemetry_collector.on_shutdown_completed(
+                duration_seconds=duration,
+                cancelled_runs=cancelled_count,
+            )
+        except Exception:
+            pass
+
+        try:
+            if runner:
+                runner.close()
+        except Exception:
+            pass
+
+        try:
+            telemetry_store.close()
+        except Exception:
+            pass
+
+
+def create_app(
+    runner: Optional[AgentRunner] = None,
+    drain_timeout_seconds: Optional[float] = None,
+) -> FastAPI:
+    """
+    Factory creating a configured FastAPI application gateway with lifespan management.
+    """
+    lifecycle_mgr = LifecycleManager(
+        drain_timeout_seconds=drain_timeout_seconds,
+        initial_state=AppLifecycleState.READY,
+    )
+    runner_instance = runner or AgentRunner()
+
     app = FastAPI(
         title="Agentic AI Software Engineer API Gateway",
         version="1.0.0",
         description="Production API Gateway for autonomous agent workflows with durable HITL persistence.",
+        lifespan=lifespan,
     )
 
-    # Attach shared AgentRunner instance
-    app.state.runner = runner or AgentRunner()
+    # Attach shared instances
+    app.state.lifecycle = lifecycle_mgr
+    app.state.runner = runner_instance
 
     # Middlewares
     app.add_middleware(
@@ -139,6 +232,23 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
     def get_agent_runner(request: Request) -> AgentRunner:
         return request.app.state.runner
 
+    def get_lifecycle_manager(request: Request) -> LifecycleManager:
+        lifecycle = getattr(request.app.state, "lifecycle", None)
+        if lifecycle is None:
+            lifecycle = LifecycleManager(initial_state=AppLifecycleState.READY)
+            request.app.state.lifecycle = lifecycle
+        return lifecycle
+
+    def check_accepting_work(request: Request) -> LifecycleManager:
+        lifecycle = get_lifecycle_manager(request)
+        if not lifecycle.is_accepting_work():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Server is shutting down (state: {lifecycle.state.value}). New runs are rejected.",
+                headers={"Retry-After": "10"},
+            )
+        return lifecycle
+
     # -------------------------------------------------------------------------
     # Health and Diagnostics
     # -------------------------------------------------------------------------
@@ -149,6 +259,20 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
             "service": "agentic-ai-software-engineer-api",
             "version": "1.0.0",
         }
+
+    @app.get("/health/ready", tags=["Health"])
+    def readiness_check(
+        response: Response,
+        runner_inst: AgentRunner = Depends(get_agent_runner),
+        lifecycle_inst: LifecycleManager = Depends(get_lifecycle_manager),
+    ):
+        report = lifecycle_inst.check_readiness(
+            runner=runner_inst,
+            store=telemetry_store,
+        )
+        if not report["is_ready"]:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return report
 
     # -------------------------------------------------------------------------
     # Tenancy & Context Inspection
@@ -183,9 +307,12 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
     def create_run(
         request: CreateRunRequest,
         background_tasks: BackgroundTasks,
+        idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+        lifecycle_mgr: LifecycleManager = Depends(check_accepting_work),
         runner_instance: AgentRunner = Depends(get_agent_runner),
         tenant_ctx: TenantContext = Depends(get_tenant_context),
     ) -> RunStatusResponse:
+
         # RBAC Permission Check
         if Permission.RUN_CREATE not in tenant_ctx.permissions:
             raise HTTPException(
@@ -204,7 +331,49 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
                 ),
             )
 
-        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        if idempotency_key:
+            key_hash = compute_key_hash(idempotency_key)
+            pending_run_id = f"run_{uuid.uuid4().hex[:12]}"
+            payload_dict = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+            try:
+                action, reserved_run_id, cached_resp = idempotency_store.check_or_reserve(
+                    organization_id=effective_org,
+                    idempotency_key=idempotency_key,
+                    operation="create_run",
+                    params=payload_dict,
+                    pending_run_id=pending_run_id,
+                )
+            except IdempotencyConflictError as e:
+                telemetry_collector.on_idempotency_conflict(
+                    run_id="unknown",
+                    organization_id=effective_org,
+                    operation="create_run",
+                    key_hash=key_hash,
+                    reason=str(e),
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"IDEMPOTENCY_CONFLICT: {str(e)}",
+                )
+
+            if action == "REPLAY":
+                telemetry_collector.on_idempotency_replay(
+                    run_id=reserved_run_id,
+                    organization_id=effective_org,
+                    operation="create_run",
+                    key_hash=key_hash,
+                    metadata={"replay_source": "idempotency_store"},
+                )
+                return RunStatusResponse(
+                    run_id=reserved_run_id,
+                    status="RUNNING",
+                    message="Run previously dispatched (idempotent replay)",
+                )
+
+            run_id = reserved_run_id
+        else:
+            run_id = f"run_{uuid.uuid4().hex[:12]}"
+
         try:
             runner_instance.register_run(
                 run_id=run_id,
@@ -223,6 +392,15 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
             user_id=tenant_ctx.user_id,
             repository_id=request.repository_id,
         )
+
+        if idempotency_key:
+            idempotency_store.complete_reservation(
+                organization_id=effective_org,
+                idempotency_key=idempotency_key,
+                operation="create_run",
+                status="DISPATCHED",
+                response_data={"run_id": run_id, "status": "RUNNING"},
+            )
 
         # Tamper-evident Audit Logging
         audit_logger.log(
@@ -337,9 +515,11 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
     def resume_run(
         run_id: str,
         request: ResumeRunRequest,
+        lifecycle_mgr: LifecycleManager = Depends(check_accepting_work),
         runner_instance: AgentRunner = Depends(get_agent_runner),
         tenant_ctx: TenantContext = Depends(get_tenant_context),
     ) -> RunStatusResponse:
+
         # 1. Tenant Verification
         if request.organization_id and request.organization_id != tenant_ctx.organization_id:
             raise HTTPException(
@@ -372,6 +552,38 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Run '{run_id}' not found.",
+            )
+
+        # Resume Idempotency Protection:
+        if current_status.status == "COMPLETED":
+            state_values = runner_instance.get_state_values(run_id, organization_id=tenant_ctx.organization_id)
+            existing_approval = state_values.get("approval")
+            if existing_approval and getattr(existing_approval, "approved", None) == request.approved:
+                if request.patch_hash is None or getattr(existing_approval, "patch_hash", None) == request.patch_hash:
+                    telemetry_collector.on_idempotency_replay(
+                        run_id=run_id,
+                        organization_id=tenant_ctx.organization_id,
+                        operation="resume_run",
+                        metadata={
+                            "replay_source": "runner_state",
+                            "patch_hash": request.patch_hash,
+                            "approved": request.approved,
+                        },
+                    )
+                    if hasattr(current_status, "qa_result") and not isinstance(current_status.qa_result, (QAResult, dict, type(None))):
+                        current_status.qa_result = None
+                    if hasattr(current_status, "policy_result") and not isinstance(current_status.policy_result, (PolicyEvaluationResult, dict, type(None))):
+                        current_status.policy_result = None
+                    return current_status
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Run '{run_id}' has already completed with a different decision or state.",
+            )
+
+        if current_status.status == "RUNNING":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot resume run '{run_id}': run is currently running.",
             )
 
         # 4. Elevated / Security Risk Evaluation
@@ -456,6 +668,54 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
             )
         except PermissionError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+    @app.post(
+        "/api/v1/runs/{run_id}/cancel",
+        response_model=RunStatusResponse,
+        tags=["Runs"],
+        summary="Request cancellation of an agent run",
+    )
+    def cancel_run(
+        run_id: str,
+        request: CancelRunRequest,
+        runner_instance: AgentRunner = Depends(get_agent_runner),
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> RunStatusResponse:
+        # RBAC Permission Check
+        if Permission.RUN_CANCEL not in tenant_ctx.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: Role '{tenant_ctx.role.value}' lacks RUN_CANCEL permission.",
+            )
+
+        try:
+            res = runner_instance.cancel_run(
+                run_id,
+                organization_id=tenant_ctx.organization_id,
+                reason=request.reason,
+                actor=tenant_ctx.user_id,
+            )
+        except KeyError:
+            # Also covers cross-tenant access - deliberately indistinguishable
+            # from "not found" so a cancel attempt can't be used to probe
+            # for another tenant's run_ids.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Run '{run_id}' not found.",
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+        audit_logger.log(
+            organization_id=tenant_ctx.organization_id,
+            user_id=tenant_ctx.user_id,
+            action=AuditAction.RUN_CANCELLED if res.status == "CANCELLED" else AuditAction.RUN_CANCEL_REQUESTED,
+            resource_type="run",
+            resource_id=run_id,
+            details={"reason": request.reason, "status": res.status},
+        )
+
+        return res
 
     # -------------------------------------------------------------------------
     # Audit Logs API (v1)
@@ -616,6 +876,17 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
                 detail=f"Cannot publish PR: Run '{run_id}' status is '{run_status.status}', expected 'COMPLETED' after HITL approval.",
             )
 
+        # Explicit re-check immediately before publication, per the same
+        # "check again before the irreversible action" rule as commit -
+        # redundant with the COMPLETED check above (a cancelled run can
+        # never read as COMPLETED), but this is the actual gate that must
+        # never be silently removed by an unrelated refactor of step 3.
+        if telemetry_store.is_cancelled(run_id, tenant_ctx.organization_id):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot publish PR: Run '{run_id}' was cancelled.",
+            )
+
         state_values = runner_instance.get_state_values(run_id, organization_id=tenant_ctx.organization_id)
         approval = state_values.get("approval")
         if not approval or not getattr(approval, "approved", False):
@@ -638,7 +909,25 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
                 detail="Cannot publish PR: No code changes were produced.",
             )
 
-        # 4. Repository authorization check
+        # 4. PR Publication Idempotency (Local Telemetry Store Check)
+        rec = telemetry_store.get_run(run_id, tenant_ctx.organization_id)
+        if rec and rec.pr_number and rec.pr_url:
+            telemetry_collector.on_idempotency_replay(
+                run_id=run_id,
+                organization_id=tenant_ctx.organization_id,
+                operation="publish_pr",
+                metadata={"pr_number": rec.pr_number, "pr_url": rec.pr_url},
+            )
+            return PublishPRResponse(
+                pr_number=rec.pr_number,
+                pr_url=rec.pr_url,
+                head_branch=git_diff.branch_name,
+                base_branch=request.base_branch,
+                is_draft=request.draft,
+                status="already_published",
+            )
+
+        # 5. Repository authorization check
         try:
             repo = tenant_manager.authorize_repository_access(
                 organization_id=tenant_ctx.organization_id,
@@ -651,9 +940,44 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
                 detail=f"{e.code}: {str(e)}",
             )
 
-        # 5. Create Pull Request using scoped token or client
+        # 6. Create Pull Request using scoped token or client
         token = repo.github_token or os.environ.get("GITHUB_TOKEN")
         client = GitHubClient(token=token)
+
+        # Pre-creation reconciliation check:
+        # Check if an existing PR already exists on GitHub for this branch
+        try:
+            existing_pr = client.find_pull_request(
+                repo_full_name=request.repo_full_name,
+                head_branch=git_diff.branch_name,
+                base_branch=request.base_branch,
+            )
+        except Exception:
+            existing_pr = None
+
+        if existing_pr:
+            telemetry_collector.on_pr_reconciled(
+                run_id=run_id,
+                organization_id=tenant_ctx.organization_id,
+                pr_number=existing_pr.pr_number,
+                pr_url=existing_pr.pr_url,
+                reconciliation_source="pre_creation_check",
+            )
+            telemetry_collector.on_pr_published(
+                run_id=run_id,
+                organization_id=tenant_ctx.organization_id,
+                pr_number=existing_pr.pr_number,
+                pr_url=existing_pr.pr_url,
+                is_draft=existing_pr.is_draft,
+            )
+            return PublishPRResponse(
+                pr_number=existing_pr.pr_number,
+                pr_url=existing_pr.pr_url,
+                head_branch=existing_pr.head_branch,
+                base_branch=existing_pr.base_branch,
+                is_draft=existing_pr.is_draft,
+                status="reconciled",
+            )
 
         title = request.title or f"fix: automated agent changes for {git_diff.branch_name}"
         body = f"## Automated Agent PR\n\n- **Run ID:** `{run_id}`\n- **Approved Patch Hash:** `{git_diff.patch_hash}`\n\n```diff\n{git_diff.unified_diff}\n```"
@@ -693,6 +1017,47 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
                 is_draft=pr_res.is_draft,
                 status="PUBLISHED",
             )
+        except (GitHubPRCreationError, GitHubBranchConflictError, GitHubApiError) as e:
+            # Reconcile in case PR was created or already exists on GitHub
+            try:
+                reconciled_pr = client.find_pull_request(
+                    repo_full_name=request.repo_full_name,
+                    head_branch=git_diff.branch_name,
+                    base_branch=request.base_branch,
+                )
+                if reconciled_pr:
+                    telemetry_collector.on_pr_reconciled(
+                        run_id=run_id,
+                        organization_id=tenant_ctx.organization_id,
+                        pr_number=reconciled_pr.pr_number,
+                        pr_url=reconciled_pr.pr_url,
+                        reconciliation_source="error_recovery_reconciliation",
+                    )
+                    telemetry_collector.on_pr_published(
+                        run_id=run_id,
+                        organization_id=tenant_ctx.organization_id,
+                        pr_number=reconciled_pr.pr_number,
+                        pr_url=reconciled_pr.pr_url,
+                        is_draft=reconciled_pr.is_draft,
+                    )
+                    return PublishPRResponse(
+                        pr_number=reconciled_pr.pr_number,
+                        pr_url=reconciled_pr.pr_url,
+                        head_branch=reconciled_pr.head_branch,
+                        base_branch=reconciled_pr.base_branch,
+                        is_draft=reconciled_pr.is_draft,
+                        status="reconciled",
+                    )
+            except Exception:
+                pass
+
+            audit_logger.log(tenant_ctx.organization_id, tenant_ctx.user_id, AuditAction.GITHUB_OPERATION_FAILED, "github", request.repo_full_name, {"error": getattr(e, "code", "UNKNOWN")})
+            if isinstance(e, GitHubPRCreationError):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"PR_CREATION_FAILURE: {str(e)}")
+            elif isinstance(e, GitHubBranchConflictError):
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"GITHUB_BRANCH_CONFLICT: {str(e)}")
+            else:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"GITHUB_API_FAILURE: {str(e)}")
         except GitHubAuthError as e:
             audit_logger.log(tenant_ctx.organization_id, tenant_ctx.user_id, AuditAction.GITHUB_OPERATION_FAILED, "github", request.repo_full_name, {"error": e.code})
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"GITHUB_AUTH_FAILURE: {str(e)}")
@@ -702,18 +1067,9 @@ def create_app(runner: Optional[AgentRunner] = None) -> FastAPI:
         except GitHubNotFoundError as e:
             audit_logger.log(tenant_ctx.organization_id, tenant_ctx.user_id, AuditAction.GITHUB_OPERATION_FAILED, "github", request.repo_full_name, {"error": e.code})
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"GITHUB_REPO_NOT_FOUND: {str(e)}")
-        except GitHubBranchConflictError as e:
-            audit_logger.log(tenant_ctx.organization_id, tenant_ctx.user_id, AuditAction.GITHUB_OPERATION_FAILED, "github", request.repo_full_name, {"error": e.code})
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"GITHUB_BRANCH_CONFLICT: {str(e)}")
         except GitHubRateLimitError as e:
             audit_logger.log(tenant_ctx.organization_id, tenant_ctx.user_id, AuditAction.GITHUB_OPERATION_FAILED, "github", request.repo_full_name, {"error": e.code})
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=f"GITHUB_RATE_LIMIT: {str(e)}")
-        except GitHubPRCreationError as e:
-            audit_logger.log(tenant_ctx.organization_id, tenant_ctx.user_id, AuditAction.GITHUB_OPERATION_FAILED, "github", request.repo_full_name, {"error": e.code})
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"PR_CREATION_FAILURE: {str(e)}")
-        except GitHubApiError as e:
-            audit_logger.log(tenant_ctx.organization_id, tenant_ctx.user_id, AuditAction.GITHUB_OPERATION_FAILED, "github", request.repo_full_name, {"error": e.code})
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"GITHUB_API_FAILURE: {str(e)}")
 
     # -------------------------------------------------------------------------
     # Analytics API (v1)

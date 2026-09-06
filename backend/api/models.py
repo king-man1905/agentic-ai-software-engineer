@@ -73,6 +73,17 @@ class RunStatusResponse(BaseModel):
     )
 
 
+class CancelRunRequest(BaseModel):
+    """
+    Request body for cancelling a run. Empty body is valid - a reason is
+    optional context for the audit trail, not a requirement.
+    """
+    reason: Optional[str] = Field(
+        default=None,
+        description="Optional human-readable reason for cancellation.",
+    )
+
+
 class ResumeRunRequest(BaseModel):
     """
     Request body for resuming a paused run at the HITL approval gate.
