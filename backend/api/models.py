@@ -179,12 +179,7 @@ class PublishPRResponse(BaseModel):
 
 
 from backend.schemas.telemetry import (
-    AnalyticsOverview,
-    EvaluationSummary,
     EvaluationTask,
-    FailureAnalytics,
-    ModelAnalytics,
-    QualityAnalytics,
     RunRecord,
     TelemetryEvent,
 )

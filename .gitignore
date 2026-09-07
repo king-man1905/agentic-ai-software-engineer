@@ -21,3 +21,9 @@ vector_store/
 .coverage
 htmlcov/
 *.log
+.claude/
+
+# Node & Frontend
+node_modules/
+dist/
+dist-ssr/

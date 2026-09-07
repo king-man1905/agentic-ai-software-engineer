@@ -3,7 +3,7 @@ Centralized privacy, sanitization, and secret redaction for all telemetry and an
 Prevents any credential, token, key, or sensitive header from entering persistent telemetry storage.
 """
 
-from typing import Any, Dict, List, Set
+from typing import Any, List, Set
 
 SENSITIVE_FIELD_NAMES: Set[str] = {
     "token",

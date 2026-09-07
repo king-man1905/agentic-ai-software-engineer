@@ -1,4 +1,3 @@
-import pytest
 from backend.developer.models import FilePatch
 from backend.developer.patcher import SafePatcher, validate_python_syntax
 

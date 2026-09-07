@@ -8,7 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.api.lifecycle import AppLifecycleState, LifecycleManager
-from backend.core.config import SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+from backend.core.config import (
+    FRONTEND_ORIGINS,
+    get_frontend_origins,
+)
 
 from backend.api.models import (
     ApiKeyResponse,
@@ -23,22 +26,23 @@ from backend.api.models import (
     RunListResponse,
     RunEventsResponse,
     RunEvaluationRequest,
+)
+from backend.schemas.telemetry import (
     AnalyticsOverview,
-    QualityAnalytics,
-    ModelAnalytics,
-    FailureAnalytics,
     EvaluationSummary,
+    FailureAnalytics,
+    ModelAnalytics,
+    QualityAnalytics,
 )
 from backend.graph.runner import AgentRunner
 from backend.schemas.qa import QAResult
 from backend.schemas.policy import PolicyEvaluationResult
-from backend.schemas.tenant import Permission, Role, TenantContext
+from backend.schemas.tenant import Permission, TenantContext
 from backend.observability.store import telemetry_store
 from backend.observability.collector import telemetry_collector
 from backend.observability.evaluation import EvaluationEngine
 from backend.security.audit import AuditAction, audit_logger
 from backend.security.auth import (
-    AuthenticationError,
     AuthenticationExpiredError,
     AuthenticationInvalidError,
     AuthenticationRequiredError,
@@ -197,6 +201,7 @@ async def lifespan(app: FastAPI):
 def create_app(
     runner: Optional[AgentRunner] = None,
     drain_timeout_seconds: Optional[float] = None,
+    allowed_origins: Optional[List[str]] = None,
 ) -> FastAPI:
     """
     Factory creating a configured FastAPI application gateway with lifespan management.
@@ -219,9 +224,10 @@ def create_app(
     app.state.runner = runner_instance
 
     # Middlewares
+    cors_origins = allowed_origins if allowed_origins is not None else get_frontend_origins()
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
