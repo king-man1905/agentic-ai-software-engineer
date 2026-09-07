@@ -4,7 +4,6 @@ Uses SQLite with optimized indexes and tenant-isolated SQL queries.
 """
 
 import json
-import os
 import sqlite3
 import threading
 import uuid

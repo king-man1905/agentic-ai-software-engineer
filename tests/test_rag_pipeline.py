@@ -26,7 +26,6 @@ Covers all 20 requirements from Step 11:
 
 import ast
 import hashlib
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -34,39 +33,27 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import FakeEmbeddings
 
 from backend.indexer.ast_chunker import (
-    chunk_file,
     chunk_file_with_error,
     chunk_python_code,
     compute_sha256,
     extract_imports,
-    fallback_chunk,
-    index_repository,
-    path_to_module,
 )
-from backend.indexer.models import CodeChunk, IndexingError, IndexingResult
-from backend.indexer.retriever import SimpleBM25Index
+from backend.indexer.models import CodeChunk
 from backend.rag.evaluator import (
     MAX_RETRIEVAL_ATTEMPTS,
     QueryRewriter,
     RetrievalEvaluator,
-    extract_potential_filenames,
-    extract_potential_symbols,
 )
 from backend.rag.indexer import build_project_index
 from backend.rag.retriever import (
     retrieve_project_context,
-    retrieve_project_context_with_scores,
     retrieve_structured_context,
 )
 from backend.schemas.planning import ExecutionPlan, PlanStep
 from backend.schemas.rag import (
-    RAGStatus,
     RAGTelemetry,
-    RetrievalEvaluation,
     RetrievalEvaluationStatus,
-    RetrievedDocumentView,
 )
-from backend.schemas.routing import RoutingDecision, TaskType
 
 
 # ---------------------------------------------------------------------------

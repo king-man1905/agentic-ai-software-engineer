@@ -10,7 +10,7 @@ from backend.developer.models import FilePatch
 from backend.developer.patcher import SafePatcher
 from backend.sandbox.models import TestExecutionResult
 from backend.sandbox.runner import SandboxRunner, get_sandbox_env
-from backend.schemas.qa import QualityCheck, QualityCheckStatus, FailureCategory
+from backend.schemas.qa import QualityCheck, QualityCheckStatus
 
 
 # Dangerous patterns for static AST security checks

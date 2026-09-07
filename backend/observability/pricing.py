@@ -3,7 +3,7 @@ Centralized pricing registry and cost calculator for LLM token usage.
 Supports dynamic rate updates, strict unknown pricing handling, and deterministic cost calculation.
 """
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from pydantic import BaseModel, Field
 
 

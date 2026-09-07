@@ -1,6 +1,6 @@
 import math
 import re
-from typing import List, Optional
+from typing import List
 from pydantic import BaseModel
 from backend.indexer.models import CodeChunk
 

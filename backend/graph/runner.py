@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import sqlite3
 import threading
-import uuid
 from typing import Any, Dict, Optional
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -52,7 +51,6 @@ from backend.security.auth import AuthMode
 from backend.security.tenant import tenant_manager
 from backend.vcs.workspace_lock import (
     WorkspaceLockManager,
-    WorkspaceLockTimeoutError,
     workspace_lock_manager,
 )
 from backend.graph.cancellation import RunCancelledException
