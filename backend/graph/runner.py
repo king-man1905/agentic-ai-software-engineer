@@ -265,6 +265,19 @@ class AgentRunner:
         if invoke_result and "__interrupt__" in invoke_result:
             return "WAITING_APPROVAL"
 
+        # Reaching LangGraph's END with nothing pending is a structural
+        # signal, not a business outcome - qa_router (backend/graph/nodes.py)
+        # routes straight to END once the revision budget is exhausted while
+        # QA is still failing, bypassing git_prepare/policy/approval/
+        # git_commit entirely. That path must not be reported the same as a
+        # genuine committed success: if the final QA result is not PASS and
+        # the run never reached a committed approval, the run failed.
+        qa_result = self._extract_qa_result(state_snapshot)
+        values = state_snapshot.values if state_snapshot else {}
+        approval_status = (values or {}).get("approval_status")
+        if qa_result is not None and qa_result.status != "PASS" and approval_status != "COMMITTED":
+            return "FAILED"
+
         return "COMPLETED"
 
     def _extract_current_node(self, state_snapshot) -> Optional[str]:
