@@ -191,7 +191,8 @@ class StructuredQAJudge:
         # ---------------------------------------------------------------------
         # 3. Integrate LLM Review (Supplementary Reasoning)
         # ---------------------------------------------------------------------
-        summary = "All required quality and sandbox test checks passed."
+        objective_pass_summary = "All required quality and sandbox test checks passed."
+        summary = objective_pass_summary
         failure_category = None
         if llm_qa_result:
             if llm_qa_result.issues:
@@ -205,16 +206,33 @@ class StructuredQAJudge:
             if llm_qa_result.test_cases:
                 test_cases.extend(llm_qa_result.test_cases)
 
-            if llm_qa_result.summary:
-                summary = f"{summary} LLM Review: {llm_qa_result.summary}"
-
             llm_status = (getattr(llm_qa_result, "status", None) or "").upper()
             if llm_status == "FAIL" or any(i.severity.upper() == "HIGH" for i in issues):
                 status = "FAIL"
                 failure_category = getattr(llm_qa_result, "failure_category", None) or FailureCategory.UNKNOWN_FAILURE.value
                 confidence = min(confidence, 0.40)
+                # The objective checks all passed - this FAIL comes entirely
+                # from the LLM advisory review, so the summary must reflect
+                # that verdict instead of the "all passed" text above. Use
+                # whatever explanation the LLM actually gave; if it gave none,
+                # say so plainly rather than silently keeping stale text that
+                # would contradict a FAIL status.
+                if llm_qa_result.summary:
+                    summary = f"Quality Gate FAILED: LLM advisory QA review: {llm_qa_result.summary}"
+                elif issues:
+                    summary = (
+                        f"Quality Gate FAILED: LLM advisory QA review flagged "
+                        f"{len(issues)} issue(s) without a summary explanation."
+                    )
+                else:
+                    summary = (
+                        "Quality Gate FAILED: LLM advisory QA review returned FAIL "
+                        "without a supporting summary or issues explaining why."
+                    )
             else:
                 status = "PASS"
+                if llm_qa_result.summary:
+                    summary = f"{objective_pass_summary} LLM Review: {llm_qa_result.summary}"
         else:
             status = "PASS"
 
