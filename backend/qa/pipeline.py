@@ -10,7 +10,7 @@ from backend.developer.models import FilePatch
 from backend.developer.patcher import SafePatcher
 from backend.sandbox.models import TestExecutionResult
 from backend.sandbox.runner import SandboxRunner, get_sandbox_env
-from backend.schemas.qa import QualityCheck, QualityCheckStatus
+from backend.schemas.qa import FailureCategory, QualityCheck, QualityCheckStatus
 
 
 # Dangerous patterns for static AST security checks
@@ -52,6 +52,15 @@ class QualityPipeline:
 
         repo = Path(repo_path)
         syntax_errors = []
+        # SafePatcher.apply_patch enforces two distinct things behind one
+        # result: the anchor/snippet must exist in the target file (every
+        # file type, mandatory), and - only for .py files - the patched
+        # content must parse as valid Python. Track which of those actually
+        # failed so the failure can be reported/categorized accurately
+        # instead of unconditionally calling every failure a Python/AST
+        # error (a README.md snippet mismatch is not a syntax error).
+        has_python_syntax_failure = False
+        has_patch_preflight_failure = False
 
         for patch in patches:
             abs_path = repo / patch.file_path
@@ -67,18 +76,38 @@ class QualityPipeline:
             if not result.is_valid:
                 err_msg = f"{patch.file_path}: {', '.join(result.syntax_errors or ['AST validation failed'])}"
                 syntax_errors.append(err_msg)
+                if patch.file_path.lower().endswith(".py"):
+                    has_python_syntax_failure = True
+                else:
+                    has_patch_preflight_failure = True
 
         duration_ms = int((time.time() - start) * 1000)
 
         if syntax_errors:
             summary = "\n".join(syntax_errors)
+            if has_python_syntax_failure and has_patch_preflight_failure:
+                reason = (
+                    f"AST syntax validation failed and patch pre-flight validation "
+                    f"failed, {len(syntax_errors)} patch(es) total."
+                )
+                category = "MIXED"
+            elif has_python_syntax_failure:
+                reason = f"AST syntax validation failed on {len(syntax_errors)} patch(es)."
+                category = FailureCategory.AST_FAILURE.value
+            else:
+                reason = (
+                    f"Patch pre-flight validation failed on {len(syntax_errors)} "
+                    f"patch(es) (target snippet not found; not a Python syntax error)."
+                )
+                category = FailureCategory.PATCH_APPLICATION_FAILURE.value
             return QualityCheck(
                 name="ast",
                 status=QualityCheckStatus.FAIL.value,
                 exit_code=1,
                 duration_ms=duration_ms,
                 stderr_summary=summary,
-                reason=f"AST syntax validation failed on {len(syntax_errors)} patch(es).",
+                reason=reason,
+                category=category,
             )
 
         return QualityCheck(

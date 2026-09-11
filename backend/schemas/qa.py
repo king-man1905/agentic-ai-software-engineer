@@ -12,6 +12,7 @@ class QualityCheckStatus(str, Enum):
 
 class FailureCategory(str, Enum):
     AST_FAILURE = "AST_FAILURE"
+    PATCH_APPLICATION_FAILURE = "PATCH_APPLICATION_FAILURE"
     TEST_FAILURE = "TEST_FAILURE"
     LINT_FAILURE = "LINT_FAILURE"
     TYPECHECK_FAILURE = "TYPECHECK_FAILURE"
@@ -51,6 +52,14 @@ class QualityCheck(BaseModel):
     reason: Optional[str] = Field(
         default=None,
         description="Explanation when status is SKIPPED or FAIL."
+    )
+    category: Optional[str] = Field(
+        default=None,
+        description=(
+            "For a FAIL status, further classifies the cause (e.g. AST_FAILURE, "
+            "PATCH_APPLICATION_FAILURE, or MIXED) so callers like the QA judge can "
+            "report it accurately without re-deriving it from free-text messages."
+        ),
     )
 
 

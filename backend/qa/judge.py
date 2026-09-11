@@ -66,7 +66,13 @@ class StructuredQAJudge:
                 summary=f"Quality Gate FAILED: Security analysis identified blocking vulnerabilities.\n{security_check.stderr_summary}",
             )
 
-        # Rule B: AST pre-flight validation failure
+        # Rule B: AST/patch pre-flight validation failure. check_ast's
+        # underlying SafePatcher.apply_patch enforces two different things
+        # behind one "ast" stage: the anchor/snippet must exist in the
+        # target file (every file type, mandatory), and - only for .py
+        # files - the patched content must be valid Python. `category`
+        # (set by check_ast) says which actually failed, so a non-Python
+        # file's snippet mismatch is never reported as a Python/AST error.
         if ast_check and ast_check.status == QualityCheckStatus.FAIL.value:
             issues.append(
                 QAIssue(
@@ -75,14 +81,27 @@ class StructuredQAJudge:
                     severity="HIGH",
                 )
             )
+            check_category = getattr(ast_check, "category", None)
+            if check_category == FailureCategory.PATCH_APPLICATION_FAILURE.value:
+                result_category = FailureCategory.PATCH_APPLICATION_FAILURE.value
+                summary_prefix = "Quality Gate FAILED: Proposed patch failed pre-flight validation (target snippet not found in source file)."
+            elif check_category == "MIXED":
+                result_category = FailureCategory.AST_FAILURE.value
+                summary_prefix = (
+                    "Quality Gate FAILED: Proposed patch failed pre-flight validation on one or more "
+                    "files, and introduces Python syntax or AST parsing errors on at least one .py file."
+                )
+            else:
+                result_category = FailureCategory.AST_FAILURE.value
+                summary_prefix = "Quality Gate FAILED: Proposed patch introduces Python syntax or AST parsing errors."
             return QAResult(
                 status="FAIL",
                 confidence=0.15,
                 regression_risk="HIGH",
                 checks=checks,
-                failure_category=FailureCategory.AST_FAILURE.value,
+                failure_category=result_category,
                 issues=issues,
-                summary=f"Quality Gate FAILED: Proposed patch introduces Python syntax or AST parsing errors.\n{ast_check.stderr_summary}",
+                summary=f"{summary_prefix}\n{ast_check.stderr_summary}",
             )
 
         # Rule C: Pytest execution failure (LLM can NEVER override this)
