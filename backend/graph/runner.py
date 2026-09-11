@@ -47,8 +47,9 @@ from backend.observability.collector import telemetry_collector
 from backend.observability.store import telemetry_store
 from backend.observability.telemetry import run_context
 from backend.schemas.telemetry import TelemetryEventType, TERMINAL_RUN_STATUSES
-from backend.security.auth import AuthMode
+from backend.security.auth import AuthMode, RepositoryAccessDeniedError, TenantAccessDeniedError
 from backend.security.tenant import tenant_manager
+from backend.vcs.git_manager import GitWorkspaceManager
 from backend.vcs.workspace_lock import (
     WorkspaceLockManager,
     workspace_lock_manager,
@@ -461,6 +462,71 @@ class AgentRunner:
             metadata=metadata,
         )
 
+    def _ensure_workspace_provisioned(
+        self,
+        project_id: Optional[str],
+        repository_id: Optional[str],
+        organization_id: str,
+    ) -> None:
+        """
+        Clones the registered, authorized repository behind `repository_id`
+        into workspace/<project_id> when that directory doesn't already
+        exist - the only place in the API-driven run path that turns a
+        registered GitHub repository into a local checkout (previously
+        only backend/integrations/run_github_bot.py's standalone CLI had
+        this, unreachable from POST /api/v1/runs).
+
+        A no-op (returns immediately, nothing cloned) when:
+        - project_id or repository_id is missing - runs with no associated
+          repository are unaffected.
+        - the workspace already exists - idempotent, never re-clones.
+        - the repository isn't registered/authorized for this tenant -
+          never clones a repo this caller isn't authorized to access;
+          existing RAG_INSUFFICIENT_CONTEXT/"don't guess" behavior takes
+          over unchanged, exactly as if this method didn't exist.
+
+        Raises RuntimeError (caught by start_run's existing exception
+        handler, which records an explicit FAILED run) if the repository
+        IS authorized but cloning it fails - never falls through silently
+        to a misleading RAG_INSUFFICIENT_CONTEXT/QA-failure trail.
+
+        SECURITY: the resolved GitHub token is embedded only in the local
+        `clone_url` variable and the argv GitWorkspaceManager.clone_repository
+        passes to the git subprocess - never logged, printed, or included
+        in the RuntimeError message (which names only the project/repo,
+        never the URL) raised on failure.
+        """
+        if not project_id or not repository_id:
+            return
+
+        project_path = Path("workspace") / project_id
+        if not project_path.exists():
+            project_path = Path(os.getcwd()) / "workspace" / project_id
+        if project_path.exists():
+            return
+
+        try:
+            repo = tenant_manager.authorize_repository_access(
+                organization_id=organization_id,
+                repo_full_name=repository_id,
+            )
+        except (TenantAccessDeniedError, RepositoryAccessDeniedError):
+            return
+
+        full_name = repo.full_name or repository_id
+        token = repo.github_token or os.environ.get("GITHUB_TOKEN")
+        if token:
+            clone_url = f"https://x-access-token:{token}@github.com/{full_name}.git"
+        else:
+            clone_url = f"https://github.com/{full_name}.git"
+
+        cloned = GitWorkspaceManager.clone_repository(clone_url, str(project_path))
+        if not cloned:
+            raise RuntimeError(
+                f"WORKSPACE_PROVISIONING_FAILED: could not clone repository "
+                f"for project '{project_id}'."
+            )
+
     def start_run(
         self,
         run_id: str,
@@ -525,6 +591,11 @@ class AgentRunner:
         try:
             with self._lock_manager.acquire(effective_org, resource_id, run_id):
                 with run_context(run_id, effective_org):
+                    self._ensure_workspace_provisioned(
+                        project_id=project_id,
+                        repository_id=repository_id,
+                        organization_id=effective_org,
+                    )
                     invoke_result = self._graph.invoke(initial_state, config=config)
             state_snapshot = self._graph.get_state(config)
             status = self._derive_status(state_snapshot, invoke_result)
