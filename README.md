@@ -88,6 +88,23 @@ uvicorn backend.api.app:app --reload
 # open http://127.0.0.1:8000/dashboard/
 ```
 
+### Control Plane Local Development
+
+The React control plane (`frontend/`) is a separate dev server from the FastAPI backend; run both side by side in two terminals:
+
+```bash
+# Terminal 1 - backend, from the project's .venv (see Quickstart above)
+uvicorn backend.api.app:app --reload
+
+# Terminal 2 - frontend, from the frontend directory
+cd frontend
+npm install
+npm run dev
+```
+
+- Backend: http://127.0.0.1:8000
+- Frontend: http://localhost:5173 (proxies `/api` and `/health` to the backend)
+
 Resolve a real GitHub issue from the CLI:
 
 ```bash
