@@ -689,6 +689,35 @@ class TelemetryCollector:
                 },
             )
 
+    def on_workspace_lock_stale_recovered(
+        self,
+        run_id: str,
+        organization_id: str = "default-org",
+        resource_id: str = "default",
+        stale_owner_run_id: str = "unknown",
+        stale_owner_pid: int = 0,
+        stale_owner_status: str = "unknown",
+    ) -> None:
+        """Records WORKSPACE_LOCK_STALE_RECOVERED when an orphaned lock entry is
+        safely evicted from in-process state because the owning PID is confirmed
+        dead and the owning run is in a terminal state in telemetry."""
+        effective_org = self._resolve_org(run_id, organization_id)
+        with _telemetry_guard("failed on_workspace_lock_stale_recovered"):
+            self.record_event(
+                run_id=run_id,
+                organization_id=effective_org,
+                event_type=TelemetryEventType.WORKSPACE_LOCK_STALE_RECOVERED,
+                metadata={
+                    "run_id": run_id,
+                    "organization_id": effective_org,
+                    "resource_id": resource_id,
+                    "stale_owner_run_id": stale_owner_run_id,
+                    "stale_owner_pid": stale_owner_pid,
+                    "stale_owner_status": stale_owner_status,
+                    "outcome": "STALE_RECOVERED",
+                },
+            )
+
     def on_idempotency_replay(
         self,
         run_id: str,
