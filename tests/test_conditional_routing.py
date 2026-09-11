@@ -333,6 +333,62 @@ class TestNodeFallbacks:
         assert isinstance(output["plan"], ExecutionPlan)
         assert output["plan"].goal == "Fix login bug"
 
+    def test_developer_node_gives_patch_prompt_one_contiguous_readme_block(self, tmp_path, monkeypatch):
+        """
+        Integration check for the fragmentation fix: developer_node's
+        exact-snippet patch-generation prompt must contain README.md
+        exactly once, as its full verbatim content - not split across
+        multiple overlapping "FILE: README.md (Lines ...)" fragments.
+        """
+        import os
+        from pathlib import Path
+        from backend.graph.nodes import developer_node
+        from backend.schemas.developer import DeveloperResult
+        from backend.schemas.planning import ExecutionPlan
+
+        project_id = "consolidation_test_proj_xyz"
+        workspace_dir = tmp_path / "workspace" / project_id
+        workspace_dir.mkdir(parents=True)
+        content = "\n".join(f"## Section {i}\nBody text for section {i}.\n" for i in range(1, 60))
+        (workspace_dir / "README.md").write_text(content, encoding="utf-8")
+
+        # Force nodes.py's os.getcwd()-based fallback path to resolve into
+        # this tmp workspace instead of the real repo's workspace/.
+        assert not (Path("workspace") / project_id).exists()
+        monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="x", changes=[], requires_testing=True, notes=[]
+            ),
+        )
+        monkeypatch.setattr("backend.services.llm.get_llm", lambda: object())
+
+        captured_prompts = []
+
+        class _FakePatchResult:
+            patches = []
+
+        def fake_invoke_structured(llm, schema, prompt):
+            captured_prompts.append(prompt)
+            return _FakePatchResult()
+
+        monkeypatch.setattr("backend.graph.nodes.invoke_structured", fake_invoke_structured)
+
+        state: AgentState = {
+            "user_message": "Update README",
+            "project_id": project_id,
+            "plan": ExecutionPlan(goal="Update README", steps=[], success_criteria="Done"),
+        }
+
+        developer_node(state)
+
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        assert prompt.count("FILE: README.md") == 1
+        assert content in prompt
+
     def test_revision_node_handles_missing_plan_safely(self, monkeypatch):
         from backend.graph.nodes import revision_node
         from backend.schemas.developer import DeveloperResult

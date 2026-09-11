@@ -283,6 +283,99 @@ def chunk_file(absolute_path: str, relative_path: str) -> List[CodeChunk]:
     return chunks
 
 
+# Files at or under this size are small enough that giving the developer's
+# exact-original-snippet patch-generation prompt one contiguous, verbatim
+# view is safe for the LLM's context budget - roughly a few thousand
+# tokens, well inside any current model's window - and removes the
+# chunk-boundary/overlap-seam ambiguity fallback_chunk() intentionally
+# accepts for its actual job (RAG-retrieval-granularity chunking). This is
+# NOT a general "load anything" escape hatch: anything larger still goes
+# through the existing bounded fallback_chunk() path unchanged.
+WHOLE_FILE_CONTEXT_MAX_CHARS = 20_000
+
+
+def whole_file_chunk_for_patch_context(
+    absolute_path: str, relative_path: str
+) -> Optional[CodeChunk]:
+    """
+    Returns a single CodeChunk holding a non-Python file's complete,
+    verbatim, on-disk content - read directly from the workspace file, not
+    reconstructed from fragments - for use only when assembling context for
+    the developer's exact-original-snippet patch-generation prompt.
+
+    Returns None (caller should fall back to chunk_file()/fallback_chunk())
+    when the file is Python, missing, unreadable, or larger than
+    WHOLE_FILE_CONTEXT_MAX_CHARS. Never used for RAG/indexing.
+    """
+    if absolute_path.lower().endswith(".py"):
+        return None
+    try:
+        with open(absolute_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception:
+        return None
+    if len(content) > WHOLE_FILE_CONTEXT_MAX_CHARS:
+        return None
+
+    total_lines = max(len(content.splitlines()), 1)
+    return CodeChunk(
+        file_path=relative_path,
+        chunk_type="fallback",
+        symbol_name=None,
+        content=content,
+        start_line=1,
+        end_line=total_lines,
+        docstring=None,
+        decorators=[],
+        module=path_to_module(relative_path),
+        symbol_type="test" if is_test_path(relative_path) else ("config" if is_config_path(relative_path) else "fallback"),
+        source_hash=compute_sha256(content),
+    )
+
+
+def build_patch_context_chunks(chunks: List[CodeChunk], project_root: str) -> List[CodeChunk]:
+    """
+    Prepares context specifically for the developer's exact-snippet
+    patch-generation prompt: for each small, non-Python file represented in
+    `chunks` (regardless of how many fragments of it are present), replaces
+    those fragments with one chunk holding the file's complete content from
+    whole_file_chunk_for_patch_context(), so the LLM is given a single
+    authoritative view of the file it must quote an exact substring from
+    instead of overlapping 100-line fallback chunks.
+
+    Python files, and non-Python files that are missing/unreadable/larger
+    than the threshold, pass through with their original chunks unchanged.
+    This never touches fallback_chunk()/chunk_file() themselves, so
+    RAG/indexing and retrieval keep their existing chunking behavior -
+    this function only reshapes the list handed to this one prompt.
+    """
+    root = Path(project_root)
+    whole_cache: dict = {}
+    emitted_whole: set = set()
+    resolved: List[CodeChunk] = []
+
+    for chunk in chunks:
+        fp = chunk.file_path
+        if fp.lower().endswith(".py"):
+            resolved.append(chunk)
+            continue
+
+        if fp not in whole_cache:
+            whole_cache[fp] = whole_file_chunk_for_patch_context(str(root / fp), fp)
+        whole = whole_cache[fp]
+
+        if whole is None:
+            resolved.append(chunk)
+            continue
+
+        if fp not in emitted_whole:
+            resolved.append(whole)
+            emitted_whole.add(fp)
+        # else: a later fragment of a file already consolidated above - drop it.
+
+    return resolved
+
+
 def index_repository(
     project_path: str, max_size_kb: int = 500
 ) -> IndexingResult:

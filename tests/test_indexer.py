@@ -3,10 +3,15 @@ import pytest
 from backend.indexer.models import CodeChunk, ScannedFile
 from backend.indexer.scanner import scan_repository
 from backend.indexer.ast_chunker import (
+    build_patch_context_chunks,
     chunk_file,
     chunk_python_code,
     fallback_chunk,
+    whole_file_chunk_for_patch_context,
+    WHOLE_FILE_CONTEXT_MAX_CHARS,
 )
+from backend.developer.models import FilePatch
+from backend.developer.patcher import SafePatcher
 
 
 def test_scan_repository(tmp_path):
@@ -223,3 +228,113 @@ def test_chunk_file_routing(tmp_path):
     assert chunks[0].chunk_type == "fallback"
     assert chunks[0].symbol_name is None
     assert "print('Hello')" in chunks[0].content
+
+
+# ---------------------------------------------------------------------------
+# Patch-generation context consolidation (developer's exact-snippet prompt)
+# ---------------------------------------------------------------------------
+
+
+def _readme_content(n_lines: int) -> str:
+    return "\n".join(f"## Section {i}\nSome body text for section {i}.\n" for i in range(1, n_lines + 1))
+
+
+def test_build_patch_context_chunks_readme_becomes_one_contiguous_block(tmp_path):
+    """A. A small non-Python file (README.md) under the size threshold is
+    consolidated into ONE contiguous chunk instead of fallback_chunk()'s
+    overlapping fragments."""
+    readme = tmp_path / "README.md"
+    content = _readme_content(60)  # well over 100 lines, under the char threshold
+    readme.write_text(content, encoding="utf-8")
+    assert len(content) < WHOLE_FILE_CONTEXT_MAX_CHARS
+
+    fragmented = chunk_file(str(readme), "README.md")
+    assert len(fragmented) > 1  # confirms this file DOES get fragmented today
+
+    consolidated = build_patch_context_chunks(fragmented, str(tmp_path))
+    readme_chunks = [c for c in consolidated if c.file_path == "README.md"]
+    assert len(readme_chunks) == 1
+    assert readme_chunks[0].content == content
+    assert readme_chunks[0].start_line == 1
+
+
+def test_build_patch_context_chunks_output_supports_exact_snippet_match(tmp_path):
+    """B. An original_code_snippet drawn from the consolidated block is a
+    real, exact substring of the on-disk file, so SafePatcher.apply_patch
+    (unmodified) accepts it - proving the fragmentation bug is closed."""
+    readme = tmp_path / "README.md"
+    content = "# Project\n\n## Existing Section\n\nSome existing body text.\n"
+    readme.write_text(content, encoding="utf-8")
+
+    fragmented = chunk_file(str(readme), "README.md")
+    consolidated = build_patch_context_chunks(fragmented, str(tmp_path))
+    readme_chunk = next(c for c in consolidated if c.file_path == "README.md")
+
+    anchor = "## Existing Section\n\nSome existing body text.\n"
+    assert anchor in readme_chunk.content  # the LLM's context really contains this verbatim
+
+    patch = FilePatch(
+        file_path="README.md",
+        original_code_snippet=anchor,
+        updated_code_snippet="## New Section\n\nUpdated body text.\n",
+        explanation="Add a new section",
+    )
+    result = SafePatcher.apply_patch(content, patch)
+    assert result.is_valid is True
+    assert "## New Section" in result.applied_content
+
+
+def test_build_patch_context_chunks_large_non_python_file_unchanged(tmp_path):
+    """C. A non-Python file at/above the threshold keeps the existing
+    bounded fallback_chunk() fragmentation - no whole-file consolidation."""
+    big_file = tmp_path / "CHANGELOG.md"
+    content = "x" * (WHOLE_FILE_CONTEXT_MAX_CHARS + 1)
+    big_file.write_text(content, encoding="utf-8")
+
+    assert whole_file_chunk_for_patch_context(str(big_file), "CHANGELOG.md") is None
+
+    fragmented = chunk_file(str(big_file), "CHANGELOG.md")
+    consolidated = build_patch_context_chunks(fragmented, str(tmp_path))
+    assert consolidated == fragmented
+
+
+def test_build_patch_context_chunks_python_files_unchanged(tmp_path):
+    """D. Python files retain their existing AST-chunking behavior - never
+    whole-filed, chunks passed through identically."""
+    py_file = tmp_path / "sample.py"
+    py_file.write_text("def a():\n    pass\n\n\ndef b():\n    pass\n", encoding="utf-8")
+
+    assert whole_file_chunk_for_patch_context(str(py_file), "sample.py") is None
+
+    original_chunks = chunk_file(str(py_file), "sample.py")
+    consolidated = build_patch_context_chunks(original_chunks, str(tmp_path))
+    assert consolidated == original_chunks
+    assert all(c.chunk_type in ("function", "fallback") for c in consolidated)
+
+
+def test_safe_patcher_still_rejects_incorrect_snippet(tmp_path):
+    """E. SafePatcher.apply_patch (unmodified) still rejects a mismatched
+    anchor - patch pre-flight/anchor validation remains mandatory."""
+    content = "# Project\n\nSome existing content.\n"
+    patch = FilePatch(
+        file_path="README.md",
+        original_code_snippet="## Section That Does Not Exist\n",
+        updated_code_snippet="## New Section\n",
+        explanation="Add a new section",
+    )
+    result = SafePatcher.apply_patch(content, patch)
+    assert result.is_valid is False
+    assert "Target original snippet not found" in result.syntax_errors[0]
+
+
+def test_fallback_chunk_and_chunk_file_behavior_unchanged():
+    """F. fallback_chunk()/chunk_file() themselves - used by RAG/indexing
+    and retrieval - are untouched: re-run the pre-existing fixture from
+    test_fallback_chunker() and confirm identical results."""
+    content = "\n".join(f"Line {i}" for i in range(1, 15))
+    chunks = fallback_chunk(content, "test.txt", chunk_size_lines=5, overlap_lines=2)
+    assert len(chunks) == 4
+    assert chunks[0].start_line == 1 and chunks[0].end_line == 5
+    assert chunks[1].start_line == 4 and chunks[1].end_line == 8
+    assert chunks[2].start_line == 7 and chunks[2].end_line == 11
+    assert chunks[3].start_line == 10 and chunks[3].end_line == 14
