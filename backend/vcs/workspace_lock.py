@@ -6,6 +6,8 @@ cross-process OS file locking) ensuring safe serialization of runs touching
 the same mutable workspace while allowing independent resources and distinct tenants
 to execute concurrently with strict isolation.
 """
+# NOTE: workspace_lock imports telemetry_store lazily (inside the recovery
+# helper) to avoid a circular import: telemetry_store → config, not → vcs.
 
 import contextlib
 import hashlib
@@ -74,6 +76,39 @@ def _release_os_lock(fd: int) -> None:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except (OSError, IOError):
             pass
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Returns True if *pid* belongs to a live process, False if it is
+    definitively dead.  Defaults to True (fail-closed) on any unexpected
+    error so we never falsely evict a lock held by a live process."""
+    if pid <= 0:
+        return True  # invalid PID → treat as alive (fail-closed)
+    try:
+        # os.kill(pid, 0) does not send a signal; it only checks existence.
+        # Raises ProcessLookupError / OSError(ESRCH) when the process is gone.
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we lack permission to signal it → still alive.
+        return True
+    except OSError:
+        # Other OS errors → fail-closed, assume alive.
+        return True
+
+
+def _read_lock_file_metadata(lock_file: Path) -> Optional[Dict[str, Any]]:
+    """Reads and parses the JSON metadata written into a lock file.
+    Returns None (fail-closed) if the file cannot be read or parsed."""
+    try:
+        raw = lock_file.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception:
+        return None
 
 
 class WorkspaceLockManager:
@@ -227,7 +262,16 @@ class WorkspaceLockManager:
                         except Exception:
                             pass
 
-                # Failed OS lock; release thread lock and wait
+                # Failed OS lock; try stale-lock recovery before releasing
+                # the thread lock.  Recovery clears in-process state only;
+                # it never deletes the lock file.
+                self._try_recover_stale_lock(
+                    resource_key=resource_key,
+                    lock_file=lock_file,
+                    requesting_run_id=run_id,
+                    organization_id=organization_id,
+                    resource_id=norm_resource,
+                )
                 thread_lock.release()
 
             if time.time() >= deadline:
@@ -302,6 +346,111 @@ class WorkspaceLockManager:
             organization_id=organization_id,
             resource_id=norm_resource,
             held_duration_ms=held_duration_ms,
+        )
+
+    def _try_recover_stale_lock(
+        self,
+        resource_key: str,
+        lock_file: Path,
+        requesting_run_id: str,
+        organization_id: str,
+        resource_id: str,
+    ) -> None:
+        """
+        Attempts to evict an orphaned in-process lock entry when all of the
+        following conditions are simultaneously satisfied:
+
+        1. A lock file exists and contains parseable JSON metadata.
+        2. The ``owner_pid`` recorded in the metadata belongs to a dead process.
+        3. The ``run_id`` recorded in the metadata corresponds to a run that
+           has reached a terminal state (FAILED, COMPLETED, CANCELLED, BLOCKED)
+           in the authoritative telemetry store.
+
+        If *any* condition cannot be verified (unreadable file, live PID,
+        non-terminal or absent telemetry record, exception), the method returns
+        silently without touching anything — fail-closed behaviour.
+
+        What recovery does:
+        - Removes the resource_key from the in-process ``_lock_owners``,
+          ``_open_fds``, and ``_thread_locks`` dictionaries so that the next
+          ``_try_os_lock()`` call can attempt a fresh acquisition.
+        - Does NOT delete or truncate the lock file (the OS byte-range lock may
+          still be held by an inherited file descriptor in a reloaded process;
+          deleting the directory entry would be unsafe).
+        - Emits a WORKSPACE_LOCK_STALE_RECOVERED telemetry event for audit.
+        """
+        # ── 1. Read and parse lock file metadata ────────────────────────────
+        metadata = _read_lock_file_metadata(lock_file)
+        if not metadata:
+            return  # unreadable → fail-closed
+
+        stale_pid: Optional[int] = metadata.get("owner_pid")
+        stale_run_id: Optional[str] = metadata.get("run_id")
+        stale_org: Optional[str] = metadata.get("organization_id")
+
+        if not stale_pid or not stale_run_id:
+            return  # incomplete metadata → fail-closed
+
+        # ── 2. Confirm the owning PID is dead ───────────────────────────────
+        if _is_pid_alive(stale_pid):
+            return  # process is alive → never evict
+
+        # ── 3. Confirm the owning run is in a terminal state ─────────────────
+        # Lazy import to avoid a circular dependency at module load time.
+        try:
+            from backend.observability.store import telemetry_store as _store
+            from backend.schemas.telemetry import TERMINAL_RUN_STATUSES as _TERMINAL
+        except ImportError:
+            return  # import failure → fail-closed
+
+        try:
+            run_record = _store.get_run(stale_run_id, stale_org)
+        except Exception:
+            return  # telemetry unavailable → fail-closed
+
+        if run_record is None:
+            return  # no record → cannot confirm terminal → fail-closed
+
+        stale_status = str(run_record.status)
+        if stale_status not in _TERMINAL:
+            return  # run is still active → never evict
+
+        # ── All three conditions met: safely evict in-process state ──────────
+        with self._global_lock:
+            # Double-check under the global lock: another thread may have
+            # already acquired the lock legitimately between our OS attempt
+            # and now.  Only evict if the stored owner still matches the
+            # stale metadata we read from the file.
+            current_owner = self._lock_owners.get(resource_key)
+            if current_owner is not None:
+                # A legitimate in-process owner is present — do not evict.
+                return
+
+            # No in-process owner entry (in-process dict was already cleared
+            # by the process crash / restart).  Clear any residual FD/thread
+            # lock entries that may have leaked.
+            stale_fd = self._open_fds.pop(resource_key, None)
+            self._held_start_times.pop(resource_key, None)
+            # Remove the thread lock entry so a fresh RLock is created on
+            # the next acquire_lock() call for this resource.
+            self._thread_locks.pop(resource_key, None)
+
+        # Close any stale FD that was still tracked in this process.
+        if stale_fd is not None:
+            try:
+                _release_os_lock(stale_fd)
+                os.close(stale_fd)
+            except Exception:
+                pass
+
+        # Emit an observable telemetry event for audit/alerting.
+        telemetry_collector.on_workspace_lock_stale_recovered(
+            run_id=requesting_run_id,
+            organization_id=organization_id,
+            resource_id=resource_id,
+            stale_owner_run_id=stale_run_id,
+            stale_owner_pid=stale_pid,
+            stale_owner_status=stale_status,
         )
 
     @contextlib.contextmanager

@@ -46,7 +46,7 @@ from backend.schemas.rag import RetrievalEvaluation, RAGTelemetry
 from backend.observability.collector import telemetry_collector
 from backend.observability.store import telemetry_store
 from backend.observability.telemetry import run_context
-from backend.schemas.telemetry import TelemetryEventType
+from backend.schemas.telemetry import TelemetryEventType, TERMINAL_RUN_STATUSES
 from backend.security.auth import AuthMode
 from backend.security.tenant import tenant_manager
 from backend.vcs.workspace_lock import (
@@ -701,6 +701,20 @@ class AgentRunner:
         # checkpoint's own interrupt marker.
         if telemetry_store.is_cancelled(run_id, effective_org):
             raise ValueError(f"Run '{run_id}' has been cancelled and cannot be resumed.")
+
+        # Guard: reject resume if the run has already reached a terminal state.
+        # The telemetry store is the authoritative source of run status — the
+        # LangGraph checkpoint's state.next may still appear "paused" even after
+        # a run has FAILED (the checkpoint records graph position, not run
+        # outcome).  Allowing a resume on a terminal run caused the
+        # WORKSPACE_LOCK_TIMEOUT incident: resume_run() re-acquired the lock,
+        # the resumed graph invocation crashed, and the lock was never released.
+        run_record = telemetry_store.get_run(run_id, effective_org)
+        if run_record is not None and str(run_record.status) in TERMINAL_RUN_STATUSES:
+            raise ValueError(
+                f"Run '{run_id}' is already in a terminal state "
+                f"(status='{run_record.status}') and cannot be resumed."
+            )
 
         if not state_snapshot.next:
             raise ValueError(
