@@ -180,7 +180,13 @@ export const RunDetailPage: React.FC<RunDetailPageProps> = ({
           )}
 
           {/* Stepper Visualizer */}
-          <PipelineStepper currentNode={runStatus?.current_node} status={status} />
+          <PipelineStepper
+            currentNode={runStatus?.current_node}
+            status={status}
+            prNumber={runStatus?.pr_number}
+            prUrl={runStatus?.pr_url}
+            prStatus={runStatus?.pr_status}
+          />
         </div>
       </div>
 

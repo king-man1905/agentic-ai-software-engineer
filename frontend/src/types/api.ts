@@ -36,6 +36,9 @@ export interface RunStatusResponse {
   policy_result?: PolicyEvaluationResult | null;
   error_summary?: string | null;
   message?: string | null;
+  pr_number?: number | null;
+  pr_url?: string | null;
+  pr_status?: string | null;
 }
 
 export interface CancelRunRequest {

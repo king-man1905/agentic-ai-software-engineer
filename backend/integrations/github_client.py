@@ -225,12 +225,28 @@ class GitHubClient:
                     f"GitHub API service error ({response.status_code}): {response.text}",
                     status_code=response.status_code,
                 )
-            response.raise_for_status()
-
             data = response.json()
+            if not isinstance(data, dict):
+                raise GitHubApiError(
+                    f"GitHub PR response is invalid: expected JSON object, got {type(data).__name__}.",
+                    status_code=response.status_code,
+                )
+            raw_number = data.get("number")
+            raw_url = data.get("html_url")
+            if raw_number is None or not isinstance(raw_number, int) or raw_number <= 0:
+                raise GitHubApiError(
+                    f"GitHub PR response missing valid PR number: got {raw_number!r}.",
+                    status_code=response.status_code,
+                )
+            if not raw_url or not isinstance(raw_url, str) or not raw_url.strip():
+                raise GitHubApiError(
+                    f"GitHub PR response missing valid html_url: got {raw_url!r}.",
+                    status_code=response.status_code,
+                )
+
             return GitHubPRResult(
-                pr_number=data.get("number", 0),
-                pr_url=data.get("html_url", ""),
+                pr_number=raw_number,
+                pr_url=raw_url.strip(),
                 head_branch=head_branch,
                 base_branch=base_branch,
                 is_draft=data.get("draft", draft),
@@ -317,9 +333,21 @@ class GitHubClient:
                     if pr_head == head_branch or pr_head == clean_head:
                         if base_branch and pr_base and pr_base != base_branch:
                             continue
+                        raw_number = pr.get("number")
+                        raw_url = pr.get("html_url")
+                        if raw_number is None or not isinstance(raw_number, int) or raw_number <= 0:
+                            raise GitHubApiError(
+                                f"GitHub PR response missing valid PR number: got {raw_number!r}.",
+                                status_code=response.status_code,
+                            )
+                        if not raw_url or not isinstance(raw_url, str) or not raw_url.strip():
+                            raise GitHubApiError(
+                                f"GitHub PR response missing valid html_url: got {raw_url!r}.",
+                                status_code=response.status_code,
+                            )
                         return GitHubPRResult(
-                            pr_number=pr.get("number", 0),
-                            pr_url=pr.get("html_url", ""),
+                            pr_number=raw_number,
+                            pr_url=raw_url.strip(),
                             head_branch=pr_head or clean_head,
                             base_branch=pr_base or base_branch or "main",
                             is_draft=pr.get("draft", False),

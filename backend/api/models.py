@@ -71,6 +71,18 @@ class RunStatusResponse(BaseModel):
         default=None,
         description="Optional human-readable informational message regarding the run dispatch or lifecycle.",
     )
+    pr_number: Optional[int] = Field(
+        default=None,
+        description="GitHub Pull Request number, if published.",
+    )
+    pr_url: Optional[str] = Field(
+        default=None,
+        description="GitHub Pull Request web URL, if published.",
+    )
+    pr_status: Optional[str] = Field(
+        default=None,
+        description="GitHub Pull Request status (e.g. PUBLISHED, DRAFT, FAILED), if applicable.",
+    )
 
 
 class CancelRunRequest(BaseModel):
