@@ -403,27 +403,47 @@ def developer_node(state: AgentState) -> dict:
         )
 
         repo_context = state.get("repo_context")
-        if not repo_context and state.get("project_id"):
+
+        # Resolved only when a real project_id is present, matching the
+        # self-scan gate below - never inferred/defaulted, so consolidation
+        # can't accidentally read a different project's workspace when
+        # repo_context was supplied without a project_id.
+        project_path = None
+        if state.get("project_id"):
             import os
             from pathlib import Path
             project_path = Path("workspace") / state["project_id"]
             if not project_path.exists():
                 project_path = Path(os.getcwd()) / "workspace" / state["project_id"]
-            if project_path.exists():
-                try:
-                    from backend.indexer.scanner import scan_repository
-                    from backend.indexer.ast_chunker import chunk_file
-                    scanned_files = scan_repository(str(project_path))
-                    all_chunks = []
-                    for sf in scanned_files:
-                        all_chunks.extend(chunk_file(sf.absolute_path, sf.relative_path))
-                    repo_context = all_chunks
-                except Exception as e:
-                    print(f"Developer node context scan notice: {e}")
+
+        if not repo_context and project_path is not None and project_path.exists():
+            try:
+                from backend.indexer.scanner import scan_repository
+                from backend.indexer.ast_chunker import chunk_file
+                scanned_files = scan_repository(str(project_path))
+                all_chunks = []
+                for sf in scanned_files:
+                    all_chunks.extend(chunk_file(sf.absolute_path, sf.relative_path))
+                repo_context = all_chunks
+            except Exception as e:
+                print(f"Developer node context scan notice: {e}")
 
         generated_patches = []
 
         if repo_context:
+            # Give the exact-snippet patch-generation prompt below one
+            # authoritative, contiguous view of small non-Python files
+            # (README.md, config, etc.) instead of fallback_chunk()'s
+            # overlapping 100-line fragments - the LLM was generating
+            # original_code_snippet anchors from fragmented/duplicated
+            # context that didn't byte-match the real file. RAG/indexing
+            # (chunk_file/fallback_chunk themselves) are untouched.
+            if project_path is not None and project_path.exists():
+                try:
+                    from backend.indexer.ast_chunker import build_patch_context_chunks
+                    repo_context = build_patch_context_chunks(repo_context, str(project_path))
+                except Exception as e:
+                    print(f"Patch context consolidation notice: {e}")
             context_str = format_categorized_context(repo_context)
             rag_eval = state.get("rag_evaluation")
             context_warning = ""
