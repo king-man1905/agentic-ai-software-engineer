@@ -25,7 +25,7 @@ from backend.revision.models import RevisionAttempt, RevisionHistory
 from backend.sandbox.models import TestExecutionResult
 from backend.schemas.developer import DeveloperResult
 from backend.schemas.planning import ExecutionPlan, PlanStep
-from backend.schemas.qa import FailureCategory, QualityCheck, QualityCheckStatus, QAResult
+from backend.schemas.qa import FailureCategory, QAIssue, QualityCheck, QualityCheckStatus, QAResult
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +378,98 @@ def test_judge_confidence_bounds():
     qa_good = StructuredQAJudge.evaluate(good_checks)
     assert 0.0 <= qa_good.confidence <= 1.0
     assert qa_good.confidence >= 0.85
+
+
+# ---------------------------------------------------------------------------
+# LLM advisory FAIL must never leave a contradictory "all passed" summary
+# (run_3ab2193a5e3a: objective checks all PASS/SKIPPED, LLM advisory returned
+# status="FAIL" with no summary/issues, and the resulting QAResult kept the
+# "All required quality and sandbox test checks passed." placeholder text
+# next to status="FAIL".)
+# ---------------------------------------------------------------------------
+
+
+def test_judge_objective_pass_llm_pass_keeps_passed_summary():
+    """Baseline, unchanged: objective checks pass and the LLM advisory also
+    passes -> the normal 'all passed' summary is used, status PASS."""
+    checks = [
+        QualityCheck(name="ast", status=QualityCheckStatus.PASS.value),
+        QualityCheck(name="pytest", status=QualityCheckStatus.PASS.value),
+        QualityCheck(name="security", status=QualityCheckStatus.PASS.value),
+    ]
+    llm_result = QAResult(status="PASS", confidence=0.9, summary="Looks good.")
+
+    qa_result = StructuredQAJudge.evaluate(checks, llm_qa_result=llm_result)
+    assert qa_result.status == "PASS"
+    assert "passed" in qa_result.summary.lower()
+
+
+def test_judge_llm_fail_without_explanation_produces_honest_summary():
+    """
+    Objective checks all pass, but the LLM advisory review returns FAIL with
+    no summary and no issues. The final summary must never claim everything
+    passed next to a FAIL status - it must clearly say the LLM advisory
+    review failed without an explanation.
+    """
+    checks = [
+        QualityCheck(name="ast", status=QualityCheckStatus.PASS.value),
+        QualityCheck(name="pytest", status=QualityCheckStatus.SKIPPED.value),
+        QualityCheck(name="security", status=QualityCheckStatus.PASS.value),
+    ]
+    llm_result = QAResult(status="FAIL", confidence=0.5, summary="", issues=[])
+
+    qa_result = StructuredQAJudge.evaluate(checks, llm_qa_result=llm_result)
+    assert qa_result.status == "FAIL"
+    assert qa_result.confidence <= 0.40
+    assert "passed" not in qa_result.summary.lower()
+    assert "fail" in qa_result.summary.lower()
+    assert "explanation" in qa_result.summary.lower() or "without" in qa_result.summary.lower()
+
+
+def test_judge_llm_fail_with_meaningful_summary_is_preserved():
+    """
+    When the LLM advisory review returns FAIL WITH a real summary, that
+    explanation must be used/preserved in the final summary - not replaced
+    by the generic 'failed without an explanation' fallback.
+    """
+    checks = [
+        QualityCheck(name="ast", status=QualityCheckStatus.PASS.value),
+        QualityCheck(name="pytest", status=QualityCheckStatus.PASS.value),
+        QualityCheck(name="security", status=QualityCheckStatus.PASS.value),
+    ]
+    llm_result = QAResult(
+        status="FAIL",
+        confidence=0.3,
+        summary="The change does not address the user's request.",
+    )
+
+    qa_result = StructuredQAJudge.evaluate(checks, llm_qa_result=llm_result)
+    assert qa_result.status == "FAIL"
+    assert "does not address the user's request" in qa_result.summary
+    assert "passed" not in qa_result.summary.lower()
+
+
+def test_judge_llm_fail_with_issues_but_no_summary_avoids_passed_wording():
+    """
+    LLM advisory FAIL with issues but no summary text: the issues are real
+    information, but the final summary must still never claim everything
+    passed next to a FAIL status.
+    """
+    checks = [
+        QualityCheck(name="ast", status=QualityCheckStatus.PASS.value),
+        QualityCheck(name="pytest", status=QualityCheckStatus.PASS.value),
+        QualityCheck(name="security", status=QualityCheckStatus.PASS.value),
+    ]
+    llm_result = QAResult(
+        status="FAIL",
+        confidence=0.5,
+        summary="",
+        issues=[QAIssue(file_path="app.py", issue="Missing null check", severity="MEDIUM")],
+    )
+
+    qa_result = StructuredQAJudge.evaluate(checks, llm_qa_result=llm_result)
+    assert qa_result.status == "FAIL"
+    assert "passed" not in qa_result.summary.lower()
 
 
 # ---------------------------------------------------------------------------
