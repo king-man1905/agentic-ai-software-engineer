@@ -4,7 +4,7 @@ import os
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from backend.developer.models import FilePatch
 from backend.developer.patcher import SafePatcher
@@ -98,6 +98,35 @@ class GitWorkspaceManager:
         slug = sanitized.strip("-") or "task"
         suffix = uuid.uuid4().hex[:8]
         return f"agent/task-{slug}-{suffix}"
+
+    @staticmethod
+    def clone_repository(clone_url: str, project_path: str, timeout: float = 60) -> bool:
+        """
+        Clones `clone_url` into `project_path` via the same non-interactive
+        git subprocess convention every other operation in this module
+        uses. Idempotent: if `project_path` already exists, returns True
+        immediately without touching it or attempting to clone - callers
+        never need their own existence check first. Returns False (never
+        raises) on any clone failure, so callers decide how to surface
+        that (e.g. as an explicit run failure).
+
+        This function is intentionally URL-agnostic - it doesn't know
+        about GitHub, tokens, or authorization; a caller that needs an
+        authenticated GitHub HTTPS URL builds it and passes it in here.
+        SECURITY: this function never logs, prints, or returns `clone_url`
+        itself, nor any subprocess stdout/stderr (which could otherwise
+        echo a credential embedded in the URL back verbatim on failure) -
+        callers must uphold the same rule with whatever they build.
+        """
+        dest = Path(project_path)
+        if dest.exists():
+            return True
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _run_git(["clone", clone_url, str(dest)], repo_path=str(dest.parent), timeout=timeout)
+            return True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return False
 
     @staticmethod
     def create_feature_branch(repo_path: str, branch_name: str) -> bool:

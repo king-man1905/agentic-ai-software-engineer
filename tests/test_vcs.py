@@ -421,6 +421,36 @@ class TestGitOperationsIsolated:
         )
         assert "agent/task-cleanup" not in branches.stdout
 
+    def test_clone_repository_creates_workspace_from_source(self, git_repo, tmp_path):
+        """A missing destination is cloned from the given URL (a plain
+        local path works too - git treats it like any other clone source),
+        materializing the source's tracked files."""
+        dest = tmp_path / "cloned_workspace"
+        result = GitWorkspaceManager.clone_repository(str(git_repo), str(dest))
+        assert result is True
+        assert dest.exists()
+        assert (dest / "README.md").read_text(encoding="utf-8") == "# Test\n"
+
+    def test_clone_repository_idempotent_when_destination_exists(self, tmp_path):
+        """An already-existing destination is left untouched - no clone is
+        even attempted (proven by passing a source that would fail if
+        actually used)."""
+        dest = tmp_path / "already_there"
+        dest.mkdir()
+        (dest / "marker.txt").write_text("pre-existing content\n", encoding="utf-8")
+
+        result = GitWorkspaceManager.clone_repository("/no/such/source", str(dest))
+
+        assert result is True
+        assert (dest / "marker.txt").read_text(encoding="utf-8") == "pre-existing content\n"
+
+    def test_clone_repository_returns_false_on_invalid_source(self, tmp_path):
+        """A source that git can't clone from fails closed - False, no
+        exception - so the caller can surface an explicit failure."""
+        dest = tmp_path / "should_not_exist"
+        result = GitWorkspaceManager.clone_repository("/no/such/source", str(dest))
+        assert result is False
+
     def test_prepare_diff_summary_end_to_end(self, git_repo):
         # Write source file
         src = git_repo / "app.py"
