@@ -32,13 +32,21 @@ export const NewRunPage: React.FC<NewRunPageProps> = ({ onRunCreated }) => {
     setError(null);
 
     try {
+      const trimmedRepo = repo.trim();
       const derivedProjectId = projectId.trim() || repo.split('/')[1] || repo;
       const res = await runsApi.createRun(
         {
           user_message: taskMessage.trim(),
           project_id: derivedProjectId,
+          // The backend resolves/authorizes a registered repository by this
+          // exact full "org/repo" identifier (see tenant_manager.
+          // authorize_repository_access) - send it verbatim, never derived
+          // or truncated, so workspace provisioning can find it. Omitted
+          // entirely when there's no repository name to report, rather than
+          // sending a fabricated/empty value.
+          repository_id: trimmedRepo || undefined,
           metadata: {
-            github_repo: repo.trim(),
+            github_repo: trimmedRepo,
             triggered_by: 'control_plane_ui',
             timestamp: new Date().toISOString(),
           },
