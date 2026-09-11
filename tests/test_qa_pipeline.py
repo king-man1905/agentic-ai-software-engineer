@@ -65,6 +65,111 @@ def test_quality_pipeline_ast_check_syntax_error(tmp_path):
     assert result.status == QualityCheckStatus.FAIL.value
     assert "SyntaxError" in (result.stderr_summary or "") or "validation failed" in (result.reason or "")
 
+    # .py syntax errors must still be categorized as an AST/Python syntax
+    # failure - the QA categorization fix must not weaken this.
+    qa_result = StructuredQAJudge.evaluate([result])
+    assert qa_result.status == "FAIL"
+    assert qa_result.failure_category == FailureCategory.AST_FAILURE.value
+    assert "python" in qa_result.summary.lower() and "syntax" in qa_result.summary.lower()
+
+
+def test_quality_pipeline_ast_check_readme_snippet_mismatch_not_python_syntax(tmp_path):
+    """
+    README.md with a mismatched anchor snippet must still FAIL (patch
+    pre-flight/anchor validation stays mandatory for every file type), but
+    must be reported and categorized as a patch pre-flight failure, never
+    as a Python syntax/AST error - README.md is never valid Python.
+    """
+    file_path = tmp_path / "README.md"
+    file_path.write_text("# Project\n\nSome existing content.\n", encoding="utf-8")
+
+    patch = FilePatch(
+        file_path="README.md",
+        original_code_snippet="## Section That Does Not Exist\n",
+        updated_code_snippet="## New Section\n",
+        explanation="Add a new section",
+    )
+    result = QualityPipeline.check_ast(str(tmp_path), [patch])
+    assert result.status == QualityCheckStatus.FAIL.value
+    assert "Target original snippet not found" in result.stderr_summary
+    # The reason must not *claim* a Python syntax/AST problem - it may
+    # honestly clarify that it is NOT one, so check the framing, not just
+    # for the substring "python" (which also appears in that negation).
+    assert "AST syntax validation failed" not in (result.reason or "")
+    assert "pre-flight" in (result.reason or "").lower()
+
+    qa_result = StructuredQAJudge.evaluate([result])
+    assert qa_result.status == "FAIL"
+    assert qa_result.failure_category != FailureCategory.AST_FAILURE.value
+    assert "introduces python syntax or ast parsing errors" not in qa_result.summary.lower()
+    assert "target" in qa_result.summary.lower() or "pre-flight" in qa_result.summary.lower()
+
+
+def test_quality_pipeline_ast_check_readme_valid_patch_skips_python_parser(tmp_path, monkeypatch):
+    """A valid README.md patch must pass pre-flight validation without the
+    Python AST parser ever being invoked on Markdown content."""
+    import backend.developer.patcher as patcher_module
+
+    file_path = tmp_path / "README.md"
+    file_path.write_text("# Project\n\nSome existing content.\n", encoding="utf-8")
+
+    parse_calls = []
+    original_validate = patcher_module.validate_python_syntax
+
+    def spy_validate(code):
+        parse_calls.append(code)
+        return original_validate(code)
+
+    monkeypatch.setattr(patcher_module, "validate_python_syntax", spy_validate)
+
+    patch = FilePatch(
+        file_path="README.md",
+        original_code_snippet="Some existing content.\n",
+        updated_code_snippet="Some updated content.\n",
+        explanation="Update content",
+    )
+    result = QualityPipeline.check_ast(str(tmp_path), [patch])
+    assert result.status == QualityCheckStatus.PASS.value
+    assert parse_calls == []
+
+
+def test_quality_pipeline_ast_check_mixed_readme_and_python(tmp_path):
+    """
+    Mixed changeset: README.md anchor validation and .py AST validation are
+    both mandatory and independently reported - one passing/being skipped
+    must never hide or weaken the other.
+    """
+    readme_path = tmp_path / "README.md"
+    readme_path.write_text("# Project\n\nExisting.\n", encoding="utf-8")
+    py_path = tmp_path / "broken.py"
+    py_path.write_text("def existing(): pass\n", encoding="utf-8")
+
+    readme_patch = FilePatch(
+        file_path="README.md",
+        original_code_snippet="## Missing Section\n",  # mismatched anchor
+        updated_code_snippet="## New Section\n",
+        explanation="Add section",
+    )
+    py_patch = FilePatch(
+        file_path="broken.py",
+        original_code_snippet="def existing(): pass\n",
+        updated_code_snippet="def broken_syntax(:\n    return\n",
+        explanation="Broken",
+    )
+
+    result = QualityPipeline.check_ast(str(tmp_path), [readme_patch, py_patch])
+    assert result.status == QualityCheckStatus.FAIL.value
+    assert "README.md" in result.stderr_summary
+    assert "Target original snippet not found" in result.stderr_summary
+    assert "broken.py" in result.stderr_summary
+    assert "SyntaxError" in result.stderr_summary
+
+    qa_result = StructuredQAJudge.evaluate([result])
+    assert qa_result.status == "FAIL"
+    # A real Python syntax problem is present alongside the README failure -
+    # it must not be downgraded, hidden, or miscategorized.
+    assert qa_result.failure_category == FailureCategory.AST_FAILURE.value
+
 
 def test_quality_pipeline_security_check_clean(tmp_path):
     """Verify static security check passes for safe code."""
