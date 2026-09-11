@@ -4,7 +4,7 @@ import os
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from backend.developer.models import FilePatch
 from backend.developer.patcher import SafePatcher

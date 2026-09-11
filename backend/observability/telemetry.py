@@ -10,7 +10,7 @@ handed back to the caller to merge into the graph state's `metrics` dict.
 
 import contextvars
 from contextlib import contextmanager
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 ZERO_USAGE: Dict[str, Any] = {
     "prompt_tokens": 0,

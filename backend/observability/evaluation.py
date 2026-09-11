@@ -6,7 +6,7 @@ Never provides an approval or policy bypass mechanism.
 
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
     from backend.graph.runner import AgentRunner
@@ -19,7 +19,7 @@ from backend.schemas.telemetry import (
     EvaluationSummary,
     EvaluationTask,
 )
-from backend.security.rbac import Permission, Role
+from backend.security.rbac import Permission
 from backend.security.tenant import TenantContext, tenant_manager
 
 

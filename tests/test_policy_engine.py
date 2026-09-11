@@ -31,7 +31,6 @@ Covers all 26 requirements:
 """
 
 import os
-import tempfile
 import pytest
 from pathlib import Path
 from unittest.mock import patch
@@ -45,7 +44,6 @@ from backend.schemas.policy import (
 )
 from backend.policy.path_filter import (
     normalize_path,
-    matches_protected_path,
     is_traversal_attack,
 )
 from backend.policy.evaluator import PolicyEvaluator
@@ -59,7 +57,6 @@ from backend.graph.nodes import (
     route_after_policy,
     approval_node,
     route_after_approval,
-    git_commit_node,
 )
 
 

@@ -14,6 +14,35 @@ WORKSPACE_LOCK_TIMEOUT_SECONDS = float(os.getenv("WORKSPACE_LOCK_TIMEOUT_SECONDS
 SHUTDOWN_DRAIN_TIMEOUT_SECONDS = float(os.getenv("SHUTDOWN_DRAIN_TIMEOUT_SECONDS", "30.0"))
 
 
+def get_frontend_origins() -> list[str]:
+    """
+    Parses allowed frontend origins for CORS.
+    Supports comma-separated list via FRONTEND_ORIGIN or FRONTEND_ORIGINS.
+    In production mode (AUTH_MODE=production or ENVIRONMENT=production),
+    fail-closed: do NOT silently fall back to development localhost origins.
+    """
+    raw = os.getenv("FRONTEND_ORIGIN") or os.getenv("FRONTEND_ORIGINS")
+    if raw:
+        origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+        if origins:
+            return origins
+
+    auth_mode = os.getenv("AUTH_MODE", "").strip().lower()
+    env_name = os.getenv("ENVIRONMENT", "").strip().lower()
+    if auth_mode == "production" or env_name == "production":
+        return []
+
+    return [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+
+FRONTEND_ORIGINS = get_frontend_origins()
+
+
 def validate_config(provider: str | None = None):
     """Validates that necessary provider keys are present prior to LLM invocation."""
     eff_provider = (provider or os.getenv("LLM_PROVIDER", LLM_PROVIDER)).strip().lower()

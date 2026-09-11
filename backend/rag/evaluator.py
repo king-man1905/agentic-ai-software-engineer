@@ -1,6 +1,6 @@
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import List, Optional
 
 from backend.indexer.models import CodeChunk
 from backend.schemas.rag import (

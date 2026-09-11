@@ -1,4 +1,3 @@
-import time
 import pytest
 from backend.sandbox.runner import SandboxRunner
 

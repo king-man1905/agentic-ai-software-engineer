@@ -1,18 +1,13 @@
 import pytest
-import os
 import subprocess
-from pathlib import Path
 
 from backend.vcs.models import GitDiffSummary, ApprovalDecision
 from backend.vcs.git_manager import GitWorkspaceManager
 from backend.developer.models import FilePatch
 from backend.graph.state import AgentState
 from backend.graph.nodes import (
-    git_prepare_node,
     approval_node,
     route_after_approval,
-    git_commit_node,
-    cleanup_node,
     qa_router,
 )
 from backend.schemas.qa import QAResult
