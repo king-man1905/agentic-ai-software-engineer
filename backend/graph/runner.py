@@ -324,6 +324,9 @@ class AgentRunner:
         status: str,
         state_snapshot=None,
         error_summary: Optional[str] = None,
+        pr_number: Optional[int] = None,
+        pr_url: Optional[str] = None,
+        pr_status: Optional[str] = None,
     ) -> RunStatusResponse:
         return RunStatusResponse(
             run_id=run_id,
@@ -333,6 +336,9 @@ class AgentRunner:
             qa_result=self._extract_qa_result(state_snapshot),
             policy_result=self._extract_policy_result(state_snapshot),
             error_summary=error_summary,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            pr_status=pr_status,
         )
 
 
@@ -606,12 +612,30 @@ class AgentRunner:
             durable_status = telemetry_store.get_run(run_id, effective_org_for_cancel)
         except Exception:
             durable_status = None
+
+        pr_number = durable_status.pr_number if durable_status else None
+        pr_url = durable_status.pr_url if durable_status else None
+        pr_status = durable_status.pr_status if durable_status else None
+
         if durable_status and durable_status.status in ("CANCELLED", "CANCELLING"):
-            return self._build_status_response(run_id, durable_status.status, state_snapshot)
+            return self._build_status_response(
+                run_id,
+                durable_status.status,
+                state_snapshot,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                pr_status=pr_status,
+            )
 
         if error_msg and (state_snapshot is None or not state_snapshot.values):
             return self._build_status_response(
-                run_id, "FAILED", state_snapshot, error_summary=error_msg
+                run_id,
+                "FAILED",
+                state_snapshot,
+                error_summary=error_msg,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                pr_status=pr_status,
             )
 
         if is_active and (state_snapshot is None or not state_snapshot.values):
@@ -619,6 +643,9 @@ class AgentRunner:
                 run_id=run_id,
                 status="RUNNING",
                 message="Run is currently executing in background",
+                pr_number=pr_number,
+                pr_url=pr_url,
+                pr_status=pr_status,
             )
 
         if state_snapshot is None or not state_snapshot.values:
@@ -630,10 +657,20 @@ class AgentRunner:
                 status="RUNNING",
                 current_node=self._extract_current_node(state_snapshot),
                 message="Run is currently executing in background",
+                pr_number=pr_number,
+                pr_url=pr_url,
+                pr_status=pr_status,
             )
 
         status = self._derive_status(state_snapshot)
-        return self._build_status_response(run_id, status, state_snapshot)
+        return self._build_status_response(
+            run_id,
+            status,
+            state_snapshot,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            pr_status=pr_status,
+        )
 
     def get_state_values(
         self,

@@ -14,6 +14,9 @@ import {
 interface PipelineStepperProps {
   currentNode?: string | null;
   status: string;
+  prNumber?: number | null;
+  prUrl?: string | null;
+  prStatus?: string | null;
 }
 
 interface StepDef {
@@ -38,46 +41,89 @@ const STEPS: StepDef[] = [
 export const PipelineStepper: React.FC<PipelineStepperProps> = ({
   currentNode,
   status,
+  prNumber,
+  prUrl,
+  prStatus,
 }) => {
   const normStatus = (status || 'CREATED').toUpperCase();
   const activeNode = currentNode ? currentNode.toLowerCase() : (normStatus === 'RUNNING' ? 'router' : '');
 
-  // Determine active step index
+  // Determine active step index for pipeline stages 0..8 (Router through Commit)
   let targetIdx = STEPS.findIndex((s) => s.key === activeNode);
   if (normStatus === 'WAITING_APPROVAL') {
     targetIdx = STEPS.findIndex((s) => s.key === 'approval');
   } else if (normStatus === 'COMPLETED') {
-    targetIdx = STEPS.length;
+    targetIdx = STEPS.length - 1; // All steps prior to PR Publish completed
   } else if (targetIdx === -1 && normStatus === 'RUNNING') {
     targetIdx = 0;
   }
+
+  // Authoritative PR Publish state
+  const hasValidPr = Boolean(
+    prNumber !== undefined &&
+    prNumber !== null &&
+    prNumber > 0 &&
+    prUrl !== undefined &&
+    prUrl !== null &&
+    prUrl.trim().length > 0
+  );
+  const isPrFailed = (prStatus || '').toUpperCase() === 'FAILED';
+  const isPrPublishing =
+    normStatus === 'PUBLISHING' ||
+    (prStatus || '').toUpperCase() === 'PUBLISHING' ||
+    activeNode === 'pr';
 
   return (
     <div className="stepper-container" style={{ padding: '8px 0', gap: '6px' }}>
       {STEPS.map((step, idx) => {
         let stateClass = 'pending';
         let statusBadge = '○';
+        let subLabel: string | null = null;
 
-        if (normStatus === 'COMPLETED' || idx < targetIdx) {
-          stateClass = 'completed';
-          statusBadge = '✓';
-        } else if (idx === targetIdx) {
-          if (normStatus === 'WAITING_APPROVAL') {
-            stateClass = 'waiting';
-            statusBadge = '⏸';
-          } else if (normStatus === 'FAILED' || normStatus === 'BLOCKED') {
+        if (step.key === 'pr') {
+          // PR Publish step: must NOT automatically become completed/green on COMPLETED status
+          if (hasValidPr) {
+            stateClass = 'completed';
+            statusBadge = '✓';
+            subLabel = `PR #${prNumber}`;
+          } else if (isPrFailed) {
             stateClass = 'failed';
             statusBadge = '✗';
-          } else {
+            subLabel = 'Failed';
+          } else if (isPrPublishing) {
             stateClass = 'active';
             statusBadge = '▶';
+            subLabel = 'Publishing';
+          } else {
+            stateClass = 'pending';
+            statusBadge = '○';
+            subLabel = 'Not published';
+          }
+        } else {
+          // Pre-PR pipeline stages (Router through Commit) retain existing behavior
+          if (normStatus === 'COMPLETED' || idx < targetIdx) {
+            stateClass = 'completed';
+            statusBadge = '✓';
+          } else if (idx === targetIdx) {
+            if (normStatus === 'WAITING_APPROVAL') {
+              stateClass = 'waiting';
+              statusBadge = '⏸';
+            } else if (normStatus === 'FAILED' || normStatus === 'BLOCKED') {
+              stateClass = 'failed';
+              statusBadge = '✗';
+            } else {
+              stateClass = 'active';
+              statusBadge = '▶';
+            }
           }
         }
 
         return (
           <div
             key={step.key}
+            data-testid={`step-${step.key}`}
             className={`step-node ${stateClass}`}
+            title={step.key === 'pr' && prUrl ? prUrl : undefined}
             style={{
               flex: '1 1 0',
               minWidth: '100px',
@@ -96,6 +142,18 @@ export const PipelineStepper: React.FC<PipelineStepperProps> = ({
             <div className="step-node-title" style={{ marginTop: '2px', fontSize: '11px' }}>
               {step.name}
             </div>
+            {subLabel && (
+              <div
+                style={{
+                  fontSize: '9px',
+                  marginTop: '2px',
+                  fontWeight: 500,
+                  opacity: stateClass === 'pending' ? 0.7 : 0.95,
+                }}
+              >
+                {subLabel}
+              </div>
+            )}
           </div>
         );
       })}

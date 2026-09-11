@@ -2,7 +2,7 @@ import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, List, Optional
 from fastapi import FastAPI, HTTPException, Request, Response, status, Depends, BackgroundTasks, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -255,6 +255,21 @@ def create_app(
             )
         return lifecycle
 
+    def _sanitize_response_fields(res: Any) -> Any:
+        if res is None:
+            return res
+        if hasattr(res, "qa_result") and not isinstance(res.qa_result, (QAResult, dict, type(None))):
+            res.qa_result = None
+        if hasattr(res, "policy_result") and not isinstance(res.policy_result, (PolicyEvaluationResult, dict, type(None))):
+            res.policy_result = None
+        if hasattr(res, "pr_number") and not isinstance(res.pr_number, (int, type(None))):
+            res.pr_number = None
+        if hasattr(res, "pr_url") and not isinstance(res.pr_url, (str, type(None))):
+            res.pr_url = None
+        if hasattr(res, "pr_status") and not isinstance(res.pr_status, (str, type(None))):
+            res.pr_status = None
+        return res
+
     # -------------------------------------------------------------------------
     # Health and Diagnostics
     # -------------------------------------------------------------------------
@@ -501,10 +516,16 @@ def create_app(
 
         try:
             res = runner_instance.get_status(run_id, organization_id=tenant_ctx.organization_id)
-            if hasattr(res, "qa_result") and not isinstance(res.qa_result, (QAResult, dict, type(None))):
-                res.qa_result = None
-            if hasattr(res, "policy_result") and not isinstance(res.policy_result, (PolicyEvaluationResult, dict, type(None))):
-                res.policy_result = None
+            _sanitize_response_fields(res)
+
+            # Populate authoritative PR data from telemetry store if not already populated
+            if res.pr_number is None and res.pr_url is None:
+                rec = telemetry_store.get_run(run_id, tenant_ctx.organization_id)
+                if rec:
+                    res.pr_number = rec.pr_number
+                    res.pr_url = rec.pr_url
+                    res.pr_status = rec.pr_status
+
             return res
         except KeyError:
             raise HTTPException(
@@ -576,10 +597,7 @@ def create_app(
                             "approved": request.approved,
                         },
                     )
-                    if hasattr(current_status, "qa_result") and not isinstance(current_status.qa_result, (QAResult, dict, type(None))):
-                        current_status.qa_result = None
-                    if hasattr(current_status, "policy_result") and not isinstance(current_status.policy_result, (PolicyEvaluationResult, dict, type(None))):
-                        current_status.policy_result = None
+                    _sanitize_response_fields(current_status)
                     return current_status
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -643,10 +661,7 @@ def create_app(
                 decision,
                 organization_id=tenant_ctx.organization_id,
             )
-            if hasattr(res, "qa_result") and not isinstance(res.qa_result, (QAResult, dict, type(None))):
-                res.qa_result = None
-            if hasattr(res, "policy_result") and not isinstance(res.policy_result, (PolicyEvaluationResult, dict, type(None))):
-                res.policy_result = None
+            _sanitize_response_fields(res)
 
             audit_logger.log(
                 organization_id=tenant_ctx.organization_id,
@@ -721,6 +736,7 @@ def create_app(
             details={"reason": request.reason, "status": res.status},
         )
 
+        _sanitize_response_fields(res)
         return res
 
     # -------------------------------------------------------------------------
@@ -848,6 +864,7 @@ def create_app(
         tenant_ctx: TenantContext = Depends(get_tenant_context),
     ) -> PublishPRResponse:
         import os
+        from pathlib import Path
         from backend.integrations.github_client import (
             GitHubClient,
             GitHubAuthError,
@@ -858,6 +875,7 @@ def create_app(
             GitHubPRCreationError,
             GitHubApiError,
         )
+        from backend.vcs.git_manager import GitWorkspaceManager
 
         # 1. Permission check
         if Permission.REPO_MANAGE not in tenant_ctx.permissions and Permission.RUN_APPROVE not in tenant_ctx.permissions:
@@ -983,6 +1001,58 @@ def create_app(
                 base_branch=existing_pr.base_branch,
                 is_draft=existing_pr.is_draft,
                 status="reconciled",
+            )
+
+        # 6b. Wrong-run/wrong-repo hardening: the repository the run was
+        # declared against at creation time (telemetry) must agree with the
+        # repository this call is authorized against, before anything is
+        # pushed - stops one run's branch from being published against a
+        # different (but separately authorized) repository. Only enforced
+        # when the recorded value looks like a real "owner/repo" (contains
+        # "/"), since some callers only ever set a bare project_id at run
+        # creation and that is not a repository to compare against.
+        # ponytail: compares caller-supplied telemetry, not the workspace's
+        # actual git remote - upgrade to verifying `git remote get-url
+        # origin` against request.repo_full_name if that self-reported
+        # value proves spoofable in practice.
+        if rec and rec.repository and "/" in rec.repository and rec.repository != request.repo_full_name:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"PR_PUBLISH_REPOSITORY_MISMATCH: Run '{run_id}' was started against "
+                    f"repository '{rec.repository}', not '{request.repo_full_name}'."
+                ),
+            )
+
+        # 7. Push the run's committed branch to the authorized target
+        # repository before asking GitHub to open a PR from it.
+        # git_commit_node (backend/graph/nodes.py) only commits locally; skip
+        # this and GitHub's PR-create API returns 422 "field head is invalid"
+        # because the branch never existed on origin. Pushes the exact branch
+        # git_diff.branch_name names (the run's single source of truth for
+        # what it committed), so a push failure - including the branch not
+        # actually existing locally - fails closed instead of opening a PR
+        # against the wrong or missing branch.
+        project_id = state_values.get("project_id") or "test_project"
+        project_path = Path("workspace") / project_id
+        if not project_path.exists():
+            project_path = Path(os.getcwd()) / "workspace" / project_id
+
+        if not GitWorkspaceManager.push_branch(str(project_path), git_diff.branch_name):
+            audit_logger.log(
+                tenant_ctx.organization_id,
+                tenant_ctx.user_id,
+                AuditAction.GITHUB_OPERATION_FAILED,
+                "github",
+                request.repo_full_name,
+                {"error": "BRANCH_PUSH_FAILED", "branch": git_diff.branch_name},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    f"BRANCH_PUSH_FAILED: Unable to push branch '{git_diff.branch_name}' "
+                    f"to remote for repository '{request.repo_full_name}'."
+                ),
             )
 
         title = request.title or f"fix: automated agent changes for {git_diff.branch_name}"

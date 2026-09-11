@@ -426,6 +426,15 @@ class TestPRPublicationIdempotencyAndReconciliation:
                 "git_diff": mock_diff,
             },
         )
+        # publish_pr pushes the branch to the real workspace git repo before
+        # creating the PR; mock it so these tests exercise idempotency and
+        # reconciliation, not real git/network I/O. Harmless no-op for the
+        # tests here that never reach the push step (early idempotency
+        # replay, pre-creation reconciliation).
+        monkeypatch.setattr(
+            "backend.vcs.git_manager.GitWorkspaceManager.push_branch",
+            lambda *args, **kwargs: True,
+        )
 
         return client, run_id, mock_diff
 

@@ -57,6 +57,52 @@ describe('Frontend Component Tests', () => {
       expect(screen.getByText('Developer')).toBeDefined();
       expect(screen.getByText('Approval Gate')).toBeDefined();
     });
+
+    it('does NOT mark PR Publish as completed/green when status is COMPLETED without PR data', () => {
+      render(<PipelineStepper status="COMPLETED" />);
+      const prStep = screen.getByTestId('step-pr');
+      expect(prStep.classList.contains('completed')).toBe(false);
+      expect(prStep.classList.contains('pending')).toBe(true);
+      expect(screen.getByText('Not published')).toBeDefined();
+
+      // Preceding pipeline stages remain completed
+      const commitStep = screen.getByTestId('step-commit');
+      expect(commitStep.classList.contains('completed')).toBe(true);
+      const routerStep = screen.getByTestId('step-router');
+      expect(routerStep.classList.contains('completed')).toBe(true);
+    });
+
+    it('marks PR Publish as completed/green when status is COMPLETED with valid PR number and URL', () => {
+      render(
+        <PipelineStepper
+          status="COMPLETED"
+          prNumber={42}
+          prUrl="https://github.com/octocat/Hello-World/pull/42"
+          prStatus="PUBLISHED"
+        />
+      );
+      const prStep = screen.getByTestId('step-pr');
+      expect(prStep.classList.contains('completed')).toBe(true);
+      expect(screen.getByText('PR #42')).toBeDefined();
+
+      // Preceding pipeline stages remain completed
+      const commitStep = screen.getByTestId('step-commit');
+      expect(commitStep.classList.contains('completed')).toBe(true);
+    });
+
+    it('marks PR Publish as active when publishing', () => {
+      render(<PipelineStepper status="PUBLISHING" />);
+      const prStep = screen.getByTestId('step-pr');
+      expect(prStep.classList.contains('active')).toBe(true);
+      expect(screen.getByText('Publishing')).toBeDefined();
+    });
+
+    it('marks PR Publish as failed when prStatus is FAILED', () => {
+      render(<PipelineStepper status="COMPLETED" prStatus="FAILED" />);
+      const prStep = screen.getByTestId('step-pr');
+      expect(prStep.classList.contains('failed')).toBe(true);
+      expect(screen.getByText('Failed')).toBeDefined();
+    });
   });
 
   describe('UnifiedDiffView', () => {

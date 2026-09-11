@@ -536,6 +536,12 @@ class TestPRPublishingPipeline:
                 is_draft=True,
             ),
         )
+        # Branch push happens against the real workspace git repo; mock it
+        # so this test exercises the API flow, not real git/network I/O.
+        monkeypatch.setattr(
+            "backend.vcs.git_manager.GitWorkspaceManager.push_branch",
+            lambda *args, **kwargs: True,
+        )
 
         # 3. Publish PR
         pub_req = PublishPRRequest(repo_full_name="default-org/api")
@@ -545,6 +551,212 @@ class TestPRPublishingPipeline:
         assert data["pr_number"] == 42
         assert data["is_draft"] is True
         assert data["status"] == "PUBLISHED"
+
+
+class TestPRPublishBranchPush:
+    """
+    Covers the fix for GitHub's 422 "field head is invalid": git_commit_node
+    (backend/graph/nodes.py) only commits the run's feature branch locally,
+    so publish_pr must push it to the authorized target repository before
+    asking GitHub to open a PR from it.
+    """
+
+    def _setup_run(self, monkeypatch, run_id, repo_full_name, branch):
+        runner = AgentRunner()
+        app = create_app(runner=runner)
+        client = TestClient(app)
+        tenant_manager.register_repository(repo_full_name, "default-org", repo_full_name.split("/")[-1])
+
+        mock_diff = GitDiffSummary(
+            branch_name=branch,
+            files_changed=["src/main.py"],
+            lines_added=1,
+            lines_deleted=0,
+            unified_diff="--- a/src/main.py\n+++ b/src/main.py\n@@ -1 +1 @@\n-old\n+new",
+            patch_hash="push_test_hash",
+            risk_score="LOW",
+        )
+        mock_status = RunStatusResponse(
+            run_id=run_id, status="COMPLETED", current_node="git_commit", git_diff=mock_diff
+        )
+        monkeypatch.setattr(runner, "get_status", lambda rid, organization_id=None: mock_status)
+        monkeypatch.setattr(
+            runner,
+            "get_state_values",
+            lambda rid, organization_id=None: {
+                "approval": ApprovalDecision(approved=True, reviewer="admin", patch_hash="push_test_hash"),
+                "approval_status": "COMMITTED",
+                "git_diff": mock_diff,
+            },
+        )
+        return client, mock_diff
+
+    def test_publish_pr_pushes_branch_before_creating_pr(self, monkeypatch):
+        """A. Successful publish: push_branch must run, and must run before create_pull_request."""
+        client, mock_diff = self._setup_run(
+            monkeypatch, "test-run-push-1", "default-org/api", "agent/task-push"
+        )
+        call_order = []
+
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.find_pull_request",
+            lambda *a, **k: None,
+        )
+
+        def fake_push(repo_path, branch_name, remote="origin"):
+            call_order.append(("push_branch", branch_name))
+            return True
+
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.push_branch", fake_push)
+
+        def fake_create(*a, **k):
+            call_order.append(("create_pull_request", k.get("head_branch")))
+            return GitHubPRResult(
+                pr_number=1,
+                pr_url="https://github.com/default-org/api/pull/1",
+                head_branch=mock_diff.branch_name,
+                base_branch="main",
+            )
+
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.create_pull_request", fake_create
+        )
+
+        req = PublishPRRequest(repo_full_name="default-org/api")
+        resp = client.post("/api/v1/runs/test-run-push-1/publish-pr", json=req.model_dump())
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "PUBLISHED"
+        assert [c[0] for c in call_order] == ["push_branch", "create_pull_request"]
+        assert call_order[0][1] == mock_diff.branch_name
+
+    def test_publish_pr_push_failure_blocks_pr_creation(self, monkeypatch):
+        """B. Push failure: publish_pr must fail clearly and never call create_pull_request."""
+        client, _ = self._setup_run(
+            monkeypatch, "test-run-push-2", "default-org/api", "agent/task-push-fail"
+        )
+
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.find_pull_request",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "backend.vcs.git_manager.GitWorkspaceManager.push_branch", lambda *a, **k: False
+        )
+        create_mock = MagicMock()
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.create_pull_request", create_mock
+        )
+
+        req = PublishPRRequest(repo_full_name="default-org/api")
+        resp = client.post("/api/v1/runs/test-run-push-2/publish-pr", json=req.model_dump())
+
+        assert resp.status_code == 502
+        assert "BRANCH_PUSH_FAILED" in resp.json()["detail"]
+        create_mock.assert_not_called()
+
+    def test_publish_pr_reconciled_existing_pr_skips_push(self, monkeypatch):
+        """C. Retry/idempotency: an already-published branch is reconciled without a new push or duplicate PR."""
+        client, mock_diff = self._setup_run(
+            monkeypatch, "test-run-push-3", "default-org/api", "agent/task-push-existing"
+        )
+
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.find_pull_request",
+            lambda *a, **k: GitHubPRResult(
+                pr_number=9,
+                pr_url="https://github.com/default-org/api/pull/9",
+                head_branch=mock_diff.branch_name,
+                base_branch="main",
+            ),
+        )
+        push_mock = MagicMock(return_value=True)
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.push_branch", push_mock)
+        create_mock = MagicMock()
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.create_pull_request", create_mock
+        )
+
+        req = PublishPRRequest(repo_full_name="default-org/api")
+        resp = client.post("/api/v1/runs/test-run-push-3/publish-pr", json=req.model_dump())
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "reconciled"
+        assert data["pr_number"] == 9
+        push_mock.assert_not_called()
+        create_mock.assert_not_called()
+
+    def test_publish_pr_unauthorized_repo_skips_push(self, monkeypatch):
+        """D. Authorization: an unregistered/unauthorized repository is still blocked before any push."""
+        runner = AgentRunner()
+        app = create_app(runner=runner)
+        client = TestClient(app)
+        # Deliberately not registering "unregistered-org/unregistered-repo".
+
+        mock_diff = GitDiffSummary(
+            branch_name="agent/task-unauth",
+            files_changed=["x.py"],
+            unified_diff="+x",
+            patch_hash="unauth_hash",
+        )
+        mock_status = RunStatusResponse(
+            run_id="test-run-push-4", status="COMPLETED", current_node="git_commit", git_diff=mock_diff
+        )
+        monkeypatch.setattr(runner, "get_status", lambda rid, organization_id=None: mock_status)
+        monkeypatch.setattr(
+            runner,
+            "get_state_values",
+            lambda rid, organization_id=None: {
+                "approval": ApprovalDecision(approved=True, reviewer="admin", patch_hash="unauth_hash"),
+                "approval_status": "COMMITTED",
+                "git_diff": mock_diff,
+            },
+        )
+
+        push_mock = MagicMock(return_value=True)
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.push_branch", push_mock)
+        create_mock = MagicMock()
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.create_pull_request", create_mock
+        )
+
+        req = PublishPRRequest(repo_full_name="unregistered-org/unregistered-repo")
+        resp = client.post("/api/v1/runs/test-run-push-4/publish-pr", json=req.model_dump())
+
+        assert resp.status_code == 403
+        push_mock.assert_not_called()
+        create_mock.assert_not_called()
+
+    def test_publish_pr_repository_mismatch_blocks_push(self, monkeypatch):
+        """
+        Hardening: a run declared (at creation) against one repository must not
+        be publishable as a PR against a different, separately-authorized repo.
+        """
+        client, mock_diff = self._setup_run(
+            monkeypatch, "test-run-push-5", "default-org/other-repo", "agent/task-mismatch"
+        )
+        telemetry_collector.on_run_created(
+            run_id="test-run-push-5",
+            organization_id="default-org",
+            repository="default-org/original-repo",
+            user_message="test",
+        )
+
+        push_mock = MagicMock(return_value=True)
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.push_branch", push_mock)
+        create_mock = MagicMock()
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.create_pull_request", create_mock
+        )
+
+        req = PublishPRRequest(repo_full_name="default-org/other-repo")
+        resp = client.post("/api/v1/runs/test-run-push-5/publish-pr", json=req.model_dump())
+
+        assert resp.status_code == 409
+        assert "PR_PUBLISH_REPOSITORY_MISMATCH" in resp.json()["detail"]
+        push_mock.assert_not_called()
+        create_mock.assert_not_called()
 
 
 # =============================================================================
