@@ -389,6 +389,269 @@ class TestNodeFallbacks:
         assert prompt.count("FILE: README.md") == 1
         assert content in prompt
 
+    def test_developer_node_tiny_readme_exact_match_patch_applies_successfully(self, tmp_path, monkeypatch):
+        """
+        FIX 3 regression test: a genuinely tiny README (matching the real
+        repository that triggered the investigation - a single line, no
+        trailing newline) is shown to the patch-generation prompt as a
+        [COMPLETE FILE CONTENT] block, and when the LLM returns a patch
+        whose original_code_snippet is copied verbatim from that exact
+        content, SafePatcher's exact-match AST pre-flight validation
+        succeeds (not weakened - it still requires a byte-exact match) and
+        the patch is actually applied to disk.
+        """
+        import os
+        from pathlib import Path
+        from backend.developer.models import FilePatch
+        from backend.graph.nodes import developer_node
+        from backend.schemas.developer import DeveloperResult
+        from backend.schemas.planning import ExecutionPlan
+
+        project_id = "tiny_readme_proj"
+        workspace_dir = tmp_path / "workspace" / project_id
+        workspace_dir.mkdir(parents=True)
+        # Exactly the real repository's README: 22 bytes, one line, no
+        # trailing newline.
+        original_content = "# agentic-ai-test-repo"
+        (workspace_dir / "README.md").write_text(original_content, encoding="utf-8")
+
+        assert not (Path("workspace") / project_id).exists()
+        monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="x", changes=[], requires_testing=True, notes=[]
+            ),
+        )
+        monkeypatch.setattr("backend.services.llm.get_llm", lambda: object())
+
+        captured_prompts = []
+        updated_content = "# agentic-ai-test-repo\n\n## E2E Test\n\nDescription.\n"
+
+        class _FakePatchResult:
+            patches = [
+                FilePatch(
+                    file_path="README.md",
+                    original_code_snippet=original_content,
+                    updated_code_snippet=updated_content,
+                    explanation="Add E2E Test section",
+                )
+            ]
+
+        def fake_invoke_structured(llm, schema, prompt):
+            captured_prompts.append(prompt)
+            return _FakePatchResult()
+
+        monkeypatch.setattr("backend.graph.nodes.invoke_structured", fake_invoke_structured)
+
+        state: AgentState = {
+            "user_message": "Add an E2E Test section to README.md",
+            "project_id": project_id,
+            "plan": ExecutionPlan(goal="Add E2E Test section", steps=[], success_criteria="Done"),
+        }
+
+        out = developer_node(state)
+
+        # The prompt gave the LLM the file marked as complete/verbatim, and
+        # contained the real content the LLM's snippet must match.
+        prompt = captured_prompts[0]
+        assert "[COMPLETE FILE CONTENT - verbatim, nothing omitted]" in prompt
+        assert original_content in prompt
+
+        # SafePatcher's exact-match validation was not weakened - it still
+        # ran, and passed because the snippet genuinely matched byte-exact.
+        assert len(out["generated_patches"]) == 1
+        assert out["generated_patches"][0].original_code_snippet == original_content
+
+        # The patch was actually applied to the real workspace file.
+        assert (workspace_dir / "README.md").read_text(encoding="utf-8") == updated_content
+
+    # ------------------------------------------------------------------
+    # FIX 2 regression tests: developer_node's no-repo-context fallback
+    # write path must never silently drop an effective DeveloperResult
+    # change - it must either become a FilePatch or the run must fail
+    # explicitly (ValueError), never a silent generated_patches=[].
+    # ------------------------------------------------------------------
+
+    def _empty_workspace_state(self, tmp_path, monkeypatch, project_id="fallback_write_proj"):
+        """An existing-but-empty workspace directory, so developer_node's
+        self-scan finds zero chunks (repo_context stays falsy) and the
+        exact-snippet LLM-patch branch is skipped entirely - isolating the
+        no-repo-context fallback write path under test."""
+        import os
+        from pathlib import Path
+
+        workspace_dir = tmp_path / "workspace" / project_id
+        workspace_dir.mkdir(parents=True)
+        assert not (Path("workspace") / project_id).exists()
+        monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+        return workspace_dir
+
+    def test_developer_node_fallback_creates_missing_parent_directory(self, tmp_path, monkeypatch):
+        from backend.graph.nodes import developer_node
+        from backend.schemas.developer import DeveloperResult, FileChange
+        from backend.schemas.planning import ExecutionPlan
+
+        workspace_dir = self._empty_workspace_state(tmp_path, monkeypatch)
+        assert not (workspace_dir / "docs" / "sub").exists()
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="add notes",
+                changes=[
+                    FileChange(
+                        file_path="docs/sub/NOTES.md",
+                        change_type="CREATE",
+                        content="# Notes\n",
+                        reason="New doc",
+                    )
+                ],
+                requires_testing=False,
+                notes=[],
+            ),
+        )
+
+        state: AgentState = {
+            "user_message": "Add notes",
+            "project_id": "fallback_write_proj",
+            "plan": ExecutionPlan(goal="Add notes", steps=[], success_criteria="Done"),
+        }
+
+        out = developer_node(state)
+
+        assert len(out["generated_patches"]) == 1
+        written = workspace_dir / "docs" / "sub" / "NOTES.md"
+        assert written.exists()
+        assert written.read_text(encoding="utf-8") == "# Notes\n"
+
+    def test_developer_node_fallback_valid_nested_path_writes_file(self, tmp_path, monkeypatch):
+        from backend.graph.nodes import developer_node
+        from backend.schemas.developer import DeveloperResult, FileChange
+        from backend.schemas.planning import ExecutionPlan
+
+        workspace_dir = self._empty_workspace_state(tmp_path, monkeypatch)
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="add module",
+                changes=[
+                    FileChange(
+                        file_path="src/pkg/module.py",
+                        change_type="CREATE",
+                        content="x = 1\n",
+                        reason="New module",
+                    )
+                ],
+                requires_testing=False,
+                notes=[],
+            ),
+        )
+
+        state: AgentState = {
+            "user_message": "Add module",
+            "project_id": "fallback_write_proj",
+            "plan": ExecutionPlan(goal="Add module", steps=[], success_criteria="Done"),
+        }
+
+        out = developer_node(state)
+
+        assert len(out["generated_patches"]) == 1
+        patch = out["generated_patches"][0]
+        assert patch.file_path == "src/pkg/module.py"
+        assert patch.updated_code_snippet == "x = 1\n"
+        assert (workspace_dir / "src" / "pkg" / "module.py").read_text(encoding="utf-8") == "x = 1\n"
+
+    @pytest.mark.parametrize(
+        "unsafe_path",
+        [
+            "../outside.py",
+            "../../etc/passwd",
+            "/etc/passwd",
+            "C:\\Windows\\evil.txt",
+        ],
+    )
+    def test_developer_node_fallback_rejects_unsafe_path(self, tmp_path, monkeypatch, unsafe_path):
+        from backend.graph.nodes import developer_node
+        from backend.schemas.developer import DeveloperResult, FileChange
+        from backend.schemas.planning import ExecutionPlan
+
+        self._empty_workspace_state(tmp_path, monkeypatch)
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="malicious change",
+                changes=[
+                    FileChange(
+                        file_path=unsafe_path,
+                        change_type="CREATE",
+                        content="pwned\n",
+                        reason="unsafe",
+                    )
+                ],
+                requires_testing=False,
+                notes=[],
+            ),
+        )
+
+        state: AgentState = {
+            "user_message": "Do something",
+            "project_id": "fallback_write_proj",
+            "plan": ExecutionPlan(goal="Do something", steps=[], success_criteria="Done"),
+        }
+
+        # The invariant: an unsafe path must never be silently skipped
+        # (generated_patches=[]) - it must fail the run explicitly.
+        with pytest.raises(ValueError, match="not a safe repository-relative path"):
+            developer_node(state)
+
+        # Nothing was ever written outside the workspace.
+        assert not (tmp_path / "etc" / "passwd").exists()
+        assert not (tmp_path / "outside.py").exists()
+
+    def test_developer_node_fallback_non_empty_change_produces_filepatch(self, tmp_path, monkeypatch):
+        """The core invariant's happy path: an effective (non-empty-content)
+        DeveloperResult change always becomes a FilePatch, never silently
+        vanishes - the bug behind the read-only investigation's
+        WAITING_APPROVAL/0-diff finding."""
+        from backend.graph.nodes import developer_node
+        from backend.schemas.developer import DeveloperResult, FileChange
+        from backend.schemas.planning import ExecutionPlan
+
+        workspace_dir = self._empty_workspace_state(tmp_path, monkeypatch)
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="update readme",
+                changes=[
+                    FileChange(
+                        file_path="README.md",
+                        change_type="MODIFY",
+                        content="# Project\n\n## E2E Test\n\nDescription.\n",
+                        reason="Add section",
+                    )
+                ],
+                requires_testing=False,
+                notes=[],
+            ),
+        )
+
+        state: AgentState = {
+            "user_message": "Update README",
+            "project_id": "fallback_write_proj",
+            "plan": ExecutionPlan(goal="Update README", steps=[], success_criteria="Done"),
+        }
+
+        out = developer_node(state)
+
+        assert len(out["generated_patches"]) == 1
+        assert out["generated_patches"][0].file_path == "README.md"
+        assert (workspace_dir / "README.md").exists()
+
     def test_revision_node_handles_missing_plan_safely(self, monkeypatch):
         from backend.graph.nodes import revision_node
         from backend.schemas.developer import DeveloperResult

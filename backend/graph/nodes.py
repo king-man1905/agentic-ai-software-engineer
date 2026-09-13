@@ -52,6 +52,20 @@ def format_categorized_context(chunks: list) -> str:
     dependencies = []
     configs = []
 
+    def emit_chunk(c, lines: list) -> None:
+        # A "whole_file" chunk (build_patch_context_chunks /
+        # whole_file_chunk_for_patch_context) is the file's complete,
+        # verbatim content, not one fragment among possibly several -
+        # flagged explicitly so the exact-snippet patch-generation prompt
+        # knows original_code_snippet must be copied character-for-character
+        # from this block, with nothing added, removed, or assumed.
+        if getattr(c, "chunk_type", None) == "whole_file":
+            lines.append("[COMPLETE FILE CONTENT - verbatim, nothing omitted]")
+        sym = f" | SYMBOL: {c.symbol_name}" if c.symbol_name else ""
+        lines.append(f"FILE: {c.file_path} (Lines {c.start_line}-{c.end_line}){sym}")
+        lines.append(c.content)
+        lines.append("---")
+
     for chunk in chunks:
         fp = chunk.file_path.replace("\\", "/").lower()
         st = getattr(chunk, "symbol_type", "") or ""
@@ -76,28 +90,19 @@ def format_categorized_context(chunks: list) -> str:
     if primary:
         lines = ["[PRIMARY IMPLEMENTATION]"]
         for c in primary:
-            sym = f" | SYMBOL: {c.symbol_name}" if c.symbol_name else ""
-            lines.append(f"FILE: {c.file_path} (Lines {c.start_line}-{c.end_line}){sym}")
-            lines.append(c.content)
-            lines.append("---")
+            emit_chunk(c, lines)
         sections.append("\n".join(lines))
 
     if related:
         lines = ["[RELATED CODE]"]
         for c in related:
-            sym = f" | SYMBOL: {c.symbol_name}" if c.symbol_name else ""
-            lines.append(f"FILE: {c.file_path} (Lines {c.start_line}-{c.end_line}){sym}")
-            lines.append(c.content)
-            lines.append("---")
+            emit_chunk(c, lines)
         sections.append("\n".join(lines))
 
     if tests:
         lines = ["[TESTS]"]
         for c in tests:
-            sym = f" | SYMBOL: {c.symbol_name}" if c.symbol_name else ""
-            lines.append(f"FILE: {c.file_path} (Lines {c.start_line}-{c.end_line}){sym}")
-            lines.append(c.content)
-            lines.append("---")
+            emit_chunk(c, lines)
         sections.append("\n".join(lines))
 
     if dependencies:
@@ -109,9 +114,7 @@ def format_categorized_context(chunks: list) -> str:
     if configs:
         lines = ["[CONFIGURATION]"]
         for c in configs:
-            lines.append(f"FILE: {c.file_path} (Lines {c.start_line}-{c.end_line})")
-            lines.append(c.content)
-            lines.append("---")
+            emit_chunk(c, lines)
         sections.append("\n".join(lines))
 
     return "\n\n".join(sections)
@@ -376,6 +379,44 @@ def knowledge_node(state: AgentState) -> dict:
     }
 
 
+def _safe_repo_relative_target(project_path, file_path: str):
+    """
+    Resolves an LLM-generated, repository-relative `file_path` to an
+    absolute path strictly inside `project_path`, or returns None when it
+    is unsafe: empty, a '..' traversal, or absolute (POSIX '/', Windows
+    '\\', or drive-qualified like 'C:...'). Reuses the same traversal
+    check the policy engine already applies to patch paths
+    (backend/policy/path_filter.is_traversal_attack) rather than
+    re-implementing it.
+
+    Used only by developer_node's no-repo-context fallback write path,
+    which materializes a full generated file directly from
+    DeveloperResult.changes (the exact-snippet LLM-patch path above it
+    already writes relative to a fixed workspace root via string
+    concatenation, not a caller-controlled join, so it isn't exposed to
+    this same risk).
+    """
+    import re
+    from pathlib import Path
+    from backend.policy.path_filter import is_traversal_attack
+
+    candidate = (file_path or "").strip()
+    if (
+        not candidate
+        or is_traversal_attack(candidate)
+        or candidate.startswith(("/", "\\"))
+        or re.match(r"^[a-zA-Z]:", candidate)
+        or Path(candidate).is_absolute()
+    ):
+        return None
+
+    resolved_root = project_path.resolve()
+    target = (project_path / candidate).resolve()
+    if target != resolved_root and resolved_root not in target.parents:
+        return None
+    return target
+
+
 def developer_node(state: AgentState) -> dict:
     check_cancelled(state)
     mark_activity(state, "developer")
@@ -464,6 +505,8 @@ STRUCTURED REPOSITORY CONTEXT:
 {context_str}
 
 Return a list of precise FilePatches. For each patch, provide the file path, the exact original code snippet to be replaced, and the updated code snippet.
+
+For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitted], that block IS the file's entire current content. original_code_snippet must be copied character-for-character from that exact block - do not add, remove, reformat, or assume any additional lines, headings, or whitespace that are not shown, even if that would normally be expected in a file of that type.
 """
             from backend.services.llm import get_llm
             from backend.developer.models import FilePatch
@@ -518,21 +561,42 @@ Return a list of precise FilePatches. For each patch, provide the file path, the
             if not project_path.exists():
                 project_path = Path(os.getcwd()) / "workspace" / project_id
             for ch in developer_result.changes:
-                abs_f = project_path / ch.file_path
-                if abs_f.parent.exists() and ch.content:
-                    try:
-                        with open(abs_f, "w", encoding="utf-8") as f:
-                            f.write(ch.content)
-                        generated_patches.append(
-                            FilePatch(
-                                file_path=ch.file_path,
-                                original_code_snippet="",
-                                updated_code_snippet=ch.content,
-                                explanation=ch.reason,
-                            )
-                        )
-                    except Exception as e:
-                        print(f"Notice: could not write full file change: {e}")
+                # DELETE changes (and any change with no content) have
+                # nothing to materialize via this write path - that's a
+                # legitimate no-op here, not a dropped "effective" change.
+                if not ch.content:
+                    continue
+
+                abs_f = _safe_repo_relative_target(project_path, ch.file_path)
+                if abs_f is None:
+                    raise ValueError(
+                        f"Refusing to materialize generated file change: "
+                        f"'{ch.file_path}' is not a safe repository-relative path."
+                    )
+
+                # Invariant: an effective (non-empty-content) DeveloperResult
+                # change must either become a FilePatch or the run must fail
+                # explicitly here - it must never silently vanish into an
+                # empty generated_patches list the way a bare
+                # `abs_f.parent.exists()` check previously allowed.
+                try:
+                    abs_f.parent.mkdir(parents=True, exist_ok=True)
+                    with open(abs_f, "w", encoding="utf-8") as f:
+                        f.write(ch.content)
+                except OSError as e:
+                    raise ValueError(
+                        f"Failed to materialize generated file change for "
+                        f"'{ch.file_path}': {e}"
+                    ) from e
+
+                generated_patches.append(
+                    FilePatch(
+                        file_path=ch.file_path,
+                        original_code_snippet="",
+                        updated_code_snippet=ch.content,
+                        explanation=ch.reason,
+                    )
+                )
 
 
     run_id = state.get("run_id")
@@ -962,10 +1026,25 @@ def policy_node(state: AgentState) -> dict:
 def route_after_policy(state: AgentState) -> str:
     """
     Routes after policy evaluation:
+    - If the staged diff is a no-op (no patches were ever generated, or the
+      generated patch produced no actual content change), route straight to
+      cleanup - never to approval. This is the deterministic, graph-level
+      guard that stops an empty diff from ever reaching interrupt(): a
+      human must never be asked to approve/reject a change that doesn't
+      exist. cleanup_node distinguishes this from a real human rejection or
+      a policy BLOCK via state["approval"] being unset and git_diff.is_no_op,
+      and reports it as NO_CHANGES_NEEDED rather than REJECTED_AND_CLEANED.
+      git_commit_node's own is_no_op check (backend/graph/nodes.py) remains
+      as a second, independent backstop - this is not the only place that
+      enforces the invariant.
     - If policy decision is BLOCK, route immediately to cleanup (prevents Git mutation).
     - If policy decision is ALLOW or REVIEW, route to approval gate.
     """
     from backend.schemas.policy import PolicyDecision
+
+    git_diff = state.get("git_diff")
+    if git_diff is not None and git_diff.is_no_op:
+        return "cleanup"
 
     policy_result = state.get("policy_result")
     if policy_result and policy_result.decision == PolicyDecision.BLOCK:
@@ -1177,10 +1256,14 @@ def git_commit_node(state: AgentState) -> dict:
 
 def cleanup_node(state: AgentState) -> dict:
     """
-    Cleans up the feature branch after rejection by checking out the
-    previous branch and deleting the feature branch.
+    Cleans up the feature branch after rejection, a policy BLOCK, or a
+    no-op diff (route_after_policy routes all three here - the latter two
+    without ever reaching approval_node). Checks out the previous branch,
+    discards any uncommitted working-tree changes, and deletes the feature
+    branch.
     """
     from backend.vcs.git_manager import GitWorkspaceManager
+    from backend.schemas.policy import PolicyDecision
     import os
     from pathlib import Path
 
@@ -1197,8 +1280,21 @@ def cleanup_node(state: AgentState) -> dict:
         branch_name=branch_name,
     )
 
-    rejection_reason = ""
     approval = state.get("approval")
+    policy_result = state.get("policy_result")
+    policy_blocked = bool(policy_result and policy_result.decision == PolicyDecision.BLOCK)
+
+    # A no-op diff is routed here by route_after_policy before approval_node
+    # ever runs, so no ApprovalDecision exists - distinguish it from a
+    # policy BLOCK (also arrives with no ApprovalDecision, but for a
+    # different, more specific reason) so the status accurately reflects
+    # "nothing to review" rather than "reviewed and rejected".
+    if approval is None and not policy_blocked and git_diff is not None and git_diff.is_no_op:
+        return {
+            "approval_status": "NO_CHANGES_NEEDED",
+        }
+
+    rejection_reason = ""
     if approval and approval.rejection_reason:
         rejection_reason = f" Reason: {approval.rejection_reason}"
 

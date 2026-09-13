@@ -320,7 +320,15 @@ def whole_file_chunk_for_patch_context(
     total_lines = max(len(content.splitlines()), 1)
     return CodeChunk(
         file_path=relative_path,
-        chunk_type="fallback",
+        # "whole_file" (not "fallback") marks this chunk as the file's
+        # complete, verbatim content rather than one fragment among
+        # possibly several - format_categorized_context() uses this to
+        # tell the patch-generation prompt "this is the entire file", so
+        # the LLM knows an exact-match original_code_snippet must come
+        # from this block with nothing added/assumed. Only consumed by
+        # that one prompt (see build_patch_context_chunks) - RAG/indexing
+        # never sees this chunk_type.
+        chunk_type="whole_file",
         symbol_name=None,
         content=content,
         start_line=1,

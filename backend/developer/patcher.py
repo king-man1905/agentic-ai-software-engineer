@@ -31,9 +31,18 @@ class SafePatcher:
         orig = patch.original_code_snippet
         upd = patch.updated_code_snippet
 
-        # If the source content and the original code snippet are both empty,
-        # it is a new file or appending to empty file.
-        if not source_content and not orig:
+        # An empty original_code_snippet is the full-file-write convention
+        # (developer_node's no-repo-context fallback path constructs
+        # patches this way): updated_code_snippet IS the file's complete
+        # intended content, regardless of whether source_content happens
+        # to already be empty (a genuinely new file) or already match it
+        # (e.g. that same node writes the file directly to disk in the
+        # same call that builds this FilePatch, so a later re-validation -
+        # qa/pipeline.py's check_ast - sees non-empty source_content for
+        # what is still a full-file replacement, not a snippet to find).
+        # Exact-match validation for a real snippet patch (non-empty orig)
+        # below is completely unchanged.
+        if not orig:
             applied = upd
         else:
             # Check if the target snippet is present in the source code

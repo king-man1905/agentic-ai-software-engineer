@@ -1,3 +1,6 @@
+import os
+import subprocess
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -9,6 +12,33 @@ from backend.schemas.planning import ExecutionPlan
 from backend.schemas.developer import DeveloperResult, FileChange
 from backend.schemas.qa import QAResult
 from backend.vcs.models import GitDiffSummary, ApprovalDecision
+
+
+def _init_git_workspace(tmp_path, monkeypatch, project_id: str):
+    """
+    Creates a real, git-initialized workspace/<project_id> under tmp_path
+    and points nodes.py's os.getcwd()-based fallback path resolution at it,
+    so developer_node's fallback write + git_prepare_node's diff
+    computation exercise a genuine git baseline (as every real, cloned
+    workspace has - see _ensure_workspace_provisioned/clone_repository)
+    instead of the ambient, non-git workspace/test_project used when no
+    project_id is given. Without real git history, _read_head_content()
+    has no prior baseline to diff a freshly-written file against.
+    """
+    from pathlib import Path
+
+    workspace_dir = tmp_path / "workspace" / project_id
+    workspace_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(workspace_dir), capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(workspace_dir), capture_output=True, text=True)
+    (workspace_dir / "README.md").write_text("# Test Project\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+
+    assert not (Path("workspace") / project_id).exists()
+    monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+    return workspace_dir
 
 
 # ============================================================================
@@ -160,8 +190,16 @@ class TestRunEndpointsValidationAndErrors:
 # ============================================================================
 
 class TestHITLLifecycleWithAPI:
+    HITL_PROJECT_ID = "hitl_lifecycle_project"
+
     @pytest.fixture
-    def client_and_runner(self, monkeypatch):
+    def client_and_runner(self, tmp_path, monkeypatch):
+        # A real, git-initialized workspace (not the ambient, non-git
+        # workspace/test_project) so git_prepare_node's diff computation has
+        # a genuine baseline to diff the fallback-written file against -
+        # every real, cloned workspace has one (see clone_repository).
+        _init_git_workspace(tmp_path, monkeypatch, self.HITL_PROJECT_ID)
+
         # Mock agents in backend.graph.nodes namespace to avoid external LLM calls
         monkeypatch.setattr(
             "backend.graph.nodes.route_task",
@@ -198,6 +236,19 @@ class TestHITLLifecycleWithAPI:
                 summary="QA verification successful.",
             ),
         )
+        # developer_node's own inline exact-snippet LLM call is a separate,
+        # real network call (get_llm + invoke_structured) - independent of
+        # the generate_code_changes mock above, and reachable whenever
+        # self-scan finds any existing content under the workspace (e.g.
+        # the README.md the git init above commits). Stubbed to
+        # deterministically return no patches from that branch, so this
+        # test exercises its own mocked FileChange (via the fallback write
+        # path) and the HITL lifecycle deterministically, without live
+        # LLM calls.
+        monkeypatch.setattr(
+            "backend.graph.nodes.invoke_structured",
+            lambda llm, schema_cls, prompt, *a, **k: schema_cls(patches=[]),
+        )
 
         runner = AgentRunner()
         app = create_app(runner=runner)
@@ -212,6 +263,7 @@ class TestHITLLifecycleWithAPI:
             "/api/v1/runs",
             json={
                 "user_message": "Fix the null check in service",
+                "project_id": self.HITL_PROJECT_ID,
                 "metadata": {"source": "unit_test"},
             },
         )
@@ -271,7 +323,7 @@ class TestHITLLifecycleWithAPI:
         # 1. Create run (dispatched asynchronously in background)
         create_resp = client.post(
             "/api/v1/runs",
-            json={"user_message": "Fix the null check in service"},
+            json={"user_message": "Fix the null check in service", "project_id": self.HITL_PROJECT_ID},
         )
         assert create_resp.status_code == 202
         run_id = create_resp.json()["run_id"]
@@ -306,7 +358,12 @@ class TestHITLLifecycleWithAPI:
 # ============================================================================
 
 class TestConcurrentRunIsolation:
-    def test_concurrent_runs_remain_isolated(self, monkeypatch):
+    def test_concurrent_runs_remain_isolated(self, tmp_path, monkeypatch):
+        # A real, git-initialized workspace (see _init_git_workspace) so
+        # git_prepare_node's diff computation has a genuine baseline -
+        # Run A and Run B write to distinct file paths within it.
+        _init_git_workspace(tmp_path, monkeypatch, "concurrent_isolation_project")
+
         monkeypatch.setattr(
             "backend.graph.nodes.route_task",
             lambda msg: RoutingDecision(
@@ -321,7 +378,17 @@ class TestConcurrentRunIsolation:
             "backend.graph.nodes.generate_code_changes",
             lambda user_request, plan, knowledge: DeveloperResult(
                 summary=f"Fix for: {user_request}",
-                changes=[],
+                changes=[
+                    FileChange(
+                        # Distinct per-request path (not shared between Run
+                        # A and Run B) so each run's diff is unambiguously
+                        # its own, not a race on the same file.
+                        file_path=f"src/isolation_check_{user_request.replace(' ', '_')}.py",
+                        change_type="MODIFY",
+                        content=f"# {user_request}\n",
+                        reason="Isolation check fix",
+                    )
+                ],
                 requires_testing=True,
             ),
         )
@@ -334,14 +401,31 @@ class TestConcurrentRunIsolation:
                 summary="QA Pass",
             ),
         )
+        # See client_and_runner in TestHITLLifecycleWithAPI: developer_node's
+        # own inline exact-snippet LLM call is separate from the
+        # generate_code_changes mock above and reachable via the workspace's
+        # committed README.md - stubbed to deterministically produce no
+        # patches from that branch so this test's own mocked FileChange
+        # (via the fallback write path) is what reaches approval, not a
+        # live/non-deterministic LLM call.
+        monkeypatch.setattr(
+            "backend.graph.nodes.invoke_structured",
+            lambda llm, schema_cls, prompt, *a, **k: schema_cls(patches=[]),
+        )
 
         runner = AgentRunner()
         app = create_app(runner=runner)
         client = TestClient(app)
 
         # Start Run A and Run B
-        res_a = client.post("/api/v1/runs", json={"user_message": "Task A"})
-        res_b = client.post("/api/v1/runs", json={"user_message": "Task B"})
+        res_a = client.post(
+            "/api/v1/runs",
+            json={"user_message": "Task A", "project_id": "concurrent_isolation_project"},
+        )
+        res_b = client.post(
+            "/api/v1/runs",
+            json={"user_message": "Task B", "project_id": "concurrent_isolation_project"},
+        )
 
         assert res_a.status_code == 202
         assert res_b.status_code == 202

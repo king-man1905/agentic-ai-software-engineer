@@ -257,9 +257,27 @@ class AgentRunner:
         LangGraph 1.2.10 behaviour:
           - Interrupted: invoke() returns with '__interrupt__' key, state.next is non-empty.
           - Completed: state.next is empty tuple.
+
+        state.next is also non-empty when a node raised an exception before
+        completing (e.g. developer_node's AST pre-flight ValueError, or any
+        other node crash) - LangGraph leaves the crashed node's name sitting
+        in `next` exactly like a genuine interrupt() pause does, and a naive
+        "next is non-empty -> WAITING_APPROVAL" check can't tell them apart.
+        Only a task with a populated `interrupts` tuple is a real HITL
+        pause; a task with a populated `error` and no `interrupts` is a
+        crashed node and must be reported as FAILED, never as a phantom
+        approval request with empty qa_result/policy_result/git_diff.
         """
-        # Primary signal: state.next populated means graph is paused
+        # Primary signal: state.next populated means graph is paused - or
+        # that the pending node crashed. Inspect the matching task to tell
+        # the two apart.
         if state_snapshot and state_snapshot.next:
+            pending_task = next(
+                (t for t in (state_snapshot.tasks or []) if t.name == state_snapshot.next[0]),
+                None,
+            )
+            if pending_task is not None and pending_task.error and not pending_task.interrupts:
+                return "FAILED"
             return "WAITING_APPROVAL"
 
         # Secondary signal: invoke result carried an interrupt marker

@@ -23,6 +23,7 @@ from backend.observability.store import telemetry_store
 from backend.schemas.developer import DeveloperResult
 from backend.schemas.qa import QAResult
 from backend.schemas.routing import RoutingDecision, TaskType
+from backend.schemas.tenant import Role
 from backend.security.auth import AuthMode
 from backend.security.tenant import tenant_manager
 
@@ -303,6 +304,80 @@ def test_api_run_provisions_missing_repository_and_rag_sees_it(
     repo_context = state_values.get("repo_context") or []
     assert len(repo_context) > 0
     assert any("README" in c.file_path for c in repo_context)
+
+
+def test_repository_registration_endpoint_enables_fresh_workspace_provisioning(
+    tmp_path, monkeypatch, source_repo_fixture, mocked_router_and_developer
+):
+    """
+    Repository registration verification: unlike
+    test_api_run_provisions_missing_repository_and_rag_sees_it (which
+    registers the repository directly via tenant_manager, bypassing the
+    HTTP API), this exercises the actual production path end-to-end for a
+    genuinely fresh project_id/workspace that has never existed:
+
+        POST /api/v1/repositories -> repository registered for the tenant
+        -> POST /api/v1/runs -> _ensure_workspace_provisioned authorizes
+        the repository -> workspace/<project_id> gets cloned/provisioned.
+
+    This is exactly the path the read-only investigation found was never
+    actually exercised by the "fresh" E2E runs, because their workspace
+    directory already existed from an earlier, unrelated provisioning.
+    GitHub credentials/network stay mocked throughout (fake_clone copies
+    from a local fixture directory instead of shelling out to git).
+    """
+    monkeypatch.chdir(tmp_path)
+
+    def fake_clone(clone_url, project_path, timeout=60):
+        shutil.copytree(str(source_repo_fixture), project_path)
+        return True
+
+    monkeypatch.setattr(
+        "backend.vcs.git_manager.GitWorkspaceManager.clone_repository", fake_clone
+    )
+
+    runner = AgentRunner()
+    app = create_app(runner=runner)
+    client = TestClient(app)
+
+    org = tenant_manager.create_organization("org-fresh", "Org Fresh")
+    user = tenant_manager.create_user("user-fresh", "fresh@org.com", "Fresh User")
+    tenant_manager.add_membership(org.id, user.id, Role.ENGINEER)
+    headers = {"X-Organization-ID": "org-fresh", "X-User-ID": "user-fresh"}
+
+    # Nothing registered yet - the API is the only path exercised here.
+    assert tenant_manager.get_repository("acme/fresh-widgets") is None
+    assert not (tmp_path / "workspace" / "fresh-widgets").exists()
+
+    register_resp = client.post(
+        "/api/v1/repositories",
+        json={"repo_full_name": "acme/fresh-widgets", "github_token": "fake-test-token"},
+        headers=headers,
+    )
+    assert register_resp.status_code == 201
+    assert register_resp.json()["is_authorized"] is True
+    assert "github_token" not in register_resp.json()
+
+    run_resp = client.post(
+        "/api/v1/runs",
+        json={
+            "user_message": "Explain what this project builds",
+            "project_id": "fresh-widgets",
+            "repository_id": "acme/fresh-widgets",
+        },
+        headers=headers,
+    )
+    assert run_resp.status_code == 202
+    run_id = run_resp.json()["run_id"]
+
+    # The workspace that did not exist before the registration call now
+    # does, populated from the (faked) clone.
+    assert (tmp_path / "workspace" / "fresh-widgets" / "README.md").exists()
+
+    state_values = runner.get_state_values(run_id, organization_id="org-fresh")
+    assert state_values.get("rag_status") != "RAG_INSUFFICIENT_CONTEXT"
+    repo_context = state_values.get("repo_context") or []
+    assert len(repo_context) > 0
 
 
 def test_api_run_clone_failure_produces_explicit_failed_run(

@@ -6,8 +6,10 @@ tenant security enforcement during recovery, patch integrity, and multi-process 
 
 import os
 import sqlite3
+import subprocess
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 
@@ -15,6 +17,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 from backend.graph.runner import AgentRunner
+from backend.graph.nodes import git_prepare_node as _real_git_prepare_node
 from backend.schemas.routing import RoutingDecision, TaskType
 from backend.schemas.developer import DeveloperResult, FileChange
 from backend.schemas.qa import QAResult
@@ -28,6 +31,68 @@ from backend.vcs.workspace_lock import (
 )
 from backend.security.auth import AuthMode
 from backend.security.tenant import tenant_manager
+
+
+def _init_git_workspace(tmp_path, monkeypatch, project_id: str):
+    """
+    Creates a real, git-initialized workspace/<project_id> under tmp_path
+    and points nodes.py's os.getcwd()-based fallback path resolution at it,
+    so developer_node's fallback write + git_prepare_node's diff
+    computation exercise a genuine git baseline (as every real, cloned
+    workspace has) instead of a canned/mocked diff. Asserts no ambient
+    workspace/<project_id> already exists at the real cwd (which would
+    shadow the tmp_path fallback and defeat the isolation).
+    """
+    workspace_dir = tmp_path / "workspace" / project_id
+    workspace_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(workspace_dir), capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(workspace_dir), capture_output=True, text=True)
+    (workspace_dir / "README.md").write_text("# Test Project\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+
+    assert not (Path("workspace") / project_id).exists(), (
+        f"workspace/{project_id} already exists at the real cwd - pick a "
+        "fresh project_id so the tmp_path fallback below isn't shadowed."
+    )
+    monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+    return workspace_dir
+
+
+def _mock_offline_graph_dependencies(monkeypatch):
+    """
+    Deterministic, fully offline stand-ins for every LLM/subprocess call
+    reachable once a real git workspace (see _init_git_workspace) gives
+    developer_node non-empty repo_context: its own inline exact-snippet
+    LLM branch (invoke_structured), the real QualityPipeline subprocess
+    checks, and the revision-loop LLM calls (defense-in-depth - QA is
+    mocked PASS on the first attempt by the autouse mock_agent_nodes
+    fixture, so revision_node should never actually run).
+
+    Does NOT touch route_task/generate_code_changes/review_code_changes/
+    git_prepare_node - those are handled by mock_agent_nodes, and
+    git_prepare_node is restored to the real implementation by the two
+    tests that need a genuine diff, individually.
+    """
+    monkeypatch.setattr(
+        "backend.graph.nodes.invoke_structured",
+        lambda llm, schema_cls, prompt, *a, **k: schema_cls(patches=[]),
+    )
+    monkeypatch.setattr(
+        "backend.qa.pipeline.QualityPipeline.run_all",
+        lambda repo_path, patches, timeout=30.0, cancel_check=None: ([], None),
+    )
+    monkeypatch.setattr(
+        "backend.agents.developer.revise_code_changes",
+        lambda *args, **kwargs: DeveloperResult(
+            summary="revised", changes=[], requires_testing=True, notes=[]
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.agents.revision.generate_revision_patches",
+        lambda *args, **kwargs: [],
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1343,7 +1408,28 @@ def test_workspace_lock_telemetry(tmp_path, monkeypatch):
 
 
 # 13. test_waiting_approval_workspace_safety
-def test_waiting_approval_workspace_safety(tmp_path):
+def test_waiting_approval_workspace_safety(tmp_path, monkeypatch):
+    """
+    Verifies workspace-lock safety while a run is genuinely paused waiting
+    for human approval: the lock must not be held across the (potentially
+    hours-long) wait, so a second run can acquire it without blocking.
+
+    Made deterministic/offline (previously called AgentRunner.start_run()
+    with the real, unmocked LLM/developer/QA path and merely assumed it
+    would land on WAITING_APPROVAL - a live network call that could also
+    legitimately crash mid-graph): a real, isolated git workspace plus the
+    graph's own real git_prepare_node give a genuine non-empty diff, and
+    every remaining LLM/subprocess call reachable along the way is mocked
+    (route_task/generate_code_changes/review_code_changes via the autouse
+    mock_agent_nodes fixture; developer_node's own inline exact-snippet
+    call, QA's real subprocess checks, and the revision LLM paths via
+    _mock_offline_graph_dependencies).
+    """
+    project_id = "hitl-lock-workspace"
+    _init_git_workspace(tmp_path, monkeypatch, project_id)
+    _mock_offline_graph_dependencies(monkeypatch)
+    monkeypatch.setattr("backend.graph.nodes.git_prepare_node", _real_git_prepare_node)
+
     db_path = str(tmp_path / "hitl_checkpoints.db")
     lock_dir = str(tmp_path / "locks")
     lock_mgr = WorkspaceLockManager(lock_dir=lock_dir)
@@ -1354,23 +1440,45 @@ def test_waiting_approval_workspace_safety(tmp_path):
         status = runner.start_run(
             run_id="run-hitl-lock-test",
             user_message="Feature requiring review",
-            project_id="project-hitl",
+            project_id=project_id,
             organization_id="org-hitl",
         )
         assert status.status == "WAITING_APPROVAL"
+        # Genuinely non-empty: the graph actually produced a real diff,
+        # not a hard-coded/forced status.
+        assert status.git_diff is not None
+        assert not status.git_diff.is_no_op
+        assert status.git_diff.files_changed
 
         # Verify lock is NOT held while waiting for human approval
-        assert lock_mgr.is_locked("org-hitl", "project-hitl") is False
+        assert lock_mgr.is_locked("org-hitl", project_id) is False
 
         # Another run can safely acquire the lock without being blocked for hours
-        assert lock_mgr.acquire_lock("org-hitl", "project-hitl", "run-subsequent", timeout=1.0) is True
-        lock_mgr.release_lock("org-hitl", "project-hitl", "run-subsequent")
+        assert lock_mgr.acquire_lock("org-hitl", project_id, "run-subsequent", timeout=1.0) is True
+        lock_mgr.release_lock("org-hitl", project_id, "run-subsequent")
     finally:
         runner.close()
 
 
 # 14. test_patch_hash_integrity_with_concurrent_run_attempt
 def test_patch_hash_integrity_with_concurrent_run_attempt(tmp_path, monkeypatch):
+    """
+    Verifies approval/diff hash integrity when a concurrent workspace
+    modification is detected between the approval request and the
+    reviewer's resume: the pre-commit drift check must reject the commit
+    (PATCH_HASH_MISMATCH), never silently commit drifted content.
+
+    Made deterministic/offline for the same reason and via the same
+    mechanism as test_waiting_approval_workspace_safety above - the run
+    must genuinely reach WAITING_APPROVAL with a real, non-empty diff
+    before the drift simulation (step 2) and resume (step 3) can
+    meaningfully exercise the integrity check this test is actually about.
+    """
+    project_id = "drift-prevention-workspace"
+    _init_git_workspace(tmp_path, monkeypatch, project_id)
+    _mock_offline_graph_dependencies(monkeypatch)
+    monkeypatch.setattr("backend.graph.nodes.git_prepare_node", _real_git_prepare_node)
+
     db_path = str(tmp_path / "drift_checkpoints.db")
     lock_dir = str(tmp_path / "locks")
     lock_mgr = WorkspaceLockManager(lock_dir=lock_dir)
@@ -1380,14 +1488,17 @@ def test_patch_hash_integrity_with_concurrent_run_attempt(tmp_path, monkeypatch)
     org_id = "org-drift-test"
 
     try:
-        # 1. Run enters WAITING_APPROVAL
+        # 1. Run enters WAITING_APPROVAL with a genuine, non-empty diff.
         status = runner.start_run(
             run_id=run_id,
             user_message="Fix bug with integrity check",
-            project_id="proj-drift",
+            project_id=project_id,
             organization_id=org_id,
         )
         assert status.status == "WAITING_APPROVAL"
+        assert status.git_diff is not None
+        assert not status.git_diff.is_no_op
+        assert status.git_diff.patch_hash
 
         # 2. Simulate concurrent workspace modification / drift before approval resumes
         # GitWorkspaceManager.verify_workspace_drift detects drift

@@ -585,3 +585,127 @@ def test_existing_patch_hash_integrity_still_works():
         assert out["approval_status"] == "PATCH_HASH_MISMATCH"
         assert out["approval"].approved is False
         assert "PATCH_HASH_MISMATCH" in out["approval"].rejection_reason
+
+
+# ============================================================================
+# 27-29: No-Op Diff Guard (never let an empty diff reach HITL approval)
+# ============================================================================
+
+
+def _no_op_git_diff() -> GitDiffSummary:
+    return GitDiffSummary(
+        branch_name="agent/task-noop",
+        files_changed=[],
+        lines_added=0,
+        lines_deleted=0,
+        unified_diff="",
+        patch_hash=GitWorkspaceManager.compute_patch_hash(""),
+        risk_score="LOW",
+        risk_reasons=["No file patches to apply."],
+    )
+
+
+def _allow_policy_result() -> PolicyEvaluationResult:
+    return PolicyEvaluationResult(
+        decision=PolicyDecision.ALLOW,
+        violations=[],
+        warnings=[],
+        checks={"risk_policy": "PASS"},
+        policy_version="1.0.0",
+        evaluated_at="2026-09-05T00:00:00Z",
+    )
+
+
+def test_no_op_diff_never_reaches_approval():
+    """27. A diff with no actual file changes must route straight to
+    cleanup - never to approval - so interrupt() is never called for it.
+    This is the deterministic, graph-level guard: route_after_policy is the
+    sole decider of whether approval_node ever runs."""
+    state: AgentState = {
+        "policy_result": _allow_policy_result(),
+        "git_diff": _no_op_git_diff(),
+    }
+
+    assert route_after_policy(state) == "cleanup"
+
+
+def test_non_empty_diff_still_reaches_approval():
+    """28. A real, non-empty diff is unaffected by the no-op guard and
+    still routes to approval exactly as before."""
+    diff_text = "+pass\n"
+    state: AgentState = {
+        "policy_result": _allow_policy_result(),
+        "git_diff": GitDiffSummary(
+            branch_name="agent/task-real",
+            files_changed=["app.py"],
+            lines_added=1,
+            lines_deleted=0,
+            unified_diff=diff_text,
+            patch_hash=GitWorkspaceManager.compute_patch_hash(diff_text),
+            risk_score="LOW",
+        ),
+    }
+
+    assert route_after_policy(state) == "approval"
+
+
+def test_no_op_diff_cannot_commit():
+    """29. A no-op diff must never reach git_commit_node - route_after_policy
+    sends it to cleanup instead - and cleanup_node must report
+    NO_CHANGES_NEEDED (distinct from a human rejection) without touching
+    any commit machinery."""
+    from backend.graph.nodes import cleanup_node
+
+    git_diff = _no_op_git_diff()
+    state: AgentState = {
+        "git_diff": git_diff,
+        "policy_result": _allow_policy_result(),
+        "project_id": "nonexistent-project-for-noop-test",
+    }
+
+    # The routing decision itself never sends this state toward git_commit.
+    assert route_after_policy(state) == "cleanup"
+
+    with patch(
+        "backend.vcs.git_manager.GitWorkspaceManager.cleanup_branch", return_value=True
+    ) as mock_cleanup, patch(
+        "backend.vcs.git_manager.GitWorkspaceManager.stage_and_commit"
+    ) as mock_commit:
+        out = cleanup_node(state)
+
+    assert out["approval_status"] == "NO_CHANGES_NEEDED"
+    mock_cleanup.assert_called_once()
+    mock_commit.assert_not_called()
+
+
+def test_policy_blocked_no_op_diff_still_reports_policy_blocked():
+    """A no-op diff that is ALSO policy-BLOCKed must still be reported as
+    POLICY_BLOCKED/REJECTED_AND_CLEANED, not misreported as
+    NO_CHANGES_NEEDED - the two states have different meanings and
+    cleanup_node must not conflate them."""
+    from backend.graph.nodes import cleanup_node
+
+    git_diff = _no_op_git_diff()
+    policy_result = PolicyEvaluationResult(
+        decision=PolicyDecision.BLOCK,
+        violations=[PolicyViolation(rule="PROTECTED_BRANCH", message="main is protected")],
+        warnings=[],
+        checks={"branch": "FAIL"},
+        policy_version="1.0.0",
+        evaluated_at="2026-09-05T00:00:00Z",
+    )
+    state: AgentState = {
+        "git_diff": git_diff,
+        "policy_result": policy_result,
+        "project_id": "nonexistent-project-for-noop-test",
+    }
+
+    # A no-op diff is checked first, but BLOCK still routes to cleanup either way.
+    assert route_after_policy(state) == "cleanup"
+
+    with patch(
+        "backend.vcs.git_manager.GitWorkspaceManager.cleanup_branch", return_value=True
+    ):
+        out = cleanup_node(state)
+
+    assert out["approval_status"] == "REJECTED_AND_CLEANED"

@@ -182,6 +182,19 @@ class GitWorkspaceManager:
         result instead of re-running SafePatcher against it: re-applying an
         already-applied patch either fails to match (the "before" snippet
         is gone) or, worse, re-inserts it a second time.
+
+        A patch with an empty original_code_snippet is developer_node's
+        full-file-write convention (its no-repo-context fallback path):
+        updated_code_snippet IS the file's complete intended content, and
+        that path already writes it directly to disk in the same call that
+        builds the FilePatch. That case is detected up front (before the
+        general "no committed version" fallback below could substitute
+        current_content in as the baseline and make a brand-new file's
+        diff look like nothing changed) and always trusts the already-
+        written current_content as the result, diffed against the true
+        prior committed content (empty for a genuinely new/untracked
+        file). A real snippet patch (non-empty original_code_snippet)
+        takes the general path, unchanged from before.
         """
         results: Dict[str, Tuple[str, str]] = {}
 
@@ -198,29 +211,32 @@ class GitWorkspaceManager:
                 except Exception:
                     pass
 
-            if not original_content:
-                # No committed version to diff against (new file, or no git
-                # history yet) - fall back to the working tree as baseline,
-                # same as the previous behavior.
-                original_content = current_content
-
-            if current_content and current_content != original_content:
-                # Already applied directly to disk - trust it.
+            if not patch.original_code_snippet and current_content:
                 patched_content = current_content
             else:
-                validation = SafePatcher.apply_patch(original_content, patch)
+                if not original_content:
+                    # No committed version to diff against (new file, or no
+                    # git history yet) - fall back to the working tree as
+                    # baseline, same as the previous behavior.
+                    original_content = current_content
 
-                if not validation.is_valid:
-                    raise ValueError(
-                        f"Patch validation failed for {patch.file_path}: "
-                        f"{validation.syntax_errors}"
-                    )
+                if current_content and current_content != original_content:
+                    # Already applied directly to disk - trust it.
+                    patched_content = current_content
+                else:
+                    validation = SafePatcher.apply_patch(original_content, patch)
 
-                patched_content = validation.applied_content or ""
+                    if not validation.is_valid:
+                        raise ValueError(
+                            f"Patch validation failed for {patch.file_path}: "
+                            f"{validation.syntax_errors}"
+                        )
 
-                abs_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(abs_path, "w", encoding="utf-8") as f:
-                    f.write(patched_content)
+                    patched_content = validation.applied_content or ""
+
+                    abs_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(abs_path, "w", encoding="utf-8") as f:
+                        f.write(patched_content)
 
             results[patch.file_path] = (original_content, patched_content)
 
@@ -371,7 +387,17 @@ class GitWorkspaceManager:
         commit and `clean -fd` removes untracked files/dirs - neither
         touches committed history, so any real prior commits on the
         fallback branch are left exactly as they were.
+
+        No-op (returns True immediately, no git subprocess invoked) when
+        `repo_path` doesn't exist at all - reachable now that a no-op diff
+        (backend/graph/nodes.py route_after_policy) routes here even for a
+        run whose project_id was never provisioned with a real workspace;
+        there is nothing to clean up for a workspace that was never
+        created.
         """
+        if not Path(repo_path).exists():
+            return True
+
         try:
             # Try 'main' first, fallback to 'master'
             fallback_branch = "main"
@@ -392,7 +418,7 @@ class GitWorkspaceManager:
             # precede branch creation in the current graph.
             _run_git(["branch", "-D", branch_name], repo_path, check=False)
             return True
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return False
 
 
