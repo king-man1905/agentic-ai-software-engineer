@@ -8,10 +8,24 @@ class FilePatch(BaseModel):
     """
     file_path: str = Field(description="Relative path of the file to modify.")
     original_code_snippet: str = Field(
-        description="The exact original code block in the file that needs replacement."
+        description=(
+            "The exact original code block in the file that needs replacement - "
+            "must match the file's existing text character-for-character, "
+            "including whitespace and line endings. "
+            "EXCEPTION - whole-file replacement: when the file's complete "
+            "current content was shown as a single block, this must instead "
+            "be an empty string (\"\") - never a copied or paraphrased quote "
+            "of that content. When this is empty, updated_code_snippet must "
+            "contain the file's entire new content, not just the changed part."
+        )
     )
     updated_code_snippet: str = Field(
-        description="The new code block that will replace the original snippet."
+        description=(
+            "The new code block that will replace the original snippet. "
+            "When original_code_snippet is empty (a whole-file replacement), "
+            "this must be the file's complete new content, not just the "
+            "changed portion."
+        )
     )
     explanation: str = Field(description="Explanation of why this patch is required.")
 

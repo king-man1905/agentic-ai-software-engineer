@@ -467,6 +467,123 @@ class TestNodeFallbacks:
         # The patch was actually applied to the real workspace file.
         assert (workspace_dir / "README.md").read_text(encoding="utf-8") == updated_content
 
+    def test_developer_node_prompt_instructs_empty_snippet_for_whole_file(self, tmp_path, monkeypatch):
+        """
+        Root-cause fix regression test: the patch-generation prompt must
+        explicitly tell the model to use the empty-original_code_snippet
+        whole-file-replace convention for [COMPLETE FILE CONTENT] blocks -
+        never ask it to quote/copy the existing content as an anchor,
+        which is what produced non-matching snippets in practice.
+        """
+        import os
+        from pathlib import Path
+        from backend.graph.nodes import developer_node
+        from backend.schemas.developer import DeveloperResult
+        from backend.schemas.planning import ExecutionPlan
+
+        project_id = "whole_file_prompt_proj"
+        workspace_dir = tmp_path / "workspace" / project_id
+        workspace_dir.mkdir(parents=True)
+        (workspace_dir / "README.md").write_text("# agentic-ai-test-repo", encoding="utf-8")
+
+        assert not (Path("workspace") / project_id).exists()
+        monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="x", changes=[], requires_testing=True, notes=[]
+            ),
+        )
+        monkeypatch.setattr("backend.services.llm.get_llm", lambda: object())
+
+        captured_prompts = []
+
+        class _FakePatchResult:
+            patches = []
+
+        def fake_invoke_structured(llm, schema, prompt):
+            captured_prompts.append(prompt)
+            return _FakePatchResult()
+
+        monkeypatch.setattr("backend.graph.nodes.invoke_structured", fake_invoke_structured)
+
+        state: AgentState = {
+            "user_message": "Add an E2E Test section to README.md",
+            "project_id": project_id,
+            "plan": ExecutionPlan(goal="Add E2E Test section", steps=[], success_criteria="Done"),
+        }
+
+        developer_node(state)
+
+        prompt = captured_prompts[0]
+        assert "[COMPLETE FILE CONTENT - verbatim, nothing omitted]" in prompt
+        assert 'set original_code_snippet to an empty string ("")' in prompt
+        assert 'replace the entire file with updated_code_snippet' in prompt
+        assert "Do NOT quote, copy, or paraphrase" in prompt
+
+    def test_developer_node_whole_file_empty_snippet_patch_applies_successfully(self, tmp_path, monkeypatch):
+        """
+        Proves the required behavior itself: a FilePatch that follows the
+        new instruction - original_code_snippet="" against a
+        [COMPLETE FILE CONTENT] file - is accepted by the existing,
+        unmodified full-file-write convention in SafePatcher.apply_patch
+        and fully replaces the file's content, without ever needing a
+        byte-exact snippet match.
+        """
+        import os
+        from pathlib import Path
+        from backend.developer.models import FilePatch
+        from backend.graph.nodes import developer_node
+        from backend.schemas.developer import DeveloperResult
+        from backend.schemas.planning import ExecutionPlan
+
+        project_id = "whole_file_empty_snippet_proj"
+        workspace_dir = tmp_path / "workspace" / project_id
+        workspace_dir.mkdir(parents=True)
+        original_content = "# agentic-ai-test-repo"
+        (workspace_dir / "README.md").write_text(original_content, encoding="utf-8")
+
+        assert not (Path("workspace") / project_id).exists()
+        monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="x", changes=[], requires_testing=True, notes=[]
+            ),
+        )
+        monkeypatch.setattr("backend.services.llm.get_llm", lambda: object())
+
+        updated_content = "# agentic-ai-test-repo\n\n## E2E Test\n\nDescription.\n"
+
+        class _FakePatchResult:
+            patches = [
+                FilePatch(
+                    file_path="README.md",
+                    original_code_snippet="",
+                    updated_code_snippet=updated_content,
+                    explanation="Add E2E Test section (whole-file replacement)",
+                )
+            ]
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.invoke_structured",
+            lambda llm, schema, prompt: _FakePatchResult(),
+        )
+
+        state: AgentState = {
+            "user_message": "Add an E2E Test section to README.md",
+            "project_id": project_id,
+            "plan": ExecutionPlan(goal="Add E2E Test section", steps=[], success_criteria="Done"),
+        }
+
+        out = developer_node(state)
+
+        assert len(out["generated_patches"]) == 1
+        assert out["generated_patches"][0].original_code_snippet == ""
+        assert (workspace_dir / "README.md").read_text(encoding="utf-8") == updated_content
+
     # ------------------------------------------------------------------
     # FIX 2 regression tests: developer_node's no-repo-context fallback
     # write path must never silently drop an effective DeveloperResult

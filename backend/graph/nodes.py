@@ -506,7 +506,7 @@ STRUCTURED REPOSITORY CONTEXT:
 
 Return a list of precise FilePatches. For each patch, provide the file path, the exact original code snippet to be replaced, and the updated code snippet.
 
-For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitted], that block IS the file's entire current content. original_code_snippet must be copied character-for-character from that exact block - do not add, remove, reformat, or assume any additional lines, headings, or whitespace that are not shown, even if that would normally be expected in a file of that type.
+For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitted], that block IS the file's entire current content. Do NOT quote, copy, or paraphrase any part of it into original_code_snippet. Instead, set original_code_snippet to an empty string ("") and put the file's complete new content - the whole file, not just the changed part - in updated_code_snippet. An empty original_code_snippet always means "replace the entire file with updated_code_snippet".
 """
             from backend.services.llm import get_llm
             from backend.developer.models import FilePatch
