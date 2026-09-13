@@ -3,6 +3,7 @@ from backend.graph.nodes import (
     revision_node,
     qa_router,
     MAX_REVISIONS,
+    _advisory_developer_result,
 )
 from backend.revision.models import (
     RevisionAttempt,
@@ -14,7 +15,7 @@ from backend.revision.analyzer import ErrorTraceAnalyzer, analyze_error_trace
 from backend.developer.models import FilePatch
 from backend.sandbox.models import TestExecutionResult
 from backend.schemas.planning import ExecutionPlan
-from backend.schemas.developer import DeveloperResult
+from backend.schemas.developer import DeveloperResult, FileChange
 from backend.schemas.qa import QAResult, QAIssue
 
 # Prevent pytest from attempting to discover TestExecutionResult as a test case class
@@ -585,3 +586,248 @@ class TestEdgeCasesAndFallbacks:
 
         # 7. QA Router routes to 'pass' -> Approval
         assert qa_router(state) == "pass"
+
+
+# ============================================================================
+# 6. QA/REVISION OPERATE ON THE ACTUAL GENERATED_PATCHES, NOT THE BLIND
+#    DEVELOPER_RESULT (root-cause fix regression tests)
+#
+# Root cause: review_code_changes and revise_code_changes were shown
+# state["developer_result"] - the output of generate_code_changes /
+# revise_code_changes itself, which never receives repo_context or file
+# content - instead of generated_patches, the actual validated patch
+# produced by developer_node's separate, context-aware exact-snippet/
+# whole-file path. The advisory reviewer/revisor therefore judged/revised
+# a disconnected placeholder rather than the real change.
+# ============================================================================
+
+class TestAdvisoryDeveloperResultHelper:
+    def test_reflects_actual_patches_not_the_blind_fallback(self):
+        """_advisory_developer_result builds its DeveloperResult from the
+        real FilePatch content, not the unrelated fallback."""
+        blind_fallback = DeveloperResult(
+            summary="blind - never saw the file", changes=[], requires_testing=True
+        )
+        patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet="",
+            updated_code_snippet="# repo\n\n## E2E Test\nreal content\n",
+            explanation="Add E2E Test section",
+        )
+
+        result = _advisory_developer_result([patch], blind_fallback)
+
+        assert result is not blind_fallback
+        assert len(result.changes) == 1
+        assert result.changes[0].file_path == "README.md"
+        assert "real content" in result.changes[0].content
+        assert "## E2E Test" in result.changes[0].content
+
+    def test_falls_back_when_no_patches_exist(self):
+        """No generated_patches (e.g. a task with nothing to patch at
+        all) -> existing blind-developer_result behavior is untouched."""
+        blind_fallback = DeveloperResult(
+            summary="blind", changes=[], requires_testing=True
+        )
+        assert _advisory_developer_result([], blind_fallback) is blind_fallback
+        assert _advisory_developer_result(None, blind_fallback) is blind_fallback
+
+    def test_never_includes_unrelated_state_or_secrets(self):
+        """The constructed DeveloperResult is built ONLY from FilePatch
+        fields (file_path/original_code_snippet/updated_code_snippet/
+        explanation) - it cannot leak a token/credential that lives
+        elsewhere in graph state (e.g. a repository_id or github_token),
+        since those are never passed in at all."""
+        planted_secret = "ghp_thisIsAFakeTestTokenNotReal1234567890"
+        patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet="",
+            updated_code_snippet="# repo\n\n## E2E Test\nsafe content\n",
+            explanation="Add E2E Test section",
+        )
+        blind_fallback = DeveloperResult(
+            summary="blind", changes=[], requires_testing=True
+        )
+
+        result = _advisory_developer_result([patch], blind_fallback)
+
+        assert planted_secret not in result.model_dump_json()
+
+
+class TestQaAndRevisionSeeActualPatch:
+    def test_qa_node_reviewer_sees_actual_patch_not_blind_developer_result(self, monkeypatch):
+        """1 & 2. review_code_changes must receive the REAL generated
+        patch's content, not the disconnected blind developer_result."""
+        from backend.graph.nodes import qa_node
+
+        blind_initial = DeveloperResult(
+            summary="blind initial - never saw README.md", changes=[], requires_testing=True
+        )
+        initial_patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet="",
+            updated_code_snippet="# repo\n\n## E2E Test\nfirst attempt content\n",
+            explanation="Add E2E Test section (attempt 1)",
+        )
+
+        captured_review_inputs = []
+
+        def fake_review(user_request, plan, developer_result):
+            captured_review_inputs.append(developer_result)
+            return QAResult(status="FAIL", summary="does not address request")
+
+        monkeypatch.setattr("backend.graph.nodes.review_code_changes", fake_review)
+        monkeypatch.setattr(
+            "backend.qa.pipeline.QualityPipeline.run_all",
+            lambda repo_path, patches, timeout=30.0, cancel_check=None: ([], None),
+        )
+
+        state: AgentState = {
+            "user_message": "Add an E2E Test section to README.md",
+            "developer_result": blind_initial,
+            "generated_patches": [initial_patch],
+        }
+
+        qa_node(state)
+
+        assert len(captured_review_inputs) == 1
+        seen = captured_review_inputs[0]
+        assert seen is not blind_initial
+        assert seen.changes[0].file_path == "README.md"
+        assert "first attempt content" in seen.changes[0].content
+
+    def test_revision_node_revise_receives_actual_previous_patch_and_qa_feedback(self, monkeypatch):
+        """3. revise_code_changes must receive the REAL previous patch
+        (not the blind developer_result) and the actual QA failure."""
+        blind_prev = DeveloperResult(
+            summary="blind - never saw README.md", changes=[], requires_testing=True
+        )
+        initial_patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet="",
+            updated_code_snippet="# repo\n\n## E2E Test\nfirst attempt content\n",
+            explanation="Add E2E Test section (attempt 1)",
+        )
+        qa_fail = QAResult(status="FAIL", summary="does not address request")
+
+        captured_revise_inputs = []
+
+        def fake_revise(user_request, plan, previous_result, qa_result):
+            captured_revise_inputs.append((previous_result, qa_result))
+            return DeveloperResult(summary="revised", changes=[], requires_testing=True)
+
+        monkeypatch.setattr("backend.agents.developer.revise_code_changes", fake_revise)
+        monkeypatch.setattr(
+            "backend.agents.revision.generate_revision_patches", lambda **kwargs: []
+        )
+
+        state: AgentState = {
+            "user_message": "Add an E2E Test section to README.md",
+            "developer_result": blind_prev,
+            "generated_patches": [initial_patch],
+            "qa_result": qa_fail,
+        }
+
+        revision_node(state)
+
+        assert len(captured_revise_inputs) == 1
+        seen_prev, seen_qa = captured_revise_inputs[0]
+        assert seen_prev is not blind_prev
+        assert seen_prev.changes[0].file_path == "README.md"
+        assert "first attempt content" in seen_prev.changes[0].content
+        assert seen_qa is qa_fail
+
+    def test_revision_output_becomes_next_qa_cycle_candidate(self, tmp_path, monkeypatch):
+        """4. A revised patch produced during revision_node (materialized
+        via the same full-file-write convention developer_node uses, when
+        the context-aware generate_revision_patches path is unavailable)
+        must actually become the candidate the NEXT qa_node call
+        evaluates - not the original, already-rejected attempt."""
+        import os
+        from pathlib import Path
+        from backend.graph.nodes import qa_node
+
+        project_id = "revision_flow_proj"
+        workspace_dir = tmp_path / "workspace" / project_id
+        workspace_dir.mkdir(parents=True)
+        monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+        assert not (Path("workspace") / project_id).exists()
+
+        initial_patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet="",
+            updated_code_snippet="# repo\n\n## E2E Test\nfirst attempt content\n",
+            explanation="Add E2E Test section (attempt 1)",
+        )
+        revised_developer_result = DeveloperResult(
+            summary="revised after QA feedback",
+            changes=[
+                FileChange(
+                    file_path="README.md",
+                    change_type="MODIFY",
+                    content="# repo\n\n## E2E Test\nrevised attempt fixing the issue\n",
+                    reason="Addressed QA feedback",
+                )
+            ],
+            requires_testing=True,
+        )
+
+        monkeypatch.setattr(
+            "backend.agents.developer.revise_code_changes",
+            lambda user_request, plan, previous_result, qa_result: revised_developer_result,
+        )
+        # No repo_context in this state -> the context-aware path is
+        # unavailable, exercising the blind-materialization fallback.
+        monkeypatch.setattr(
+            "backend.agents.revision.generate_revision_patches", lambda **kwargs: []
+        )
+
+        qa_results = [QAResult(status="FAIL", summary="does not address request")]
+        captured_review_inputs = []
+
+        def fake_review(user_request, plan, developer_result):
+            captured_review_inputs.append(developer_result)
+            return qa_results.pop(0) if qa_results else QAResult(status="PASS", summary="ok")
+
+        monkeypatch.setattr("backend.graph.nodes.review_code_changes", fake_review)
+        monkeypatch.setattr(
+            "backend.qa.pipeline.QualityPipeline.run_all",
+            lambda repo_path, patches, timeout=30.0, cancel_check=None: ([], None),
+        )
+
+        state: AgentState = {
+            "user_message": "Add an E2E Test section to README.md",
+            "project_id": project_id,
+            "developer_result": DeveloperResult(summary="blind", changes=[], requires_testing=True),
+            "generated_patches": [initial_patch],
+        }
+
+        # Cycle 1: QA fails the initial patch.
+        state.update(qa_node(state))
+        assert state["qa_result"].status == "FAIL"
+        assert "first attempt content" in captured_review_inputs[0].changes[0].content
+
+        # Revision produces the revised patch as the new candidate.
+        state.update(revision_node(state))
+        assert len(state["generated_patches"]) == 1
+        assert "revised attempt fixing the issue" in state["generated_patches"][0].updated_code_snippet
+
+        # Cycle 2: the SAME state flows straight into qa_node again (the
+        # graph's revision -> qa edge, not revision -> developer) and must
+        # evaluate the REVISED patch, not the original one.
+        state.update(qa_node(state))
+        assert len(captured_review_inputs) == 2
+        assert "revised attempt fixing the issue" in captured_review_inputs[1].changes[0].content
+        assert "first attempt content" not in captured_review_inputs[1].changes[0].content
+
+    def test_graph_edge_routes_revision_directly_to_qa(self):
+        """Confirms the actual compiled graph wiring: revision's outgoing
+        edge targets "qa" (not "developer"), so developer_node's
+        unconditional generated_patches=[] reset can never discard what
+        revision_node just produced before QA re-evaluates it."""
+        from backend.graph.runner import AgentRunner
+
+        runner = AgentRunner()
+        edges = {(e.source, e.target) for e in runner._graph.get_graph().edges}
+        assert ("revision", "qa") in edges
+        assert ("revision", "developer") not in edges

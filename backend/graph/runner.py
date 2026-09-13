@@ -160,7 +160,15 @@ def _build_graph(checkpointer: BaseCheckpointSaver):
     )
     builder.add_edge("git_commit", END)
     builder.add_edge("cleanup", END)
-    builder.add_edge("revision", "developer")
+    # revision -> qa (not "developer"): revision_node already produces the
+    # revised candidate (generated_patches/developer_result) itself - routing
+    # back through developer_node would unconditionally reset
+    # generated_patches=[] and regenerate a fresh, blind patch from scratch,
+    # discarding revision's output before QA ever saw it. Going straight to
+    # qa_node makes the revised patch the one actually re-evaluated.
+    # revision_count (and therefore MAX_REVISIONS bounding) is incremented
+    # inside revision_node itself and is unaffected by this edge.
+    builder.add_edge("revision", "qa")
 
     return builder.compile(checkpointer=checkpointer)
 

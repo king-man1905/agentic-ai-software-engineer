@@ -389,9 +389,10 @@ def _safe_repo_relative_target(project_path, file_path: str):
     (backend/policy/path_filter.is_traversal_attack) rather than
     re-implementing it.
 
-    Used only by developer_node's no-repo-context fallback write path,
-    which materializes a full generated file directly from
-    DeveloperResult.changes (the exact-snippet LLM-patch path above it
+    Used by _materialize_developer_changes (developer_node's and
+    revision_node's no-repo-context fallback write paths, which
+    materialize a full generated file directly from
+    DeveloperResult.changes - the exact-snippet LLM-patch path above it
     already writes relative to a fixed workspace root via string
     concatenation, not a caller-controlled join, so it isn't exposed to
     this same risk).
@@ -415,6 +416,113 @@ def _safe_repo_relative_target(project_path, file_path: str):
     if target != resolved_root and resolved_root not in target.parents:
         return None
     return target
+
+
+def _materialize_developer_changes(changes, project_id: str) -> list:
+    """
+    Writes each non-empty FileChange directly to disk under
+    workspace/<project_id> and returns the corresponding FilePatch list,
+    using the same full-file-write convention as the exact-snippet patch
+    path (empty original_code_snippet - see backend/developer/patcher.py).
+
+    Shared by developer_node's own no-repo-context fallback and
+    revision_node's blind-revision fallback (when generate_revision_patches
+    either didn't run or produced nothing), so a revised DeveloperResult
+    from revise_code_changes is materialized exactly the same way an
+    initial one is, instead of a second, divergent implementation.
+
+    Invariant preserved: an effective (non-empty-content) change must
+    either become a FilePatch or this call fails explicitly (ValueError) -
+    it must never silently vanish.
+    """
+    from backend.developer.models import FilePatch
+    import os
+    from pathlib import Path
+
+    project_path = Path("workspace") / project_id
+    if not project_path.exists():
+        project_path = Path(os.getcwd()) / "workspace" / project_id
+
+    patches = []
+    for ch in changes:
+        # DELETE changes (and any change with no content) have nothing to
+        # materialize via this write path - a legitimate no-op, not a
+        # dropped "effective" change.
+        if not ch.content:
+            continue
+
+        abs_f = _safe_repo_relative_target(project_path, ch.file_path)
+        if abs_f is None:
+            raise ValueError(
+                f"Refusing to materialize generated file change: "
+                f"'{ch.file_path}' is not a safe repository-relative path."
+            )
+
+        try:
+            abs_f.parent.mkdir(parents=True, exist_ok=True)
+            with open(abs_f, "w", encoding="utf-8") as f:
+                f.write(ch.content)
+        except OSError as e:
+            raise ValueError(
+                f"Failed to materialize generated file change for "
+                f"'{ch.file_path}': {e}"
+            ) from e
+
+        patches.append(
+            FilePatch(
+                file_path=ch.file_path,
+                original_code_snippet="",
+                updated_code_snippet=ch.content,
+                explanation=ch.reason,
+            )
+        )
+    return patches
+
+
+def _advisory_developer_result(generated_patches, fallback):
+    """
+    Builds the DeveloperResult shown to the advisory QA reviewer
+    (review_code_changes) and the revision agent (revise_code_changes) so
+    they judge/revise the file(s) actually validated and staged
+    (generated_patches) - not the separate, context-blind DeveloperResult
+    produced by generate_code_changes/revise_code_changes, which never
+    receives repo_context or file content and is otherwise the only
+    representation of "the proposed implementation" those two prompts see.
+
+    Falls back to `fallback` unchanged when there are no generated_patches
+    (e.g. a task with nothing to patch at all) - existing blind-
+    developer_result behavior for that case is untouched. Does not alter
+    generated_patches, SafePatcher validation, or objective QA checks -
+    those already operate on generated_patches directly and are
+    unaffected by this advisory-only, LLM-facing representation.
+    """
+    if not generated_patches:
+        return fallback
+
+    from backend.schemas.developer import DeveloperResult, FileChange
+
+    changes = [
+        FileChange(
+            file_path=p.file_path,
+            change_type="MODIFY",
+            content=p.updated_code_snippet,
+            reason=(
+                f"{p.explanation}\n\n"
+                f"--- BEFORE ---\n{p.original_code_snippet or '(new file / whole-file replacement)'}\n"
+                f"--- AFTER ---\n{p.updated_code_snippet}"
+            ),
+        )
+        for p in generated_patches
+    ]
+    return DeveloperResult(
+        summary=(
+            f"Applied {len(changes)} validated patch(es): "
+            f"{', '.join(c.file_path for c in changes)}."
+        ),
+        changes=changes,
+        requires_testing=True,
+        notes=[],
+    )
 
 
 def developer_node(state: AgentState) -> dict:
@@ -553,50 +661,9 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
                 generated_patches.append(patch)
 
         if not generated_patches and developer_result and developer_result.changes:
-            from backend.developer.models import FilePatch
-            import os
-            from pathlib import Path
-            project_id = state.get("project_id", "test_project")
-            project_path = Path("workspace") / project_id
-            if not project_path.exists():
-                project_path = Path(os.getcwd()) / "workspace" / project_id
-            for ch in developer_result.changes:
-                # DELETE changes (and any change with no content) have
-                # nothing to materialize via this write path - that's a
-                # legitimate no-op here, not a dropped "effective" change.
-                if not ch.content:
-                    continue
-
-                abs_f = _safe_repo_relative_target(project_path, ch.file_path)
-                if abs_f is None:
-                    raise ValueError(
-                        f"Refusing to materialize generated file change: "
-                        f"'{ch.file_path}' is not a safe repository-relative path."
-                    )
-
-                # Invariant: an effective (non-empty-content) DeveloperResult
-                # change must either become a FilePatch or the run must fail
-                # explicitly here - it must never silently vanish into an
-                # empty generated_patches list the way a bare
-                # `abs_f.parent.exists()` check previously allowed.
-                try:
-                    abs_f.parent.mkdir(parents=True, exist_ok=True)
-                    with open(abs_f, "w", encoding="utf-8") as f:
-                        f.write(ch.content)
-                except OSError as e:
-                    raise ValueError(
-                        f"Failed to materialize generated file change for "
-                        f"'{ch.file_path}': {e}"
-                    ) from e
-
-                generated_patches.append(
-                    FilePatch(
-                        file_path=ch.file_path,
-                        original_code_snippet="",
-                        updated_code_snippet=ch.content,
-                        explanation=ch.reason,
-                    )
-                )
+            generated_patches = _materialize_developer_changes(
+                developer_result.changes, state.get("project_id", "test_project")
+            )
 
 
     run_id = state.get("run_id")
@@ -612,6 +679,15 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
         "developer_result": developer_result,
         "plan": plan,
         "generated_patches": generated_patches,
+        # Persisted (mirroring knowledge_node's existing behavior) so
+        # revision_node's own context-aware patch path
+        # (generate_revision_patches) can actually run on a knowledge-skip
+        # task - previously this was a local variable, discarded at the end
+        # of every developer_node call. Contains only already-scanned
+        # source file chunks (backend/indexer/scanner.py already excludes
+        # .env/*.pem/*.key/secrets.json); no credentials or repository
+        # tokens ever pass through this value.
+        "repo_context": repo_context,
         "metrics": merge_usage(state.get("metrics"), usage),
     }
 
@@ -627,11 +703,18 @@ def qa_node(state: AgentState) -> dict:
             success_criteria="Complete requested task directly.",
         )
 
-    # 1. LLM Semantic Review
+    # 1. LLM Semantic Review - judged against the ACTUAL validated patch
+    # (generated_patches) whenever one exists, not the separate,
+    # context-blind DeveloperResult from generate_code_changes (see
+    # _advisory_developer_result). The reviewer remains fully advisory -
+    # its FAIL still participates in StructuredQAJudge's existing
+    # aggregation policy (backend/qa/judge.py) unchanged.
     llm_qa_result = review_code_changes(
         user_request=state["user_message"],
         plan=plan,
-        developer_result=state["developer_result"],
+        developer_result=_advisory_developer_result(
+            state.get("generated_patches"), state["developer_result"]
+        ),
     )
 
     project_id = state.get("project_id", "test_project")
@@ -791,18 +874,28 @@ def revision_node(state: AgentState) -> dict:
             notes=[],
         )
 
+    # Show the revision agent the ACTUAL previous patch it needs to fix
+    # (see _advisory_developer_result) - not the separate, context-blind
+    # developer_result, which has no file content and would otherwise
+    # correctly (but unhelpfully) report that it lacks the context to
+    # revise anything.
+    advisory_prev_result = _advisory_developer_result(
+        state.get("generated_patches"), prev_result
+    )
+
     # 5. Revise code changes
     with collect_usage() as usage:
         revised_result = revise_code_changes(
             user_request=state["user_message"],
             plan=plan,
-            previous_result=prev_result,
+            previous_result=advisory_prev_result,
             qa_result=qa_result,
         )
 
         # 6. Generate revised patches and perform AST pre-flight validation if repo context is available
         repo_context = state.get("repo_context")
         generated_patches = state.get("generated_patches") or []
+        context_aware_patch_produced = False
 
         if repo_context:
             try:
@@ -816,8 +909,24 @@ def revision_node(state: AgentState) -> dict:
                 )
                 if revised_patches:
                     generated_patches = revised_patches
+                    context_aware_patch_produced = True
             except Exception as e:
                 print(f"Revision patch generation notice: {e}")
+
+        # Blind-path fallback: if the context-aware regeneration above
+        # didn't run (no repo_context) or produced nothing THIS attempt,
+        # materialize revise_code_changes's own output the same way
+        # developer_node's fallback does (_materialize_developer_changes),
+        # so a genuinely improved blind revision still becomes the
+        # candidate the next QA cycle actually evaluates. Checked against
+        # context_aware_patch_produced, not "generated_patches is empty" -
+        # generated_patches already holds the PREVIOUS (rejected) attempt
+        # on every revision past the first, so that would otherwise never
+        # be empty and this fallback would never run.
+        if not context_aware_patch_produced and revised_result and revised_result.changes:
+            generated_patches = _materialize_developer_changes(
+                revised_result.changes, state.get("project_id", "test_project")
+            )
 
     # 7. Record this revision attempt with structured telemetry
     new_revision_count = revision_count + 1
