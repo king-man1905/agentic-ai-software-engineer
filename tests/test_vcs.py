@@ -421,6 +421,80 @@ class TestGitOperationsIsolated:
         )
         assert "agent/task-cleanup" not in branches.stdout
 
+    def test_cleanup_branch_discards_uncommitted_changes_on_rejection(self, git_repo):
+        """A rejected run: developer_node wrote patch content directly to
+        disk (tracked-file edit + a new untracked file) before HITL
+        approval, but the human rejected it. No commit was ever made and
+        no feature branch was ever created (git_commit_node is the only
+        place that creates one). cleanup_branch must still leave the
+        workspace exactly as it was pre-run."""
+        original_readme = (git_repo / "README.md").read_text(encoding="utf-8")
+
+        (git_repo / "README.md").write_text("# Test\ntampered by rejected run\n", encoding="utf-8")
+        (git_repo / "leftover_patch.py").write_text("x = 1\n", encoding="utf-8")
+
+        success = GitWorkspaceManager.cleanup_branch(str(git_repo), "agent/task-never-created")
+        assert success is True
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(git_repo), capture_output=True, text=True,
+        )
+        assert status.stdout.strip() == "", "workspace must be clean after a rejected run"
+        assert (git_repo / "README.md").read_text(encoding="utf-8") == original_readme
+        assert not (git_repo / "leftover_patch.py").exists()
+
+    def test_cleanup_branch_discards_uncommitted_changes_on_policy_block(self, git_repo):
+        """A policy-blocked run: route_after_policy sends BLOCK decisions
+        straight to cleanup, before any branch or commit exists - same
+        uncommitted-patch-on-disk shape as a rejection, exercised here with
+        a different mix (deleted-then-modified tracked content) to confirm
+        cleanup isn't just resetting a single known diff shape."""
+        (git_repo / "README.md").unlink()
+        (git_repo / "README.md").write_text("# Test\nrewritten by policy-blocked run\n", encoding="utf-8")
+        (git_repo / "another_leftover.py").write_text("y = 2\n", encoding="utf-8")
+
+        success = GitWorkspaceManager.cleanup_branch(str(git_repo), "agent/task-policy-blocked")
+        assert success is True
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(git_repo), capture_output=True, text=True,
+        )
+        assert status.stdout.strip() == "", "workspace must be clean after a policy-blocked run"
+        assert (git_repo / "README.md").read_text(encoding="utf-8") == "# Test\n"
+        assert not (git_repo / "another_leftover.py").exists()
+
+    def test_cleanup_branch_preserves_committed_history(self, git_repo):
+        """Real prior work committed to main must survive cleanup - only
+        the uncommitted leftovers from the rejected/blocked run are
+        discarded, never anything already committed."""
+        (git_repo / "shipped_feature.py").write_text("def shipped():\n    return True\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(git_repo), capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "ship real feature"],
+            cwd=str(git_repo), capture_output=True, text=True, check=True,
+        )
+        committed_log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(git_repo), capture_output=True, text=True,
+        ).stdout
+
+        # A later run's uncommitted, rejected patch attempt.
+        (git_repo / "shipped_feature.py").write_text("def shipped():\n    return False  # tampered\n", encoding="utf-8")
+        (git_repo / "rejected_new_file.py").write_text("z = 3\n", encoding="utf-8")
+
+        success = GitWorkspaceManager.cleanup_branch(str(git_repo), "agent/task-after-commit")
+        assert success is True
+
+        # The earlier commit is untouched.
+        log_after = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(git_repo), capture_output=True, text=True,
+        ).stdout
+        assert log_after == committed_log
+        assert "ship real feature" in log_after
+        assert (git_repo / "shipped_feature.py").read_text(encoding="utf-8") == "def shipped():\n    return True\n"
+        assert not (git_repo / "rejected_new_file.py").exists()
+
     def test_clone_repository_creates_workspace_from_source(self, git_repo, tmp_path):
         """A missing destination is cloned from the given URL (a plain
         local path works too - git treats it like any other clone source),

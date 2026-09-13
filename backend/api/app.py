@@ -21,6 +21,8 @@ from backend.api.models import (
     CreateRunRequest,
     PublishPRRequest,
     PublishPRResponse,
+    RegisterRepositoryRequest,
+    RepositoryResponse,
     RunStatusResponse,
     ResumeRunRequest,
     RunListResponse,
@@ -314,6 +316,83 @@ def create_app(
             "role": tenant_ctx.role.value,
             "permissions": [p.value for p in tenant_ctx.permissions],
         }
+
+    # -------------------------------------------------------------------------
+    # Repositories API (v1)
+    # -------------------------------------------------------------------------
+    @app.post(
+        "/api/v1/repositories",
+        response_model=RepositoryResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Repositories"],
+        summary="Register and authorize a repository for the caller's tenant organization",
+    )
+    def register_repository(
+        request: RegisterRepositoryRequest,
+        tenant_ctx: TenantContext = Depends(get_tenant_context),
+    ) -> RepositoryResponse:
+        # RBAC Permission Check - reuses the existing REPO_MANAGE permission
+        # already granted to OWNER/ADMIN/ENGINEER roles.
+        if Permission.REPO_MANAGE not in tenant_ctx.permissions:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: Role '{tenant_ctx.role.value}' lacks REPO_MANAGE permission.",
+            )
+
+        repo_full_name = request.repo_full_name.strip()
+        if not repo_full_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="repo_full_name is required.",
+            )
+
+        # Tenant isolation: the repository is always registered under the
+        # caller's own organization (never a caller-supplied org id), and a
+        # repo already registered to a *different* organization is never
+        # silently reassigned - TenantManager's repository registry is
+        # keyed globally by full_name, so without this check one tenant
+        # could hijack another tenant's authorized repository by
+        # re-registering the same name.
+        existing = tenant_manager.get_repository(repo_full_name)
+        if existing and existing.organization_id != tenant_ctx.organization_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Repository '{repo_full_name}' is already registered to a different organization.",
+            )
+
+        repo = tenant_manager.register_repository(
+            repo_id=repo_full_name,
+            org_id=tenant_ctx.organization_id,
+            name=repo_full_name.split("/")[-1],
+            full_name=repo_full_name,
+            default_branch=request.default_branch,
+            is_private=request.is_private,
+            github_token=request.github_token,
+        )
+
+        # Tamper-evident Audit Logging - records that a token was configured
+        # without ever recording the token value itself (also defense in
+        # depth against sanitize_audit_details, which already redacts it).
+        audit_logger.log(
+            organization_id=tenant_ctx.organization_id,
+            user_id=tenant_ctx.user_id,
+            action=AuditAction.REPOSITORY_CONNECTED,
+            resource_type="repository",
+            resource_id=repo_full_name,
+            details={"has_token": bool(request.github_token)},
+        )
+
+        return RepositoryResponse(
+            id=repo.id,
+            organization_id=repo.organization_id,
+            name=repo.name,
+            full_name=repo.full_name,
+            default_branch=repo.default_branch,
+            allowed_branches=repo.allowed_branches,
+            is_private=repo.is_private,
+            is_authorized=repo.is_authorized,
+            has_token=bool(repo.github_token),
+        )
 
     # -------------------------------------------------------------------------
     # Runs API (v1)

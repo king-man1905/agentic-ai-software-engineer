@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import { NewRunPage } from '../pages/NewRunPage';
 import { runsApi } from '../api/runs';
+import { repositoriesApi } from '../api/repositories';
 
 vi.mock('../api/runs', () => ({
   runsApi: {
@@ -9,12 +10,30 @@ vi.mock('../api/runs', () => ({
   },
 }));
 
+vi.mock('../api/repositories', () => ({
+  repositoriesApi: {
+    register: vi.fn(),
+  },
+}));
+
 const mockedCreateRun = runsApi.createRun as unknown as ReturnType<typeof vi.fn>;
+const mockedRegisterRepository = repositoriesApi.register as unknown as ReturnType<typeof vi.fn>;
 
 describe('NewRunPage - repository_id wiring', () => {
   beforeEach(() => {
     mockedCreateRun.mockReset();
     mockedCreateRun.mockResolvedValue({ run_id: 'run_123', status: 'RUNNING' });
+    mockedRegisterRepository.mockReset();
+    mockedRegisterRepository.mockResolvedValue({
+      id: 'acme-org/widgets-service',
+      organization_id: 'default-org',
+      name: 'widgets-service',
+      default_branch: 'main',
+      allowed_branches: ['main'],
+      is_private: true,
+      is_authorized: true,
+      has_token: false,
+    });
   });
 
   const fillAndSubmit = async (repoValue: string | null, taskMessage = 'Fix the bug') => {
@@ -68,6 +87,27 @@ describe('NewRunPage - repository_id wiring', () => {
     expect(payload.repository_id).toBeUndefined();
     // project_id/metadata behavior for a blank repo is unchanged by this fix.
     expect(payload.metadata.github_repo).toBe('');
+    // No repo to register - and nothing arbitrary should be registered either.
+    expect(mockedRegisterRepository).not.toHaveBeenCalled();
+  });
+
+  it('registers/authorizes the target repository for the tenant before dispatching the run', async () => {
+    await fillAndSubmit('acme-org/widgets-service');
+
+    expect(mockedRegisterRepository).toHaveBeenCalledTimes(1);
+    expect(mockedRegisterRepository).toHaveBeenCalledWith({ repo_full_name: 'acme-org/widgets-service' });
+    expect(mockedCreateRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a registration failure and never dispatches the run', async () => {
+    mockedRegisterRepository.mockRejectedValueOnce(
+      new Error("Permission denied: Role 'VIEWER' lacks REPO_MANAGE permission.")
+    );
+
+    await fillAndSubmit('acme-org/widgets-service');
+
+    expect(mockedCreateRun).not.toHaveBeenCalled();
+    expect(screen.getByText(/lacks REPO_MANAGE permission/)).toBeTruthy();
   });
 
   it('preserves existing New Run behavior: default repo value, project_id override, and onRunCreated callback', async () => {

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Play, Sparkles } from 'lucide-react';
 import { runsApi } from '../api/runs';
+import { repositoriesApi } from '../api/repositories';
 import { ErrorAlert } from '../components/common/ErrorAlert';
 
 interface NewRunPageProps {
@@ -34,6 +35,15 @@ export const NewRunPage: React.FC<NewRunPageProps> = ({ onRunCreated }) => {
     try {
       const trimmedRepo = repo.trim();
       const derivedProjectId = projectId.trim() || repo.split('/')[1] || repo;
+
+      // Register/authorize the target repository for this tenant before
+      // dispatching the run - the backend only clones a repository into
+      // the run's workspace (_ensure_workspace_provisioned) once it has
+      // been registered for the caller's organization.
+      if (trimmedRepo) {
+        await repositoriesApi.register({ repo_full_name: trimmedRepo });
+      }
+
       const res = await runsApi.createRun(
         {
           user_message: taskMessage.trim(),

@@ -34,6 +34,44 @@ class CreateRunRequest(BaseModel):
     )
 
 
+class RegisterRepositoryRequest(BaseModel):
+    """
+    Request body to register/authorize a repository for the caller's tenant
+    organization, so subsequent runs can clone it and publish PRs against it.
+    """
+    repo_full_name: str = Field(
+        description="Repository identifier in 'owner/repo' format. Used as both repository_id on run creation and repo_full_name when publishing a PR."
+    )
+    default_branch: str = Field(default="main", description="Default branch name.")
+    is_private: bool = Field(default=True, description="Whether the repository is private.")
+    github_token: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional repository-scoped GitHub token. Never echoed back in "
+            "the response or written to logs/audit trail; falls back to the "
+            "server's GITHUB_TOKEN environment variable when omitted."
+        ),
+    )
+
+
+class RepositoryResponse(BaseModel):
+    """
+    Public schema for a registered repository. Deliberately omits
+    github_token - the raw credential is never returned to a caller.
+    """
+    id: str
+    organization_id: str
+    name: str
+    full_name: Optional[str] = None
+    default_branch: str
+    allowed_branches: List[str]
+    is_private: bool
+    is_authorized: bool
+    has_token: bool = Field(
+        description="Whether a repository-scoped GitHub token is configured for this repository."
+    )
+
+
 class RunStatusResponse(BaseModel):
     """
     Describes the current status of an agent run.

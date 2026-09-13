@@ -354,8 +354,23 @@ class GitWorkspaceManager:
     @staticmethod
     def cleanup_branch(repo_path: str, branch_name: str) -> bool:
         """
-        Checks out the previous branch (main/master) and deletes the feature branch.
+        Checks out the previous branch (main/master), discards any
+        uncommitted working-tree changes, and deletes the feature branch.
         Returns True on success.
+
+        developer_node/git_prepare_node write proposed patch content
+        directly to disk (so a diff can be computed) before the HITL
+        approval gate ever runs. When a run is rejected or policy-blocked,
+        no commit is ever made and no feature branch is ever created
+        (git_commit_node is the only place that creates one, reached only
+        after approval) - so without discarding those uncommitted edits
+        here, they sit on disk and the next run against the same project
+        workspace mistakes them for the repository's real state.
+
+        `checkout -- .` resets tracked files to the just-checked-out
+        commit and `clean -fd` removes untracked files/dirs - neither
+        touches committed history, so any real prior commits on the
+        fallback branch are left exactly as they were.
         """
         try:
             # Try 'main' first, fallback to 'master'
@@ -365,7 +380,17 @@ class GitWorkspaceManager:
                 fallback_branch = "master"
 
             _run_git(["checkout", fallback_branch], repo_path)
-            _run_git(["branch", "-D", branch_name], repo_path)
+
+            # Discard uncommitted changes left behind by patch generation.
+            # Never touches committed history - only the working tree/index.
+            _run_git(["checkout", "--", "."], repo_path, check=False)
+            _run_git(["clean", "-fd"], repo_path, check=False)
+
+            # Delete the feature branch if it was actually created (only
+            # true once a run reaches git_commit_node); a no-op rather than
+            # a failure when it wasn't, since rejection/policy-block always
+            # precede branch creation in the current graph.
+            _run_git(["branch", "-D", branch_name], repo_path, check=False)
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
             return False

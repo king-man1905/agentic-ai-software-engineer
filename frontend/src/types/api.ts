@@ -5,6 +5,25 @@ import { RunRecord, TelemetryEvent } from './telemetry';
 
 export type { RunRecord, TelemetryEvent };
 
+export interface RegisterRepositoryRequest {
+  repo_full_name: string;
+  default_branch?: string;
+  is_private?: boolean;
+  github_token?: string;
+}
+
+export interface RepositoryResponse {
+  id: string;
+  organization_id: string;
+  name: string;
+  full_name?: string | null;
+  default_branch: string;
+  allowed_branches: string[];
+  is_private: boolean;
+  is_authorized: boolean;
+  has_token: boolean;
+}
+
 export interface CreateRunRequest {
   user_message: string;
   project_id?: string | null;
