@@ -1588,6 +1588,139 @@ def test_fallback_initialization_failure_chains_exception_and_emits_safe_telemet
     assert "x-access-token" not in meta_str
 
 
+# 29. test_real_fallback_selection_composes_with_invoke_structured_on_malformed_primary
+def test_real_fallback_selection_composes_with_invoke_structured_on_malformed_primary(monkeypatch):
+    """
+    End-to-end composition test using the REAL (unmocked) get_fallback_provider()
+    together with the REAL invoke_structured() - only backend.services.llm.get_llm
+    is mocked, at the external LLM-client boundary (no real ChatGoogleGenerativeAI
+    client is ever constructed and no real network request is ever made), so this
+    proves the actual credential-aware selection logic and the actual fallback
+    control flow compose correctly end-to-end, not just each in isolation:
+
+        malformed NVIDIA response -> LLMMalformedResponseError
+        -> get_fallback_provider() [REAL] selects the one credentialed
+           alternative, gemini, via a test-only fake credential (no real
+           GOOGLE_API_KEY needed, read, or touched anywhere)
+        -> get_llm(provider="gemini") [mocked at the SDK-client boundary]
+        -> fallback invocation succeeds
+        -> invoke_structured() [REAL] returns the fallback's structured result
+    """
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    # Only nvidia (primary - irrelevant to fallback selection) and gemini are
+    # "credentialed" here; openai is deliberately left uncredentialed so the
+    # real preference order (gemini before openai for an nvidia primary) is
+    # exercised meaningfully, not just trivially satisfied by there being
+    # only one possible candidate at all.
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-fake-primary-key", gemini="fake-test-google-key", openai=None)
+
+    primary = FakeEmptyCompletionLLM(provider="nvidia", content="")
+    fallback_result = RoutingDecision(
+        task_type=TaskType.BUG_FIX,
+        confidence=0.93,
+        requires_planning=False,
+        requires_knowledge=False,
+        reasoning="Real fallback composition succeeded",
+    )
+    fallback = FakeProviderLLM(provider="gemini", result=fallback_result)
+
+    def strict_get_llm(provider=None, **kw):
+        assert provider == "gemini", f"expected the real selection logic to choose 'gemini', got {provider!r}"
+        return fallback
+
+    # Mocked ONLY at the external LLM-client boundary (get_llm) - never
+    # get_fallback_provider itself, and never invoke_structured.
+    monkeypatch.setattr("backend.services.llm.get_llm", strict_get_llm)
+
+    recorded_events = []
+    original_on_fallback = telemetry_collector.on_provider_fallback
+
+    def mock_on_fallback(**kwargs):
+        recorded_events.append(kwargs)
+        original_on_fallback(**kwargs)
+
+    monkeypatch.setattr(telemetry_collector, "on_provider_fallback", mock_on_fallback)
+
+    result = invoke_structured(primary, RoutingDecision, "Some prompt")
+
+    # 1 + 5. Primary was malformed, and invoke_structured returned the
+    # fallback's structured result - not an error, not the primary's output.
+    assert result == fallback_result
+
+    # 2 + 3 + 4. The REAL get_fallback_provider() selected "gemini" (the only
+    # credentialed alternative) - strict_get_llm's own assertion would have
+    # failed the test otherwise - it was actually initialized, and the
+    # fallback invocation actually ran and succeeded exactly once.
+    assert fallback.invocations == 1
+
+    # 6. No unnecessary additional primary retries: exactly 2 invocations on
+    # the primary (structured-output attempt + direct-fallback attempt) -
+    # the same existing bound, not a new retry loop from this composition.
+    assert primary.invocations == 2
+
+    # 7. A PROVIDER_FALLBACK telemetry event was emitted for the actual
+    # fallback attempt, correctly attributing both providers and the
+    # classification that triggered it.
+    assert len(recorded_events) == 1
+    event = recorded_events[0]
+    assert event["primary_provider"] == "nvidia"
+    assert event["fallback_provider"] == "gemini"
+    assert event["failure_type"] == "LLMMalformedResponseError"
+    assert event["failure_category"] == "LLM_MALFORMED_RESPONSE"
+
+    # 8. No credential values appear anywhere in the recorded telemetry.
+    event_str = str(event)
+    assert "fake-test-google-key" not in event_str
+    assert "nvapi-fake-primary-key" not in event_str
+
+
+# 30. test_real_fallback_selection_returns_none_and_no_misleading_event_on_malformed_primary
+def test_real_fallback_selection_returns_none_and_no_misleading_event_on_malformed_primary(monkeypatch):
+    """
+    Complementary to the composition test above: using the REAL (unmocked)
+    get_fallback_provider() with no alternative provider credentialed at
+    all (matching this sandbox's actual .env: only NVIDIA_API_KEY is set),
+    a malformed NVIDIA response must propagate as the primary's own
+    LLMMalformedResponseError, and no PROVIDER_FALLBACK event may be
+    emitted - because no fallback was ever actually selected or attempted.
+    """
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-fake-primary-key", gemini=None, openai=None)
+
+    primary = FakeEmptyCompletionLLM(provider="nvidia", content="")
+
+    # get_llm must never even be called - there's nothing to fall back to.
+    def unexpected_get_llm(provider=None, **kw):
+        raise AssertionError(
+            f"get_llm() must not be called when no fallback provider is available (provider={provider!r})"
+        )
+
+    monkeypatch.setattr("backend.services.llm.get_llm", unexpected_get_llm)
+
+    recorded_events = []
+    original_record_event = telemetry_collector.record_event
+
+    def mock_record_event(*a, **kw):
+        recorded_events.append(kw)
+        return original_record_event(*a, **kw)
+
+    monkeypatch.setattr(telemetry_collector, "record_event", mock_record_event)
+
+    with pytest.raises(LLMMalformedResponseError) as exc_info:
+        invoke_structured(primary, RoutingDecision, "Any prompt")
+
+    assert exc_info.value.provider == "nvidia"
+    # Bounded: structured-output attempt + direct-fallback attempt only -
+    # no internal retry loop, no fallback provider ever attempted.
+    assert primary.invocations == 2
+    assert recorded_events == [], (
+        "No PROVIDER_FALLBACK event should be recorded when the real "
+        "selection logic found no credentialed fallback"
+    )
+
+
 # ============================================================================
 # PHASE 8 — STEP 3: WORKSPACE LOCKING + CONCURRENCY SAFETY TESTS
 # ============================================================================
