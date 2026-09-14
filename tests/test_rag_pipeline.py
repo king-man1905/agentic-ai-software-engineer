@@ -44,8 +44,9 @@ from backend.rag.evaluator import (
     QueryRewriter,
     RetrievalEvaluator,
 )
-from backend.rag.indexer import build_project_index
+from backend.rag.indexer import build_project_index, get_vector_store_path
 from backend.rag.retriever import (
+    load_project_index,
     retrieve_project_context,
     retrieve_structured_context,
 )
@@ -199,16 +200,40 @@ def test_faiss_metadata_preservation(tmp_path):
 
     with patch("backend.rag.indexer.get_embeddings", return_value=mock_embeddings), \
          patch("backend.rag.retriever.get_embeddings", return_value=mock_embeddings):
-        res = build_project_index(str(tmp_path), "test_proj_meta")
+        res = build_project_index(str(tmp_path), "test_proj_meta", organization_id="tenant-meta")
         assert res["chunks"] >= 1
+        assert "tenant-meta" in res["index_path"]
 
-        structured_views = retrieve_structured_context("test_proj_meta", "create_order", k=2)
+        structured_views = retrieve_structured_context(
+            "test_proj_meta", "create_order", k=2, organization_id="tenant-meta"
+        )
         assert len(structured_views) > 0
         v = structured_views[0]
         assert v.file == "service.py"
         assert v.line_start >= 1
         assert v.line_end >= v.line_start
         assert isinstance(v.score, float)
+
+
+def test_build_project_index_requires_organization_id(tmp_path):
+    """A vector store can never be created without a tenant namespace."""
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    mock_embeddings = FakeEmbeddings(size=128)
+    with patch("backend.rag.indexer.get_embeddings", return_value=mock_embeddings):
+        with pytest.raises((ValueError, TypeError)):
+            build_project_index(str(tmp_path), "test_proj_no_org", organization_id=None)
+
+
+def test_load_project_index_cannot_read_unnamespaced_store(tmp_path, monkeypatch):
+    """Even if an old unnamespaced vector_store/<project_id> directory exists on
+    disk, load_project_index must never read it - only the namespaced path."""
+    monkeypatch.chdir(tmp_path)
+    legacy_dir = tmp_path / "vector_store" / "legacy_proj"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "marker").write_text("stale unnamespaced index", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError):
+        load_project_index("legacy_proj", organization_id="tenant-real")
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +430,7 @@ def test_existing_rag_backward_compatibility():
     mock_store.similarity_search.return_value = [mock_doc]
 
     with patch("backend.rag.retriever.load_project_index", return_value=mock_store):
-        docs = retrieve_project_context("sample_proj", "legacy search", k=1)
+        docs = retrieve_project_context("sample_proj", "legacy search", k=1, organization_id="tenant-legacy")
         assert len(docs) == 1
         assert docs[0].page_content == "def legacy(): pass"
         assert docs[0].metadata["source"] == "legacy.py"

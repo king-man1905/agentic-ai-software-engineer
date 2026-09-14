@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -10,6 +10,7 @@ from backend.indexer.ast_chunker import chunk_file
 from backend.indexer.scanner import scan_repository
 from backend.rag.loaders import load_project_files
 from backend.rag.splitter import split_documents
+from backend.vcs.workspace_paths import safe_path_component
 
 VECTOR_STORE_ROOT = Path("vector_store")
 
@@ -21,16 +22,32 @@ def get_embeddings():
     )
 
 
-def get_vector_store_path(project_id: str, organization_id: Optional[str] = None) -> Path:
-    if organization_id:
-        return VECTOR_STORE_ROOT / organization_id / project_id
-    return VECTOR_STORE_ROOT / project_id
+def get_vector_store_path(project_id: str, organization_id: str) -> Path:
+    """
+    Resolves the tenant-namespaced vector-store directory:
+    vector_store/<organization_id>/<project_id>.
+
+    organization_id is mandatory - every vector store is tenant-scoped, and
+    silently falling back to an unnamespaced vector_store/<project_id> would
+    let two tenants collide on the same directory merely by choosing the
+    same project_id (the same bug class P0-3 fixed for workspace/). Fails
+    closed with ValueError rather than guessing a path.
+    """
+    org = safe_path_component(organization_id)
+    proj = safe_path_component(project_id)
+    if org is None or proj is None:
+        raise ValueError(
+            "get_vector_store_path requires a valid organization_id and "
+            f"project_id (got organization_id={organization_id!r}, "
+            f"project_id={project_id!r})"
+        )
+    return VECTOR_STORE_ROOT / org / proj
 
 
 def build_project_index(
     project_path: str,
     project_id: str,
-    organization_id: Optional[str] = None,
+    organization_id: str,
 ):
     project = Path(project_path)
     if not project.exists():

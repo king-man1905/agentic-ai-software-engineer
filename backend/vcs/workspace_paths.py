@@ -22,7 +22,7 @@ from typing import Optional
 from backend.policy.path_filter import is_traversal_attack
 
 
-def _safe_path_component(value: Optional[str]) -> Optional[str]:
+def safe_path_component(value: Optional[str]) -> Optional[str]:
     """
     Validates that `value` is safe to use as a single path *segment*
     (organization_id or project_id) - not a sub-path. Rejects anything
@@ -30,6 +30,9 @@ def _safe_path_component(value: Optional[str]) -> Optional[str]:
     extra segments, e.g. "org/../../other-org", through what's supposed
     to be one component), a bare '.'/'..', or a Windows drive-letter
     prefix. Returns the stripped value, or None if unsafe.
+
+    Shared across every tenant-namespaced path resolver (workspace/ and
+    vector_store/) so this validation can't drift between them.
     """
     candidate = (value or "").strip()
     if not candidate:
@@ -59,8 +62,8 @@ def resolve_workspace_path(organization_id: Optional[str], project_id: Optional[
     resolves explicitly via os.getcwd() (as production code, which
     monkeypatches os.getcwd() in some tests, needs).
     """
-    org = _safe_path_component(organization_id)
-    proj = _safe_path_component(project_id)
+    org = safe_path_component(organization_id)
+    proj = safe_path_component(project_id)
     if org is None or proj is None:
         return None
 

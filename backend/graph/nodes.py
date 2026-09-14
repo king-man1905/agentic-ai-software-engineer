@@ -238,11 +238,12 @@ def knowledge_node(state: AgentState) -> dict:
     # raises before assignment, so answer_from_project can tell "retrieval
     # genuinely failed" apart from "retrieval succeeded with zero matches"
     # and fall back to its own retrieval/error-handling accordingly.
+    organization_id = state.get("organization_id", "default-org")
     docs = None
     dense_candidates = []
     try:
         from backend.rag.retriever import load_project_index
-        vector_store = load_project_index(project_id)
+        vector_store = load_project_index(project_id, organization_id=organization_id)
         docs = vector_store.similarity_search(state["user_message"], k=20)
         for doc in docs:
             dense_candidates.append(
@@ -268,6 +269,7 @@ def knowledge_node(state: AgentState) -> dict:
             project_id=project_id,
             question=state["user_message"],
             documents=docs,
+            organization_id=organization_id,
         )
     except Exception as e:
         knowledge = KnowledgeAnswer(

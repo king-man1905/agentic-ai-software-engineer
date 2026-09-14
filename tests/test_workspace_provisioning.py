@@ -278,7 +278,7 @@ def mocked_router_and_developer(monkeypatch):
 
     monkeypatch.setattr(
         "backend.graph.nodes.answer_from_project",
-        lambda project_id, question, k=4, documents=None: _KnowledgeAnswer(
+        lambda project_id, question, k=4, documents=None, organization_id=None: _KnowledgeAnswer(
             answer="stub knowledge answer",
             sources=[],
             sufficient_context=bool(documents),
