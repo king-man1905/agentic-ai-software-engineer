@@ -1398,6 +1398,196 @@ def test_malformed_response_fallback_telemetry_category(monkeypatch):
     assert recorded_events[0]["failure_type"] == "LLMMalformedResponseError"
 
 
+def _set_provider_credentials(monkeypatch, nvidia=None, gemini=None, openai=None):
+    """
+    Deterministically sets/clears provider credentials for
+    get_fallback_provider()'s real (unmocked) credential checks, regardless
+    of whatever real keys this sandbox's .env happens to configure -
+    _has_provider_credentials() checks os.getenv(VAR, <module-level
+    default captured at import time>), so both the process env var and
+    backend.services.llm's own imported constant must be set/cleared
+    together to get a deterministic result independent of the environment.
+    """
+    import backend.services.llm as llm_module
+
+    for env_name, attr_name, value in [
+        ("NVIDIA_API_KEY", "NVIDIA_API_KEY", nvidia),
+        ("GOOGLE_API_KEY", "GOOGLE_API_KEY", gemini),
+        ("OPENAI_API_KEY", "OPENAI_API_KEY", openai),
+    ]:
+        if value:
+            monkeypatch.setenv(env_name, value)
+            monkeypatch.setattr(llm_module, attr_name, value)
+        else:
+            monkeypatch.delenv(env_name, raising=False)
+            monkeypatch.setattr(llm_module, attr_name, None)
+
+
+# 23. test_get_fallback_provider_no_credentials_returns_none (Category A)
+def test_get_fallback_provider_no_credentials_returns_none(monkeypatch):
+    """
+    No alternative provider has credentials -> get_fallback_provider must
+    return None instead of selecting an uncredentialed provider as a
+    last-resort default (the exact bug the read-only investigation found).
+    """
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-primary-key", gemini=None, openai=None)
+
+    assert get_fallback_provider(primary="nvidia") is None
+
+
+# 24. test_get_fallback_provider_selects_the_one_credentialed_alternative (Category B)
+@pytest.mark.parametrize(
+    "primary,creds,expected",
+    [
+        ("nvidia", {"gemini": None, "openai": "k"}, "openai"),
+        ("nvidia", {"gemini": "k", "openai": None}, "gemini"),
+        ("gemini", {"nvidia": None, "openai": "k"}, "openai"),
+        ("gemini", {"nvidia": "k", "openai": None}, "nvidia"),
+        ("openai", {"nvidia": None, "gemini": "k"}, "gemini"),
+        ("openai", {"nvidia": "k", "gemini": None}, "nvidia"),
+    ],
+)
+def test_get_fallback_provider_selects_the_one_credentialed_alternative(monkeypatch, primary, creds, expected):
+    """
+    For every primary provider, when exactly one of the two alternatives is
+    credentialed, that one is selected - confirming the existing
+    deterministic preference order is preserved and correctly skips the
+    uncredentialed alternative rather than picking it anyway.
+    """
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    _set_provider_credentials(monkeypatch, **creds)
+
+    assert get_fallback_provider(primary=primary) == expected
+
+
+# 25. test_explicit_fallback_override_skips_uncredentialed_provider (Category C)
+def test_explicit_fallback_override_skips_uncredentialed_provider(monkeypatch):
+    """
+    LLM_FALLBACK_PROVIDER explicitly names an uncredentialed provider -
+    it must NOT be selected; selection must fall through to the normal,
+    credential-checked preference order and pick the valid alternative.
+    """
+    monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "gemini")
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-key", gemini=None, openai="sk-key")
+
+    result = get_fallback_provider(primary="nvidia")
+    assert result != "gemini"
+    assert result == "openai"
+
+
+# 26. test_explicit_fallback_override_with_no_alternatives_returns_none (Category D)
+def test_explicit_fallback_override_with_no_alternatives_returns_none(monkeypatch):
+    """
+    LLM_FALLBACK_PROVIDER names an uncredentialed provider and no other
+    alternative has credentials either -> None, never a guess.
+    """
+    monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "gemini")
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-key", gemini=None, openai=None)
+
+    assert get_fallback_provider(primary="nvidia") is None
+
+
+# 27. test_malformed_primary_with_no_fallback_available (Category E)
+def test_malformed_primary_with_no_fallback_available_emits_no_misleading_fallback_event(monkeypatch):
+    """
+    Primary returns a malformed response, but no fallback provider is
+    available (get_fallback_provider() returns None) - invoke_structured
+    must fail with the primary's own LLMMalformedResponseError, and must
+    NOT emit a PROVIDER_FALLBACK event implying a fallback was attempted,
+    since none ever was.
+    """
+    primary = FakeEmptyCompletionLLM(provider="nvidia", content="")
+
+    recorded_events = []
+    original_record_event = telemetry_collector.record_event
+
+    def mock_record_event(*a, **kw):
+        recorded_events.append(kw)
+        return original_record_event(*a, **kw)
+
+    monkeypatch.setattr(telemetry_collector, "record_event", mock_record_event)
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: None)
+
+    with pytest.raises(LLMMalformedResponseError) as exc_info:
+        invoke_structured(primary, RoutingDecision, "Any prompt")
+
+    assert exc_info.value.provider == "nvidia"
+    assert recorded_events == [], "No PROVIDER_FALLBACK event should be recorded when no fallback was ever attempted"
+
+
+# 28. test_fallback_initialization_failure_chains_exception_and_emits_safe_telemetry (Category F)
+def test_fallback_initialization_failure_chains_exception_and_emits_safe_telemetry(monkeypatch):
+    """
+    Fallback candidate is selected (credentialed per get_fallback_provider,
+    from the caller's point of view) but get_llm() still raises during
+    initialization for some other reason. Verifies:
+    - the externally propagated error remains the primary's classification
+      (fail-closed, unchanged from before this hardening)
+    - the real init_exc is preserved via exception chaining (__cause__),
+      not silently discarded
+    - a distinguishable, structured telemetry signal is recorded
+      (outcome="fallback_init_failed") with only safe metadata fields
+    - no secret/credential material appears anywhere in that telemetry
+    """
+    primary = FakeProviderLLM(
+        provider="nvidia",
+        failure=httpx.NetworkError("503 Service Unavailable"),
+    )
+
+    def raising_get_llm(provider=None, **kw):
+        if provider == "gemini":
+            raise ValueError(
+                "LLM_PROVIDER is 'gemini' but GOOGLE_API_KEY is missing. Add it to environment variables."
+            )
+        return primary
+
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "gemini")
+    monkeypatch.setattr("backend.services.llm.get_llm", raising_get_llm)
+
+    recorded_events = []
+    original_record_event = telemetry_collector.record_event
+
+    def mock_record_event(*a, **kw):
+        recorded_events.append(kw)
+        return original_record_event(*a, **kw)
+
+    monkeypatch.setattr(telemetry_collector, "record_event", mock_record_event)
+
+    with pytest.raises(LLMTransientError) as exc_info:
+        invoke_structured(primary, RoutingDecision, "Any prompt")
+
+    # The primary's own classification is still what's externally propagated.
+    assert exc_info.value.provider == "nvidia"
+
+    # init_exc was preserved via chaining, not silently discarded.
+    assert exc_info.value.__cause__ is not None
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert "GOOGLE_API_KEY" in str(exc_info.value.__cause__)
+
+    # A distinguishable, structured telemetry signal was recorded.
+    init_failure_events = [
+        e for e in recorded_events if e.get("metadata", {}).get("outcome") == "fallback_init_failed"
+    ]
+    assert len(init_failure_events) == 1
+    meta = init_failure_events[0]["metadata"]
+    assert meta["primary_provider"] == "nvidia"
+    assert meta["fallback_provider"] == "gemini"
+    assert meta["failure_category"] == "LLM_TRANSIENT_FAILURE"
+
+    # No secrets/credentials anywhere in the recorded telemetry metadata.
+    meta_str = str(meta)
+    assert "gho_" not in meta_str
+    assert "sk-" not in meta_str
+    assert "nvapi-" not in meta_str
+    assert "Authorization" not in meta_str
+    assert "x-access-token" not in meta_str
+
+
 # ============================================================================
 # PHASE 8 — STEP 3: WORKSPACE LOCKING + CONCURRENCY SAFETY TESTS
 # ============================================================================

@@ -312,6 +312,7 @@ def invoke_structured(
     )
     from backend.services.llm import get_llm, get_fallback_provider
     from backend.observability.collector import telemetry_collector
+    from backend.schemas.telemetry import TelemetryEventType
 
     primary_provider = _infer_provider(llm)
     t0 = time.time()
@@ -385,7 +386,34 @@ def invoke_structured(
                 f"Total provider attempts exhausted.",
                 flush=True,
             )
-            raise classified_primary
+            # Distinct, durable telemetry signal for "a fallback provider was
+            # selected but never actually ran" - reuses the existing
+            # PROVIDER_FALLBACK event via record_event() (no new event type
+            # or collector method needed) with an explicit outcome field, so
+            # this is distinguishable from a fallback attempt that ran and
+            # also failed. Deliberately records only pre-known-safe fields -
+            # never str(init_exc) or anything else derived from the raw
+            # exception, which could in principle echo credential-bearing
+            # configuration (e.g. a client SDK's own error text).
+            telemetry_collector.record_event(
+                run_id=effective_run_id,
+                organization_id=effective_org_id,
+                event_type=TelemetryEventType.PROVIDER_FALLBACK,
+                duration_ms=elapsed_ms,
+                metadata={
+                    "run_id": effective_run_id,
+                    "organization_id": effective_org_id,
+                    "primary_provider": primary_provider,
+                    "fallback_provider": fallback_provider,
+                    "failure_category": failure_cat,
+                    "outcome": "fallback_init_failed",
+                    "attempt_number": 1,
+                },
+            )
+            # Exception chaining: init_exc is preserved as __cause__ instead
+            # of being silently discarded. What's raised is unchanged
+            # (still classified_primary) - fail-closed behavior is preserved.
+            raise classified_primary from init_exc
 
         t1 = time.time()
         try:
