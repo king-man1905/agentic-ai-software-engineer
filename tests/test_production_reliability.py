@@ -513,8 +513,13 @@ def test_multiple_runs_have_isolated_checkpoints(tmp_path):
         assert status_a.status == "WAITING_APPROVAL"
         assert status_b.status == "WAITING_APPROVAL"
 
-        # Resume Run A only
-        decision = ApprovalDecision(approved=True, reviewer="reviewer-a")
+        # Resume Run A only. P0-4: approval is fail-closed on a missing
+        # patch_hash, so it must be submitted here to genuinely reach
+        # COMMITTED - omitting it (as this test previously did) is now
+        # correctly rejected instead of silently treated as approved.
+        decision = ApprovalDecision(
+            approved=True, reviewer="reviewer-a", patch_hash=status_a.git_diff.patch_hash
+        )
         resumed_a = runner.resume_run(run_id=run_a, approval_decision=decision, organization_id=org_id)
         assert resumed_a.status == "COMPLETED"
 

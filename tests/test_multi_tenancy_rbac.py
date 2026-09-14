@@ -230,6 +230,7 @@ class TestApprovalAuthorization:
         state = {
             "git_diff": GitDiffSummary(
                 branch_name="feature/test",
+                files_changed=["app.py"],
                 unified_diff="--- a\n+++ b",
                 risk_score="LOW",
                 patch_hash="abc123hash",

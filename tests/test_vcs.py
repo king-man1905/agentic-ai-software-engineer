@@ -781,9 +781,12 @@ class TestApprovalRouting:
 
         captured_payload = {}
 
+        # P0-4: approval is fail-closed on a missing patch_hash, so the
+        # mocked decision must submit the real one to reach APPROVED - this
+        # test's actual point (interrupt payload shape) is unaffected.
         def mock_interrupt(payload):
             captured_payload.update(payload)
-            return {"approved": True, "reviewer": "test-reviewer"}
+            return {"approved": True, "reviewer": "test-reviewer", "patch_hash": payload["patch_hash"]}
 
         import backend.graph.nodes as nodes_module
         original_interrupt = nodes_module.interrupt
@@ -791,14 +794,16 @@ class TestApprovalRouting:
         try:
             nodes_module.interrupt = mock_interrupt
 
+            diff_text = "+new\n-old"
             diff = GitDiffSummary(
                 branch_name="agent/task-test",
                 files_changed=["app.py"],
                 lines_added=3,
                 lines_deleted=1,
-                unified_diff="+new\n-old",
+                unified_diff=diff_text,
                 risk_score="LOW",
                 risk_reasons=["Standard change."],
+                patch_hash=GitWorkspaceManager.compute_patch_hash(diff_text),
             )
             dev_result = DeveloperResult(
                 summary="Fix bug",
@@ -829,23 +834,38 @@ class TestApprovalRouting:
         finally:
             nodes_module.interrupt = original_interrupt
 
-    def test_approval_node_boolean_true_decision(self):
-        """Test backward compat: simple True decision produces APPROVED."""
+    def test_approval_node_boolean_true_decision_fails_closed_without_a_hash(self):
+        """
+        A bare Python `True` returned from interrupt() (the simplest legacy
+        decision shape) becomes ApprovalDecision(approved=True) with no
+        patch_hash at all - by construction, it can never carry one. Under
+        P0-4's fail-closed integrity check this can therefore never reach
+        APPROVED, regardless of the diff; it must be rejected the same way
+        any other approval missing a patch_hash is, not silently treated
+        as approved (which is what this test previously asserted, and is
+        exactly the gap P0-4 closes).
+        """
         import backend.graph.nodes as nodes_module
         original_interrupt = nodes_module.interrupt
         try:
             nodes_module.interrupt = lambda payload: True
 
+            diff_text = "+line 1"
             state: AgentState = {
                 "user_message": "Test",
-                "git_diff": GitDiffSummary(branch_name="agent/task-t"),
+                "git_diff": GitDiffSummary(
+                    branch_name="agent/task-t",
+                    files_changed=["main.py"],
+                    unified_diff=diff_text,
+                    patch_hash=GitWorkspaceManager.compute_patch_hash(diff_text),
+                ),
                 "developer_result": DeveloperResult(
                     summary="Test", changes=[], requires_testing=False,
                 ),
             }
             output = approval_node(state)
-            assert output["approval_status"] == "APPROVED"
-            assert output["approval"].approved is True
+            assert output["approval_status"] == "MISSING_APPROVAL_PATCH_HASH"
+            assert output["approval"].approved is False
         finally:
             nodes_module.interrupt = original_interrupt
 

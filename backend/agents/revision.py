@@ -120,6 +120,7 @@ def generate_revision_patches(
     repo_context: Optional[List[CodeChunk]] = None,
     revision_history: Optional[RevisionHistory] = None,
     project_id: str = "test_project",
+    organization_id: str = "default-org",
 ) -> List[FilePatch]:
     """
     Generates updated FilePatches based on failing error traces, and validates syntax with AST SafePatcher.
@@ -171,16 +172,28 @@ Generate precise FilePatch objects replacing the broken snippet with the correct
     patch_result = invoke_structured(llm, PatchResponse, prompt)
     patches = patch_result.patches
 
-    import os
-    from pathlib import Path
+    from backend.policy.path_filter import safe_repo_relative_path
+    from backend.vcs.workspace_paths import resolve_workspace_path
 
     validated_patches: List[FilePatch] = []
     for patch in patches:
-        project_path = Path("workspace") / project_id
-        if not project_path.exists():
-            project_path = Path(os.getcwd()) / "workspace" / project_id
+        project_path = resolve_workspace_path(organization_id, project_id)
+        if project_path is None:
+            raise ValueError(
+                f"Refusing to validate revision patch: organization_id/"
+                f"project_id did not resolve to a safe workspace path for "
+                f"project '{project_id}'."
+            )
 
-        abs_file_path = project_path / patch.file_path
+        # SECURITY: patch.file_path is LLM-controlled - same containment
+        # check as the developer node's exact-snippet write path.
+        abs_file_path = safe_repo_relative_path(project_path, patch.file_path)
+        if abs_file_path is None:
+            raise ValueError(
+                f"Refusing to validate revision patch: "
+                f"'{patch.file_path}' is not a safe repository-relative path."
+            )
+
         source_content = ""
         if abs_file_path.exists():
             try:

@@ -50,6 +50,7 @@ from backend.schemas.telemetry import TelemetryEventType, TERMINAL_RUN_STATUSES
 from backend.security.auth import AuthMode, RepositoryAccessDeniedError, TenantAccessDeniedError
 from backend.security.tenant import tenant_manager
 from backend.vcs.git_manager import GitWorkspaceManager, build_github_auth_header
+from backend.vcs.workspace_paths import resolve_workspace_path
 from backend.vcs.workspace_lock import (
     WorkspaceLockManager,
     workspace_lock_manager,
@@ -496,11 +497,11 @@ class AgentRunner:
     ) -> None:
         """
         Clones the registered, authorized repository behind `repository_id`
-        into workspace/<project_id> when that directory doesn't already
-        exist - the only place in the API-driven run path that turns a
-        registered GitHub repository into a local checkout (previously
-        only backend/integrations/run_github_bot.py's standalone CLI had
-        this, unreachable from POST /api/v1/runs).
+        into workspace/<organization_id>/<project_id> when that directory
+        doesn't already exist - the only place in the API-driven run path
+        that turns a registered GitHub repository into a local checkout
+        (previously only backend/integrations/run_github_bot.py's
+        standalone CLI had this, unreachable from POST /api/v1/runs).
 
         A no-op (returns immediately, nothing cloned) when:
         - project_id or repository_id is missing - runs with no associated
@@ -514,7 +515,10 @@ class AgentRunner:
         Raises RuntimeError (caught by start_run's existing exception
         handler, which records an explicit FAILED run) if the repository
         IS authorized but cloning it fails - never falls through silently
-        to a misleading RAG_INSUFFICIENT_CONTEXT/QA-failure trail.
+        to a misleading RAG_INSUFFICIENT_CONTEXT/QA-failure trail. Also
+        raises RuntimeError if organization_id/project_id can't be
+        resolved to a safe workspace path at all (see
+        resolve_workspace_path) - fails closed rather than guessing.
 
         SECURITY: the resolved GitHub token never touches the stored clone
         URL - `clone_url` is always the plain, credential-free
@@ -527,13 +531,22 @@ class AgentRunner:
         flag - never written to any file, never logged, never printed, and
         never included in the RuntimeError message (which names only the
         project/repo) raised on failure.
+
+        SECURITY (tenant isolation): the workspace path is namespaced by
+        organization_id (resolve_workspace_path), so two different tenants
+        choosing the identical project_id can never collide on - or
+        silently inherit - the same on-disk workspace.
         """
         if not project_id or not repository_id:
             return
 
-        project_path = Path("workspace") / project_id
-        if not project_path.exists():
-            project_path = Path(os.getcwd()) / "workspace" / project_id
+        project_path = resolve_workspace_path(organization_id, project_id)
+        if project_path is None:
+            raise RuntimeError(
+                f"WORKSPACE_PROVISIONING_FAILED: organization_id/project_id "
+                f"could not be resolved to a safe workspace path for project "
+                f"'{project_id}'."
+            )
         if project_path.exists():
             return
 

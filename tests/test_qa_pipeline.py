@@ -264,6 +264,97 @@ def test_quality_pipeline_run_all_success(tmp_path):
         assert test_res.success is True
 
 
+# ============================================================================
+# P0-2: SECURITY GATE MUST BLOCK EXECUTION, EXECUTION MUST BE ISOLATED
+# ============================================================================
+
+class TestSecurityGateBlocksExecution:
+    def test_dangerous_patch_blocks_pytest_lint_typecheck_and_they_never_execute(self, tmp_path):
+        """
+        A patch whose content trips check_security must prevent
+        check_pytest/check_lint/check_typecheck from running at all - not
+        just be reported as a failure alongside them. Proven concretely: a
+        real test file on disk that would create a sentinel file if pytest
+        ever actually collected and ran it must never create that sentinel.
+        """
+        sentinel = tmp_path / "PYTEST_ACTUALLY_RAN.marker"
+        dangerous_code = (
+            "import os\n"
+            f"os.system({str(sentinel)!r} and 'echo pwned > ' + {str(sentinel)!r})\n"
+            "\n"
+            "def test_noop():\n"
+            "    assert True\n"
+        )
+        (tmp_path / "test_evil.py").write_text(dangerous_code, encoding="utf-8")
+
+        patch = FilePatch(
+            file_path="test_evil.py",
+            original_code_snippet="",
+            updated_code_snippet=dangerous_code,
+            explanation="malicious patch containing os.system",
+        )
+
+        checks, test_result = QualityPipeline.run_all(str(tmp_path), [patch])
+        by_name = {c.name: c for c in checks}
+
+        assert by_name["security"].status == QualityCheckStatus.FAIL.value
+        assert by_name["pytest"].status == QualityCheckStatus.SKIPPED.value
+        assert "BLOCKED_BY_SECURITY_GATE" in (by_name["pytest"].reason or "")
+        assert by_name["lint"].status == QualityCheckStatus.SKIPPED.value
+        assert "BLOCKED_BY_SECURITY_GATE" in (by_name["lint"].reason or "")
+        assert by_name["typecheck"].status == QualityCheckStatus.SKIPPED.value
+        assert "BLOCKED_BY_SECURITY_GATE" in (by_name["typecheck"].reason or "")
+        assert test_result is None
+
+        # The concrete proof: the dangerous os.system() call was never
+        # actually executed by pytest, because pytest was never run.
+        assert not sentinel.exists()
+
+
+class TestExecutionIsolatedFromPersistentWorkspace:
+    def test_pytest_execution_cannot_modify_persistent_repo_state(self, tmp_path):
+        """
+        A safe (security-scan-passing) test file that writes a marker via
+        plain file I/O when pytest actually collects and runs it must have
+        that marker appear ONLY in the disposable execution copy, never in
+        repo_path itself - proving execution happened under a different
+        workspace path, not the persistent one that diff/commit/push trust.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        marker_name = "PYTEST_EXECUTION_MARKER.txt"
+        safe_code = (
+            "import os\n"
+            "\n"
+            "def test_writes_marker():\n"
+            f"    with open(os.path.join(os.path.dirname(__file__), {marker_name!r}), 'w') as f:\n"
+            "        f.write('pytest ran here')\n"
+            "    assert True\n"
+        )
+        (repo / "test_writes_marker.py").write_text(safe_code, encoding="utf-8")
+
+        patch = FilePatch(
+            file_path="test_writes_marker.py",
+            original_code_snippet="",
+            updated_code_snippet=safe_code,
+            explanation="legitimate test that writes a marker file when it runs",
+        )
+
+        checks, test_result = QualityPipeline.run_all(str(repo), [patch])
+        by_name = {c.name: c for c in checks}
+
+        assert by_name["security"].status == QualityCheckStatus.PASS.value
+        assert by_name["pytest"].status == QualityCheckStatus.PASS.value
+        assert test_result is not None
+        assert test_result.success is True
+
+        # The marker must never land in the real, persistent repo - only
+        # (if anywhere, since isolated_workspace cleans up on exit) in a
+        # disposable copy that no longer exists once run_all returns.
+        assert not (repo / marker_name).exists()
+
+
 # ---------------------------------------------------------------------------
 # Structured QA Judge Unit Tests
 # ---------------------------------------------------------------------------
