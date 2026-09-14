@@ -1,3 +1,4 @@
+import base64
 import difflib
 import hashlib
 import os
@@ -75,6 +76,33 @@ def _run_git(
     )
 
 
+def build_github_auth_header(token: str) -> str:
+    """
+    Builds an in-memory HTTP Basic Authorization header value for GitHub's
+    HTTPS Git-over-HTTP endpoint, using the standard "x-access-token:<token>"
+    convention (the same userinfo scheme previously embedded directly in
+    clone URLs). Callers pass the result as `auth_header` to
+    clone_repository()/push_branch() instead of embedding the token in a
+    URL - it's supplied to git via a process-scoped `-c http.extraHeader=...`
+    flag, never written to any file. Never log, print, or persist the
+    return value anywhere.
+    """
+    encoded = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+    return f"Authorization: Basic {encoded}"
+
+
+def _with_auth_config(args: List[str], auth_header: Optional[str]) -> List[str]:
+    """
+    Prepends a process-scoped `-c http.extraHeader=<auth_header>` flag to a
+    git argv when an auth header is supplied - never written to `.git/config`
+    or any other file, and never part of the remote URL itself, unlike the
+    previous embedded-credential-URL approach.
+    """
+    if not auth_header:
+        return args
+    return ["-c", f"http.extraHeader={auth_header}"] + args
+
+
 class GitWorkspaceManager:
     """
     Manages isolated Git workspace operations: branch creation, patch application,
@@ -100,7 +128,12 @@ class GitWorkspaceManager:
         return f"agent/task-{slug}-{suffix}"
 
     @staticmethod
-    def clone_repository(clone_url: str, project_path: str, timeout: float = 60) -> bool:
+    def clone_repository(
+        clone_url: str,
+        project_path: str,
+        timeout: float = 60,
+        auth_header: Optional[str] = None,
+    ) -> bool:
         """
         Clones `clone_url` into `project_path` via the same non-interactive
         git subprocess convention every other operation in this module
@@ -111,19 +144,27 @@ class GitWorkspaceManager:
         that (e.g. as an explicit run failure).
 
         This function is intentionally URL-agnostic - it doesn't know
-        about GitHub, tokens, or authorization; a caller that needs an
-        authenticated GitHub HTTPS URL builds it and passes it in here.
+        about GitHub, tokens, or authorization; a caller that needs
+        authenticated access builds a pre-formed HTTP Authorization header
+        value (see build_github_auth_header()) and passes it as
+        `auth_header`, rather than embedding credentials in `clone_url`
+        itself. When set, the header is supplied to git via a process-
+        scoped `-c http.extraHeader=...` flag - never written to any file
+        - so `clone_url` should always be a plain, credential-free URL;
+        the resulting clone's `remote.origin.url` (and `git remote -v`)
+        will only ever contain whatever `clone_url` itself was.
         SECURITY: this function never logs, prints, or returns `clone_url`
-        itself, nor any subprocess stdout/stderr (which could otherwise
-        echo a credential embedded in the URL back verbatim on failure) -
-        callers must uphold the same rule with whatever they build.
+        or `auth_header`, nor any subprocess stdout/stderr (which could
+        otherwise echo a credential embedded in the URL back verbatim on
+        failure) - callers must uphold the same rule with whatever they build.
         """
         dest = Path(project_path)
         if dest.exists():
             return True
+        args = _with_auth_config(["clone", clone_url, str(dest)], auth_header)
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            _run_git(["clone", clone_url, str(dest)], repo_path=str(dest.parent), timeout=timeout)
+            _run_git(args, repo_path=str(dest.parent), timeout=timeout)
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return False
@@ -354,17 +395,38 @@ class GitWorkspaceManager:
             return False
 
     @staticmethod
-    def push_branch(repo_path: str, branch_name: str, remote: str = "origin") -> bool:
+    def push_branch(
+        repo_path: str,
+        branch_name: str,
+        remote: str = "origin",
+        auth_header: Optional[str] = None,
+    ) -> bool:
         """
         Pushes a local branch to the remote repository.
         Returns True on success, False on failure.
+
+        Accepts the same optional pre-built HTTP Authorization header as
+        clone_repository() (see build_github_auth_header()), supplied via a
+        process-scoped `-c http.extraHeader=...` flag - push no longer
+        relies on a credential embedded in the remote's stored URL.
         """
+        args = _with_auth_config(["push", "-u", remote, branch_name], auth_header)
         try:
-            _run_git(["push", "-u", remote, branch_name], repo_path)
+            _run_git(args, repo_path)
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             if hasattr(e, "stderr") and e.stderr:
-                print(f"[!] Push error: {e.stderr.strip()}")
+                # SECURITY: with auth supplied via a header that's never
+                # embedded in the remote URL, git's own stderr for an
+                # auth/network failure has no credential left to echo - the
+                # remote URL it reports is always the clean, token-free
+                # one. As defense in depth (e.g. a future remote that
+                # reintroduces a URL-embedded credential), any known
+                # auth_header value is also redacted before printing.
+                msg = e.stderr.strip()
+                if auth_header:
+                    msg = msg.replace(auth_header, "[REDACTED]")
+                print(f"[!] Push error: {msg}")
             return False
 
     @staticmethod

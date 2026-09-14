@@ -954,7 +954,7 @@ def create_app(
             GitHubPRCreationError,
             GitHubApiError,
         )
-        from backend.vcs.git_manager import GitWorkspaceManager
+        from backend.vcs.git_manager import GitWorkspaceManager, build_github_auth_header
 
         # 1. Permission check
         if Permission.REPO_MANAGE not in tenant_ctx.permissions and Permission.RUN_APPROVE not in tenant_ctx.permissions:
@@ -1117,7 +1117,19 @@ def create_app(
         if not project_path.exists():
             project_path = Path(os.getcwd()) / "workspace" / project_id
 
-        if not GitWorkspaceManager.push_branch(str(project_path), git_diff.branch_name):
+        # SECURITY: reuses the exact same tenant-scoped `token` already
+        # resolved above (step 6) via authorize_repository_access() - no
+        # second credential store or authorization path is introduced. The
+        # token is used only to build an in-memory HTTP Authorization
+        # header (never persisted, logged, or included in any exception),
+        # supplied to push_branch() as `auth_header` so the push no longer
+        # depends on - or requires - a credential embedded in the
+        # workspace's stored remote.origin.url.
+        auth_header = build_github_auth_header(token) if token else None
+
+        if not GitWorkspaceManager.push_branch(
+            str(project_path), git_diff.branch_name, auth_header=auth_header
+        ):
             audit_logger.log(
                 tenant_ctx.organization_id,
                 tenant_ctx.user_id,

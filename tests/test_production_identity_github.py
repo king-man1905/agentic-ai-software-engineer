@@ -1,3 +1,4 @@
+import base64
 import os
 from unittest.mock import MagicMock, patch
 import httpx
@@ -603,7 +604,7 @@ class TestPRPublishBranchPush:
             lambda *a, **k: None,
         )
 
-        def fake_push(repo_path, branch_name, remote="origin"):
+        def fake_push(repo_path, branch_name, remote="origin", auth_header=None):
             call_order.append(("push_branch", branch_name))
             return True
 
@@ -757,6 +758,88 @@ class TestPRPublishBranchPush:
         assert "PR_PUBLISH_REPOSITORY_MISMATCH" in resp.json()["detail"]
         push_mock.assert_not_called()
         create_mock.assert_not_called()
+
+    def test_publish_pr_push_receives_tenant_scoped_auth_header(self, monkeypatch):
+        """G. push_branch() must receive the exact tenant-scoped token
+        (resolved via the same authorize_repository_access() the
+        PR-creation step already reuses) as an in-memory auth_header -
+        never a raw token, and never re-derived through a second
+        credential store. The raw token must also never appear in the
+        API response body."""
+        client, mock_diff = self._setup_run(
+            monkeypatch, "test-run-push-authed", "default-org/api", "agent/task-authed-push"
+        )
+        # _setup_run already registered "default-org/api"; re-registering
+        # attaches a token to that same tenant-scoped repository record.
+        tenant_manager.register_repository(
+            "default-org/api", "default-org", "api",
+            full_name="default-org/api", github_token="fake-publish-token",
+        )
+
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.find_pull_request",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.create_pull_request",
+            lambda *a, **k: GitHubPRResult(
+                pr_number=7,
+                pr_url="https://github.com/default-org/api/pull/7",
+                head_branch=mock_diff.branch_name,
+                base_branch="main",
+            ),
+        )
+
+        captured = {}
+
+        def spy_push(repo_path, branch_name, remote="origin", auth_header=None):
+            captured["auth_header"] = auth_header
+            return True
+
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.push_branch", spy_push)
+
+        req = PublishPRRequest(repo_full_name="default-org/api")
+        resp = client.post("/api/v1/runs/test-run-push-authed/publish-pr", json=req.model_dump())
+
+        assert resp.status_code == 200
+        assert captured["auth_header"] is not None
+        assert captured["auth_header"].startswith("Authorization: Basic ")
+        assert "fake-publish-token" not in captured["auth_header"]
+
+        encoded = captured["auth_header"].removeprefix("Authorization: Basic ")
+        assert base64.b64decode(encoded).decode() == "x-access-token:fake-publish-token"
+
+        # Never returned through the API response either.
+        assert "fake-publish-token" not in resp.text
+
+    def test_publish_pr_push_failure_audit_log_never_contains_token(self, monkeypatch):
+        """H. A push failure for a tenant-scoped, token-bearing repository
+        must never leak that token into the resulting audit log entry."""
+        client, _ = self._setup_run(
+            monkeypatch, "test-run-push-audit", "default-org/api", "agent/task-audit-push"
+        )
+        tenant_manager.register_repository(
+            "default-org/api", "default-org", "api",
+            full_name="default-org/api", github_token="fake-audit-check-token",
+        )
+
+        monkeypatch.setattr(
+            "backend.integrations.github_client.GitHubClient.find_pull_request",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            "backend.vcs.git_manager.GitWorkspaceManager.push_branch", lambda *a, **k: False
+        )
+
+        req = PublishPRRequest(repo_full_name="default-org/api")
+        resp = client.post("/api/v1/runs/test-run-push-audit/publish-pr", json=req.model_dump())
+
+        assert resp.status_code == 502
+
+        events = audit_logger.get_events("default-org")
+        assert len(events) > 0
+        for event in events:
+            assert "fake-audit-check-token" not in str(event.details)
 
 
 # =============================================================================

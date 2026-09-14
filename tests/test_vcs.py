@@ -1,8 +1,10 @@
-import pytest
 import subprocess
 
+import pytest
+
 from backend.vcs.models import GitDiffSummary, ApprovalDecision
-from backend.vcs.git_manager import GitWorkspaceManager
+from backend.vcs.git_manager import GitWorkspaceManager, build_github_auth_header
+from backend.vcs import git_manager as git_manager_module
 from backend.developer.models import FilePatch
 from backend.graph.state import AgentState
 from backend.graph.nodes import (
@@ -524,6 +526,196 @@ class TestGitOperationsIsolated:
         dest = tmp_path / "should_not_exist"
         result = GitWorkspaceManager.clone_repository("/no/such/source", str(dest))
         assert result is False
+
+    # ------------------------------------------------------------------
+    # Credential-aware clone/push: auth_header must never be persisted
+    # ------------------------------------------------------------------
+
+    def test_clone_repository_without_auth_header_produces_clean_remote(self, git_repo, tmp_path):
+        """A. auth_header=None (the public-repo default): clone succeeds,
+        no http.extraHeader is ever added, and remote.origin.url is
+        exactly the plain clone source - the credential-free baseline
+        every public-repo clone must keep working unchanged."""
+        dest = tmp_path / "clean_clone"
+        result = GitWorkspaceManager.clone_repository(str(git_repo), str(dest))
+        assert result is True
+
+        config_text = (dest / ".git" / "config").read_text(encoding="utf-8")
+        assert "extraheader" not in config_text.lower()
+
+        remote_url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(dest), capture_output=True, text=True,
+        ).stdout.strip()
+        assert remote_url == str(git_repo)
+
+    def test_clone_repository_with_auth_header_never_persists_it(self, git_repo, tmp_path):
+        """B. A fake auth header (built the same way build_github_auth_header()
+        does) authenticates the clone via a process-scoped `-c
+        http.extraHeader=...` flag only - it must never end up written to
+        .git/config or surfaced by `git remote -v`."""
+        fake_token = "ghp_FAKE_TEST_TOKEN_1234567890abcdef"
+        auth_header = build_github_auth_header(fake_token)
+        dest = tmp_path / "authenticated_clone"
+
+        result = GitWorkspaceManager.clone_repository(
+            str(git_repo), str(dest), auth_header=auth_header
+        )
+        assert result is True
+
+        config_text = (dest / ".git" / "config").read_text(encoding="utf-8")
+        assert fake_token not in config_text
+        assert auth_header not in config_text
+
+        remote_v = subprocess.run(
+            ["git", "remote", "-v"], cwd=str(dest), capture_output=True, text=True,
+        ).stdout
+        assert fake_token not in remote_v
+        assert auth_header not in remote_v
+
+    def test_clone_repository_failure_never_leaks_auth_header(self, tmp_path, capsys):
+        """C. An intentionally-failing clone (bad source) with a fake auth
+        header present must never leak the header/token via any raised
+        exception or via stdout/stderr - clone_repository() swallows the
+        underlying exception entirely and returns False."""
+        fake_token = "ghp_FAKE_TEST_TOKEN_should_never_leak"
+        auth_header = build_github_auth_header(fake_token)
+        dest = tmp_path / "should_not_exist_2"
+
+        result = GitWorkspaceManager.clone_repository(
+            "/no/such/source", str(dest), auth_header=auth_header
+        )
+        assert result is False
+        assert not dest.exists()
+
+        captured = capsys.readouterr()
+        assert fake_token not in captured.out
+        assert fake_token not in captured.err
+        assert auth_header not in captured.out
+        assert auth_header not in captured.err
+
+    def test_push_branch_supplies_auth_header_via_process_scoped_config(self, monkeypatch, tmp_path):
+        """D. push_branch() must pass an http.extraHeader flag to git when
+        auth_header is given, and the push must succeed using ONLY that
+        header - the remote here is a plain, credential-free local bare
+        repo, so a successful push proves push does not depend on any
+        credential embedded in remote.origin.url."""
+        bare = tmp_path / "bare_remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", str(bare)], capture_output=True, text=True, check=True
+        )
+
+        src = tmp_path / "src_repo"
+        src.mkdir()
+        subprocess.run(["git", "init"], cwd=str(src), capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=str(src), capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"], cwd=str(src), capture_output=True, text=True
+        )
+        (src / "README.md").write_text("# Test\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(src), capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"], cwd=str(src), capture_output=True, text=True, check=True
+        )
+        subprocess.run(["git", "branch", "-M", "main"], cwd=str(src), capture_output=True, text=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(bare)],
+            cwd=str(src), capture_output=True, text=True, check=True,
+        )
+        subprocess.run(
+            ["git", "push", "-u", "origin", "main"],
+            cwd=str(src), capture_output=True, text=True, check=True,
+        )
+
+        GitWorkspaceManager.create_feature_branch(str(src), "agent/task-push-auth")
+        (src / "new.txt").write_text("x\n", encoding="utf-8")
+        GitWorkspaceManager.stage_and_commit(str(src), "add new.txt")
+
+        fake_token = "ghp_FAKE_TEST_TOKEN_push"
+        auth_header = build_github_auth_header(fake_token)
+
+        captured_argv = {}
+        original_run_git = git_manager_module._run_git
+
+        def spy_run_git(args, repo_path, check=True, timeout=60):
+            captured_argv["args"] = list(args)
+            return original_run_git(args, repo_path, check=check, timeout=timeout)
+
+        monkeypatch.setattr("backend.vcs.git_manager._run_git", spy_run_git)
+
+        result = GitWorkspaceManager.push_branch(
+            str(src), "agent/task-push-auth", auth_header=auth_header
+        )
+
+        assert result is True
+        assert f"http.extraHeader={auth_header}" in captured_argv["args"]
+
+        # The remote itself was never given any credential - a successful
+        # push proves authentication came from the header alone.
+        remote_url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(src), capture_output=True, text=True,
+        ).stdout.strip()
+        assert remote_url == str(bare)
+        assert fake_token not in remote_url
+
+    def test_push_branch_failure_never_prints_auth_header(self, tmp_path, capsys):
+        """E. A real push failure (no such remote configured) with a fake
+        auth header present must never print the header/token to stdout."""
+        src = tmp_path / "no_remote_repo"
+        src.mkdir()
+        subprocess.run(["git", "init"], cwd=str(src), capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=str(src), capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"], cwd=str(src), capture_output=True, text=True
+        )
+        (src / "README.md").write_text("# Test\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(src), capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"], cwd=str(src), capture_output=True, text=True, check=True
+        )
+
+        fake_token = "ghp_FAKE_TEST_TOKEN_push_fail"
+        auth_header = build_github_auth_header(fake_token)
+
+        result = GitWorkspaceManager.push_branch(str(src), "main", auth_header=auth_header)
+        assert result is False
+
+        captured = capsys.readouterr()
+        assert fake_token not in captured.out
+        assert auth_header not in captured.out
+
+    def test_push_branch_redacts_auth_header_if_it_ever_appears_in_stderr(self, monkeypatch, tmp_path, capsys):
+        """E (defense in depth). Even if some future git error message DID
+        echo the auth_header verbatim in stderr, push_branch()'s own
+        redaction must strip it before printing."""
+        fake_token = "ghp_FAKE_TEST_TOKEN_redact"
+        auth_header_value = build_github_auth_header(fake_token)
+
+        def fake_run_git(args, repo_path, check=True, timeout=60):
+            raise subprocess.CalledProcessError(
+                returncode=128,
+                cmd=["git", "push"],
+                stderr=f"fatal: unable to access: {auth_header_value}",
+            )
+
+        monkeypatch.setattr("backend.vcs.git_manager._run_git", fake_run_git)
+
+        result = GitWorkspaceManager.push_branch(
+            str(tmp_path), "main", auth_header=auth_header_value
+        )
+        assert result is False
+
+        captured = capsys.readouterr()
+        assert fake_token not in captured.out
+        assert auth_header_value not in captured.out
+        assert "[REDACTED]" in captured.out
 
     def test_prepare_diff_summary_end_to_end(self, git_repo):
         # Write source file

@@ -49,7 +49,7 @@ from backend.observability.telemetry import run_context
 from backend.schemas.telemetry import TelemetryEventType, TERMINAL_RUN_STATUSES
 from backend.security.auth import AuthMode, RepositoryAccessDeniedError, TenantAccessDeniedError
 from backend.security.tenant import tenant_manager
-from backend.vcs.git_manager import GitWorkspaceManager
+from backend.vcs.git_manager import GitWorkspaceManager, build_github_auth_header
 from backend.vcs.workspace_lock import (
     WorkspaceLockManager,
     workspace_lock_manager,
@@ -516,11 +516,17 @@ class AgentRunner:
         IS authorized but cloning it fails - never falls through silently
         to a misleading RAG_INSUFFICIENT_CONTEXT/QA-failure trail.
 
-        SECURITY: the resolved GitHub token is embedded only in the local
-        `clone_url` variable and the argv GitWorkspaceManager.clone_repository
-        passes to the git subprocess - never logged, printed, or included
-        in the RuntimeError message (which names only the project/repo,
-        never the URL) raised on failure.
+        SECURITY: the resolved GitHub token never touches the stored clone
+        URL - `clone_url` is always the plain, credential-free
+        "https://github.com/<owner>/<repo>.git" form, so it's never
+        persisted into the clone's .git/config or surfaced by `git remote
+        -v`. The token is used only to build an in-memory HTTP
+        Authorization header (build_github_auth_header()), passed to
+        GitWorkspaceManager.clone_repository() as `auth_header` and
+        supplied to git via a process-scoped `-c http.extraHeader=...`
+        flag - never written to any file, never logged, never printed, and
+        never included in the RuntimeError message (which names only the
+        project/repo) raised on failure.
         """
         if not project_id or not repository_id:
             return
@@ -541,12 +547,10 @@ class AgentRunner:
 
         full_name = repo.full_name or repository_id
         token = repo.github_token or os.environ.get("GITHUB_TOKEN")
-        if token:
-            clone_url = f"https://x-access-token:{token}@github.com/{full_name}.git"
-        else:
-            clone_url = f"https://github.com/{full_name}.git"
+        clone_url = f"https://github.com/{full_name}.git"
+        auth_header = build_github_auth_header(token) if token else None
 
-        cloned = GitWorkspaceManager.clone_repository(clone_url, str(project_path))
+        cloned = GitWorkspaceManager.clone_repository(clone_url, str(project_path), auth_header=auth_header)
         if not cloned:
             raise RuntimeError(
                 f"WORKSPACE_PROVISIONING_FAILED: could not clone repository "

@@ -167,6 +167,77 @@ class TestEnsureWorkspaceProvisioned:
 
         clone_spy.assert_not_called()
 
+    def test_clone_url_is_clean_and_token_passed_separately(self, tmp_path, monkeypatch):
+        """F. _ensure_workspace_provisioned must pass a clean,
+        credential-free URL to clone_repository() and the resolved token
+        only via the separate auth_header parameter - never embedded in
+        the URL itself, unlike the previous
+        "https://x-access-token:<token>@github.com/..." construction."""
+        tenant_manager.register_repository(
+            "acme/widgets", "default-org", "widgets",
+            full_name="acme/widgets", github_token="fake-provisioning-token",
+        )
+        monkeypatch.chdir(tmp_path)
+        clone_spy = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            "backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy
+        )
+
+        runner = AgentRunner()
+        runner._ensure_workspace_provisioned(
+            project_id="widgets", repository_id="acme/widgets", organization_id="default-org",
+        )
+
+        clone_spy.assert_called_once()
+        clone_url, project_path = clone_spy.call_args[0][:2]
+        auth_header = clone_spy.call_args.kwargs.get("auth_header")
+
+        assert clone_url == "https://github.com/acme/widgets.git"
+        assert "fake-provisioning-token" not in clone_url
+        assert project_path.endswith("widgets")
+        assert auth_header is not None
+        assert auth_header.startswith("Authorization: Basic ")
+        assert "fake-provisioning-token" not in auth_header
+
+    def test_provisioning_failure_never_leaks_token_in_telemetry(self, tmp_path, monkeypatch):
+        """H. A failed clone during workspace provisioning must never leak
+        the resolved token into RUN_FAILED (or any other) telemetry event
+        - only the project/repo names are recorded, matching what the
+        raised RuntimeError itself is already proven to omit."""
+        tenant_manager.register_repository(
+            "acme/widgets", "default-org", "widgets",
+            full_name="acme/widgets", github_token="fake-leak-check-token",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            "backend.vcs.git_manager.GitWorkspaceManager.clone_repository",
+            lambda *a, **k: False,
+        )
+
+        runner = AgentRunner()
+        app = create_app(runner=runner)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/api/v1/runs",
+            json={
+                "user_message": "Explain this project",
+                "project_id": "widgets-fail-case",
+                "repository_id": "acme/widgets",
+            },
+        )
+        assert resp.status_code == 202
+        run_id = resp.json()["run_id"]
+
+        rec = telemetry_store.get_run(run_id, "default-org")
+        assert rec is not None
+        assert rec.status == "FAILED"
+
+        events = telemetry_store.list_events(run_id, "default-org")
+        assert len(events) > 0
+        for event in events:
+            assert "fake-leak-check-token" not in str(event.safe_metadata)
+
 
 # ---------------------------------------------------------------------------
 # Full-graph: real AgentRunner/TestClient, LLM nodes mocked
@@ -271,7 +342,7 @@ def test_api_run_provisions_missing_repository_and_rag_sees_it(
         "acme/widgets", "default-org", "widgets", full_name="acme/widgets",
     )
 
-    def fake_clone(clone_url, project_path, timeout=60):
+    def fake_clone(clone_url, project_path, timeout=60, auth_header=None):
         shutil.copytree(str(source_repo_fixture), project_path)
         return True
 
@@ -328,7 +399,7 @@ def test_repository_registration_endpoint_enables_fresh_workspace_provisioning(
     """
     monkeypatch.chdir(tmp_path)
 
-    def fake_clone(clone_url, project_path, timeout=60):
+    def fake_clone(clone_url, project_path, timeout=60, auth_header=None):
         shutil.copytree(str(source_repo_fixture), project_path)
         return True
 

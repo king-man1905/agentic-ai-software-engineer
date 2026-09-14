@@ -182,8 +182,20 @@ class TestRegisterRepositoryEndpoint:
         )
         clone_spy.assert_called_once()
         clone_url = clone_spy.call_args[0][0]
-        assert "secret-token-abc" in clone_url
+        auth_header = clone_spy.call_args.kwargs.get("auth_header")
+        # SECURITY: the registered token must reach clone_repository() only
+        # via the separate auth_header parameter - never embedded in the
+        # URL itself (which is what used to end up persisted verbatim in
+        # the clone's .git/config). auth_header carries the token only
+        # base64-encoded (standard HTTP Basic auth), never in plaintext.
+        assert "secret-token-abc" not in clone_url
         assert "acme/widgets" in clone_url
+        assert auth_header is not None
+        assert auth_header.startswith("Authorization: Basic ")
+        assert "secret-token-abc" not in auth_header
+        import base64
+        encoded = auth_header.removeprefix("Authorization: Basic ")
+        assert base64.b64decode(encoded).decode() == "x-access-token:secret-token-abc"
 
         # publish-pr's authorization check (backend/api/app.py) also succeeds
         # for the branch pattern the agent commits to.
