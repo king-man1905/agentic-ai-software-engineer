@@ -831,3 +831,97 @@ class TestQaAndRevisionSeeActualPatch:
         edges = {(e.source, e.target) for e in runner._graph.get_graph().edges}
         assert ("revision", "qa") in edges
         assert ("revision", "developer") not in edges
+
+
+from types import SimpleNamespace
+
+
+class FakeEmptyCompletionLLM:
+    """Simulates a provider whose with_structured_output() produces nothing
+    usable, forcing telemetry's _invoke_single_provider "direct fallback"
+    path, whose own llm.invoke() then returns an empty completion body."""
+
+    def __init__(self, provider="nvidia", model_name="test-model"):
+        self.provider = provider
+        self.model = model_name
+        self.invocations = 0
+
+    def with_structured_output(self, schema, include_raw=False):
+        return self
+
+    def invoke(self, prompt):
+        self.invocations += 1
+        if self.invocations == 1:
+            return None
+        return SimpleNamespace(content="", usage_metadata=None)
+
+
+class FakeStructuredLLM:
+    """Stands in for a provider that successfully returns a structured result
+    via with_structured_output(schema, include_raw=True)."""
+
+    def __init__(self, provider="gemini", model_name="test-model", result=None):
+        self.provider = provider
+        self.model = model_name
+        self.result = result
+        self.invocations = 0
+
+    def with_structured_output(self, schema, include_raw=False):
+        return self
+
+    def invoke(self, prompt):
+        self.invocations += 1
+        return {"parsed": self.result, "raw": SimpleNamespace(usage_metadata=None), "parsing_error": None}
+
+
+class TestRevisionSurvivesMalformedLlmResponse:
+    """Category E: revision resilience to a malformed/empty LLM response.
+
+    revise_code_changes() calls invoke_structured() exactly like the developer
+    agent's initial generation path does, so it inherits the same provider
+    fallback behavior: an empty/malformed primary response is retried against
+    the fallback provider rather than crashing the revision node.
+    """
+
+    def test_revision_node_recovers_via_provider_fallback_on_empty_primary_response(
+        self, monkeypatch
+    ):
+        from backend.observability.telemetry import invoke_structured
+
+        primary = FakeEmptyCompletionLLM(provider="nvidia")
+        revised_result = DeveloperResult(
+            summary="Revised after primary provider returned an empty response",
+            changes=[],
+            requires_testing=True,
+        )
+        fallback = FakeStructuredLLM(provider="gemini", result=revised_result)
+
+        # revise_code_changes() imports get_llm directly into its own module.
+        monkeypatch.setattr("backend.agents.developer.get_llm", lambda *a, **kw: primary)
+        # invoke_structured()'s fallback path resolves the secondary provider
+        # via backend.services.llm, same as the production reliability tests.
+        monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "gemini")
+        monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback)
+
+        state: AgentState = {
+            "user_message": "Fix broken query in database helper",
+            "developer_result": DeveloperResult(
+                summary="Initial attempt", changes=[], requires_testing=True
+            ),
+            "qa_result": QAResult(
+                status="FAIL",
+                issues=[QAIssue(file_path="db.py", issue="SyntaxError", severity="HIGH")],
+                test_cases=[],
+                summary="Pytest failed on syntax error.",
+            ),
+            "revision_count": 0,
+        }
+
+        # The real revise_code_changes() runs (not monkeypatched away), so
+        # this exercises the actual invoke_structured() fallback path.
+        output = revision_node(state)
+
+        assert output["developer_result"] == revised_result
+        assert output["revision_count"] == 1
+        assert primary.invocations == 2  # bounded: structured attempt + direct-fallback attempt
+        assert fallback.invocations == 1

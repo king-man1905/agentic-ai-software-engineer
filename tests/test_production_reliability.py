@@ -605,7 +605,7 @@ from backend.services.errors import (
     classify_llm_exception,
     is_fallback_eligible,
 )
-from backend.observability.telemetry import invoke_structured, run_context
+from backend.observability.telemetry import invoke_structured, run_context, _invoke_single_provider
 from backend.observability.collector import telemetry_collector
 from backend.observability.store import telemetry_store
 from backend.schemas.telemetry import TelemetryEventType, FailureCategory
@@ -1068,6 +1068,334 @@ def test_llm_timeout_does_not_hang_graph(monkeypatch, tmp_path):
         assert "timed out" in (status.error_summary or "").lower()
     finally:
         runner.close()
+
+
+# ============================================================================
+# PHASE 8 — STEP 4: LLM MALFORMED-RESPONSE CLASSIFICATION + FALLBACK
+# ============================================================================
+
+from backend.services.errors import LLMMalformedResponseError
+from langchain_core.exceptions import OutputParserException
+from types import SimpleNamespace
+import json as _json
+
+
+class FakeEmptyCompletionLLM:
+    """
+    Simulates a provider whose with_structured_output() produces nothing usable
+    (forcing telemetry's _invoke_single_provider "direct fallback" path), and whose
+    plain .invoke() then returns an empty completion body - the real-world shape of
+    a provider that silently returned nothing for a structured-output request.
+    """
+    def __init__(self, provider="nvidia", model_name="test-model", content=""):
+        self.provider = provider
+        self.model = model_name
+        self.content = content
+        self.invocations = 0
+
+    def with_structured_output(self, schema, include_raw=False):
+        return self  # invoke() below stands in for structured.invoke(prompt) too
+
+    def invoke(self, prompt):
+        self.invocations += 1
+        if self.invocations == 1:
+            return None  # with_structured_output's own invoke: nothing usable
+        return SimpleNamespace(content=self.content, usage_metadata=None)
+
+
+# 15. test_malformed_response_classification (Category A)
+def test_malformed_response_classification():
+    """
+    Verifies that provider response-parsing failures (empty/truncated JSON,
+    OutputParserException, JSONDecodeError, and a Pydantic ValidationError caused by
+    unparseable model output) are classified as LLMMalformedResponseError, and remain
+    fallback-eligible.
+    """
+    from backend.schemas.telemetry import FailureCategory  # noqa: F401 (keep import parity)
+    from pydantic import BaseModel
+
+    class _Schema(BaseModel):
+        summary: str
+
+    # json.JSONDecodeError on a truncated/empty body
+    try:
+        _json.loads("")
+    except _json.JSONDecodeError as e:
+        classified = classify_llm_exception(e, provider="nvidia")
+        assert isinstance(classified, LLMMalformedResponseError)
+        assert is_fallback_eligible(classified) is True
+
+    # LangChain OutputParserException
+    classified2 = classify_llm_exception(
+        OutputParserException("Failed to parse output: no JSON object found"),
+        provider="gemini",
+    )
+    assert isinstance(classified2, LLMMalformedResponseError)
+    assert is_fallback_eligible(classified2) is True
+
+    # Real Pydantic ValidationError from a genuinely empty/unparseable body
+    try:
+        _Schema.model_validate_json("")
+    except Exception as e:
+        classified3 = classify_llm_exception(e, provider="openai")
+        assert isinstance(classified3, LLMMalformedResponseError)
+        assert is_fallback_eligible(classified3) is True
+
+    try:
+        _Schema.model_validate_json('{"summary": "x", "changes": [')
+    except Exception as e:
+        classified4 = classify_llm_exception(e, provider="openai")
+        assert isinstance(classified4, LLMMalformedResponseError)
+        assert is_fallback_eligible(classified4) is True
+
+    # Direct unit-level eligibility check requested by spec
+    assert is_fallback_eligible(LLMMalformedResponseError("empty response")) is True
+    assert is_fallback_eligible(LLMInvalidRequestError("bad request")) is False
+
+
+# 16. test_genuine_invalid_request_still_not_fallback_eligible (Category B regression)
+def test_genuine_invalid_request_still_not_fallback_eligible():
+    """
+    Regression: genuine request-validity failures (HTTP 400/422, context window
+    exceeded, a well-formed-JSON-but-schema-invalid Pydantic ValidationError, and
+    authentication errors) must remain classified exactly as before - never as
+    LLMMalformedResponseError, and never fallback-eligible.
+    """
+    from pydantic import BaseModel
+
+    class _Schema(BaseModel):
+        summary: str
+        count: int
+
+    for exc, provider in [
+        (Exception("400 Bad Request: invalid parameter"), "nvidia"),
+        (Exception("422 Unprocessable Entity: schema mismatch"), "gemini"),
+        (Exception("maximum context length exceeded"), "openai"),
+        (Exception("context window exceeded for this model"), "nvidia"),
+    ]:
+        classified = classify_llm_exception(exc, provider=provider)
+        assert isinstance(classified, LLMInvalidRequestError)
+        assert not isinstance(classified, LLMMalformedResponseError)
+        assert is_fallback_eligible(classified) is False
+
+    # Well-formed JSON that simply fails schema validation (missing/wrong-typed
+    # field) is NOT a malformed-response problem - it's a genuine schema mismatch.
+    try:
+        _Schema.model_validate_json('{"summary": "ok"}')
+    except Exception as e:
+        classified = classify_llm_exception(e, provider="nvidia")
+        assert isinstance(classified, LLMInvalidRequestError)
+        assert not isinstance(classified, LLMMalformedResponseError)
+        assert is_fallback_eligible(classified) is False
+
+    # Authentication errors remain terminal, never fallback-eligible.
+    auth_classified = classify_llm_exception(
+        Exception("401 Unauthorized: Invalid API key"), provider="nvidia"
+    )
+    assert isinstance(auth_classified, LLMAuthenticationError)
+    assert is_fallback_eligible(auth_classified) is False
+
+
+# 17. test_empty_response_triggers_fallback (Category C)
+def test_empty_response_triggers_fallback(monkeypatch):
+    """
+    Verifies that a primary provider returning an empty structured completion
+    triggers safe fallback to a working secondary provider, and that
+    invoke_structured succeeds with the fallback's valid result.
+    """
+    primary = FakeEmptyCompletionLLM(provider="nvidia", content="")
+    fallback = FakeProviderLLM(
+        provider="gemini",
+        result=RoutingDecision(
+            task_type=TaskType.BUG_FIX,
+            confidence=0.9,
+            requires_planning=False,
+            requires_knowledge=False,
+            reasoning="Fallback succeeded after empty primary response",
+        ),
+    )
+
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "gemini")
+    monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback)
+
+    recorded_events = []
+    original_on_fallback = telemetry_collector.on_provider_fallback
+
+    def mock_on_fallback(**kwargs):
+        recorded_events.append(kwargs)
+        original_on_fallback(**kwargs)
+
+    monkeypatch.setattr(telemetry_collector, "on_provider_fallback", mock_on_fallback)
+
+    result = invoke_structured(primary, RoutingDecision, "Some prompt")
+    assert result.task_type == TaskType.BUG_FIX
+    assert fallback.invocations == 1
+    assert len(recorded_events) == 1
+    assert recorded_events[0]["failure_type"] == "LLMMalformedResponseError"
+
+
+# 18. test_malformed_json_fallback (Category D)
+def test_malformed_json_fallback(monkeypatch):
+    """
+    Verifies that a primary provider returning truncated/malformed JSON (raised as
+    a JSONDecodeError from the structured-output parser) triggers safe fallback,
+    and the fallback's valid structured output is returned.
+    """
+    primary = FakeProviderLLM(
+        provider="nvidia",
+        failure=_json.JSONDecodeError("Expecting value", "{\"summary\": ", 12),
+    )
+    fallback = FakeProviderLLM(
+        provider="gemini",
+        result=RoutingDecision(
+            task_type=TaskType.CODE_GENERATION,
+            confidence=0.92,
+            requires_planning=False,
+            requires_knowledge=False,
+            reasoning="Fallback succeeded after malformed JSON",
+        ),
+    )
+
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "gemini")
+    monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback)
+
+    result = invoke_structured(primary, RoutingDecision, "Some prompt")
+    assert result.task_type == TaskType.CODE_GENERATION
+    assert primary.invocations == 1
+    assert fallback.invocations == 1
+
+
+# 19. test_malformed_response_fallback_is_bounded (Category F)
+def test_malformed_response_fallback_is_bounded(monkeypatch):
+    """
+    Verifies that malformed/empty responses cannot create unbounded retries: if both
+    primary and fallback return malformed/empty responses, invoke_structured raises
+    a structured final error after exactly 2 total provider attempts.
+    """
+    primary = FakeEmptyCompletionLLM(provider="nvidia", content="")
+    fallback = FakeEmptyCompletionLLM(provider="gemini", content="")
+
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "gemini")
+    monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback)
+
+    with pytest.raises(LLMMalformedResponseError):
+        invoke_structured(primary, RoutingDecision, "Any prompt")
+
+    # Each fake provider is invoked at most twice internally (structured-output
+    # attempt + direct-fallback attempt) - never an unbounded retry loop.
+    assert primary.invocations == 2
+    assert fallback.invocations == 2
+
+
+class FakeParsingErrorLLM:
+    """
+    Simulates with_structured_output(schema, include_raw=True) returning
+    LangChain's own {"parsed": None, "raw": ..., "parsing_error": exc} shape -
+    reaching _invoke_single_provider's OUTER except-block substring checks
+    directly (via the `raise result["parsing_error"]` line), without passing
+    through the unrelated inner guided_json/[400] recovery branch that only
+    wraps the with_structured_output().invoke() call itself.
+    """
+    def __init__(self, provider="nvidia", model_name="test-model", parsing_error=None):
+        self.provider = provider
+        self.model = model_name
+        self.parsing_error = parsing_error
+        self.invocations = 0
+
+    def with_structured_output(self, schema, include_raw=False):
+        return self
+
+    def invoke(self, prompt):
+        self.invocations += 1
+        return {"parsed": None, "raw": None, "parsing_error": self.parsing_error}
+
+
+# 20. test_malformed_response_substring_regression (review follow-up: A + B)
+def test_malformed_response_substring_regression():
+    """
+    Regression for the review finding: a provider response that merely
+    *describes itself* as malformed (not a JSONDecodeError/OutputParserException
+    by type, and without Pydantic's json_invalid tag) must still classify as
+    LLMMalformedResponseError and remain fallback-eligible - the old bare
+    `"malformed" in exc_str` clause on the Invalid Request rule used to steal
+    exactly this case and make it terminal.
+    """
+    for message in [
+        "Malformed response body received from provider",
+        "malformed JSON in response",
+    ]:
+        classified = classify_llm_exception(Exception(message), provider="nvidia")
+        assert isinstance(classified, LLMMalformedResponseError), (
+            f"{message!r} must classify as LLMMalformedResponseError, got {type(classified).__name__}"
+        )
+        assert is_fallback_eligible(classified) is True
+
+    # A genuine "malformed request" signal (the narrow phrase that replaced the
+    # bare "malformed" substring) must still classify as a terminal invalid
+    # request, never fallback-eligible.
+    classified_req = classify_llm_exception(Exception("malformed request"), provider="nvidia")
+    assert isinstance(classified_req, LLMInvalidRequestError)
+    assert not isinstance(classified_req, LLMMalformedResponseError)
+    assert is_fallback_eligible(classified_req) is False
+
+
+# 21. test_malformed_response_with_retry_substrings_does_not_retry_internally
+def test_malformed_response_with_retry_substrings_does_not_retry_internally():
+    """
+    Fast-fail safety: a malformed-response error whose (model-controlled)
+    message text happens to contain "429" or "[400]" must not trigger
+    _invoke_single_provider's internal sleep-and-continue retry checks - it
+    must fail fast on the first attempt, exactly like Timeout/Auth/InvalidRequest.
+    """
+    primary = FakeParsingErrorLLM(
+        parsing_error=OutputParserException(
+            "Failed to parse output. Raw completion happened to mention [400] verbatim."
+        ),
+    )
+
+    with pytest.raises(LLMMalformedResponseError):
+        _invoke_single_provider(primary, RoutingDecision, "Any prompt")
+
+    # Exactly one internal invocation - fast-failed immediately, no
+    # sleep-and-continue retry loop despite the coincidental "[400]" text.
+    assert primary.invocations == 1
+
+
+# 22. test_malformed_response_fallback_telemetry_category
+def test_malformed_response_fallback_telemetry_category(monkeypatch):
+    """
+    Verifies that a malformed-response-triggered provider fallback emits the
+    explicit failure_category "LLM_MALFORMED_RESPONSE", distinct from generic
+    transient failures (503s), timeouts, and rate limits.
+    """
+    primary = FakeEmptyCompletionLLM(provider="nvidia", content="")
+    fallback = FakeProviderLLM(
+        provider="gemini",
+        result=RoutingDecision(
+            task_type=TaskType.BUG_FIX,
+            confidence=0.9,
+            requires_planning=False,
+            requires_knowledge=False,
+            reasoning="Fallback succeeded",
+        ),
+    )
+
+    recorded_events = []
+    original_on_fallback = telemetry_collector.on_provider_fallback
+
+    def mock_on_fallback(**kwargs):
+        recorded_events.append(kwargs)
+        original_on_fallback(**kwargs)
+
+    monkeypatch.setattr(telemetry_collector, "on_provider_fallback", mock_on_fallback)
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "gemini")
+    monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback)
+
+    invoke_structured(primary, RoutingDecision, "Some prompt")
+
+    assert len(recorded_events) == 1
+    assert recorded_events[0]["failure_category"] == "LLM_MALFORMED_RESPONSE"
+    assert recorded_events[0]["failure_type"] == "LLMMalformedResponseError"
 
 
 # ============================================================================

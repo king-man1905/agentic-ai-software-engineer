@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from backend.observability.telemetry import (
     collect_usage,
     estimate_cost_usd,
@@ -7,6 +9,7 @@ from backend.observability.telemetry import (
     invoke_structured,
     merge_usage,
 )
+from backend.services.errors import LLMMalformedResponseError
 
 
 class TestEstimateCostUsd:
@@ -101,13 +104,27 @@ class FakeStructuredRunnable:
 
 
 class FakeLLM:
-    def __init__(self, parsed, raw, parsing_error=None, model="meta/llama-3.1-8b-instruct"):
+    def __init__(
+        self,
+        parsed,
+        raw,
+        parsing_error=None,
+        model="meta/llama-3.1-8b-instruct",
+        direct_content=None,
+    ):
         self.model = model
         self._runnable = FakeStructuredRunnable(parsed, raw, parsing_error)
+        self._direct_content = direct_content
 
     def with_structured_output(self, schema, include_raw=False):
         assert include_raw is True
         return self._runnable
+
+    def invoke(self, prompt):
+        """Stands in for the "direct fallback" `llm.invoke(prompt)` call in
+        _invoke_single_provider, reached when with_structured_output() produced
+        nothing usable (parsed is None and there was no parsing_error)."""
+        return SimpleNamespace(content=self._direct_content, usage_metadata=None)
 
 
 class TestInvokeStructured:
@@ -154,3 +171,14 @@ class TestInvokeStructured:
             assert False, "expected ValueError to propagate"
         except ValueError as e:
             assert "bad schema" in str(e)
+
+    def test_empty_completion_is_malformed_not_invalid_request(self):
+        """
+        An empty completion body (parsed=None, no parsing_error, direct
+        llm.invoke() returns empty content) must be detected as
+        LLMMalformedResponseError before it can reach model_validate_json("")
+        and be misclassified as a non-retryable LLMInvalidRequestError.
+        """
+        llm = FakeLLM(parsed=None, raw=None, direct_content="")
+        with pytest.raises(LLMMalformedResponseError):
+            invoke_structured(llm, dict, "prompt")

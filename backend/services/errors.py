@@ -44,6 +44,20 @@ class LLMTransientError(LLMError):
     pass
 
 
+class LLMMalformedResponseError(LLMTransientError):
+    """
+    Provider returned an empty, truncated, or unparseable structured
+    response (e.g. an empty completion body, invalid/truncated JSON, or a
+    schema parser failing to decode the raw text at all - not a
+    well-formed response that simply fails semantic/schema validation).
+    This is a response-quality problem, not a request-validity problem:
+    retrying the same request (or trying a different provider) is a
+    reasonable recovery, so this is retryable and eligible for provider
+    fallback like any other transient failure.
+    """
+    pass
+
+
 class LLMRateLimitError(LLMError):
     """
     Provider rate limit or quota exhaustion (HTTP 429).
@@ -150,19 +164,69 @@ def classify_llm_exception(exc: Exception, provider: Optional[str] = None) -> LL
             original_exception=exc,
         )
 
-    # 4. Invalid Request / Schema Validation Checks (MUST NOT FALLBACK)
+    # 4. Malformed / Empty Structured Response Checks (Eligible for fallback)
+    # Checked BEFORE the Invalid Request rule below: a provider that
+    # returned an empty, truncated, or unparseable structured completion is
+    # a response-quality problem worth a retry/fallback attempt, not a
+    # deterministic "the request itself was invalid" failure - even though
+    # the parsing library (Pydantic's ValidationError, LangChain's
+    # OutputParserException, or Python's json.JSONDecodeError) raises
+    # exactly the same exception *types* a genuine schema/argument error
+    # would. Distinguished by message content, not exception type alone: a
+    # Pydantic ValidationError only lands here when its own `type=
+    # json_invalid` tag (or an equivalent JSON-decoding message) shows the
+    # failure was in parsing the raw response text as JSON at all - never
+    # for a well-formed JSON response that simply fails semantic/schema
+    # validation (e.g. "field required"), which still falls through to the
+    # Invalid Request rule below, unchanged, via the generic
+    # "validationerror" type check there. A message that describes the
+    # *response* as malformed (e.g. "Malformed response body received from
+    # provider") belongs here too, not on the Invalid Request rule - guarded
+    # against "malformed request" specifically so that phrase (a genuine
+    # outbound-request signal) still falls through to the Invalid Request
+    # rule below unaffected.
+    if (
+        "jsondecodeerror" in exc_type
+        or "outputparserexception" in exc_type
+        or "outputparser" in exc_type
+        or "json_invalid" in exc_str
+        or "expecting value" in exc_str
+        or "eof while parsing" in exc_str
+        or "unterminated string" in exc_str
+        or "unterminated array" in exc_str
+        or "unterminated object" in exc_str
+        or ("extra data" in exc_str and "json" in exc_str)
+        or ("malformed" in exc_str and "malformed request" not in exc_str)
+    ):
+        return LLMMalformedResponseError(
+            f"LLM returned an empty, truncated, or unparseable structured response: {exc}",
+            provider=provider,
+            original_exception=exc,
+        )
+
+    # 5. Invalid Request / Schema Validation Checks (MUST NOT FALLBACK)
+    # Note: deliberately does NOT use `isinstance(exc, (ValueError, TypeError))`
+    # as a catch-all - that swept every response-parsing failure (which is
+    # also typically a ValueError/TypeError under the hood) into this
+    # non-retryable bucket, including the empty/malformed-JSON case rule 4
+    # above now correctly classifies as retryable instead. Genuine invalid-
+    # request signals (status code, explicit type names, or message
+    # content) are matched explicitly. Also deliberately does NOT match a
+    # bare "malformed" substring - a provider response that merely
+    # describes itself as "malformed" (e.g. "Malformed response body
+    # received from provider") is exactly the response-quality problem
+    # rule 4 above exists to catch, and is retryable; only a message that
+    # specifically calls out the *request* as malformed belongs here.
     if (
         status_code in (400, 422)
-        or isinstance(exc, (ValueError, TypeError))
         or "badrequest" in exc_type
         or "validationerror" in exc_type
-        or "outputparser" in exc_type
         or "invalidargument" in exc_type
         or "400" in exc_str and "bad request" in exc_str
         or "context window" in exc_str
         or "maximum context length" in exc_str
         or "schema" in exc_str
-        or "malformed" in exc_str
+        or "malformed request" in exc_str
     ):
         return LLMInvalidRequestError(
             f"LLM invalid request: {exc}",
@@ -170,7 +234,7 @@ def classify_llm_exception(exc: Exception, provider: Optional[str] = None) -> LL
             original_exception=exc,
         )
 
-    # 5. Transient Network / Server 5xx Checks (Eligible for fallback)
+    # 6. Transient Network / Server 5xx Checks (Eligible for fallback)
     if (
         (isinstance(status_code, int) and 500 <= status_code <= 599)
         or "connectionerror" in exc_type
@@ -194,7 +258,7 @@ def classify_llm_exception(exc: Exception, provider: Optional[str] = None) -> LL
             original_exception=exc,
         )
 
-    # 6. Fallback to Permanent / General LLM Error
+    # 7. Fallback to Permanent / General LLM Error
     return LLMPermanentError(
         f"LLM provider error: {exc}",
         provider=provider,

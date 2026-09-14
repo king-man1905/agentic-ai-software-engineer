@@ -159,6 +159,7 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
         classify_llm_exception,
         LLMAuthenticationError,
         LLMInvalidRequestError,
+        LLMMalformedResponseError,
         LLMTimeoutError,
     )
 
@@ -213,6 +214,22 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
                 call_usage = extract_usage(raw, model)
                 collector.update(merge_usage(collector, call_usage))
 
+            # A genuinely empty completion body is never meaningfully
+            # parseable - detected here, before any parsing is attempted,
+            # rather than let it fall through the regex match (which
+            # simply won't match) and the "convert to JSON" re-prompt
+            # below into model_validate_json("") at the bottom, which
+            # raises a Pydantic ValidationError that would otherwise be a
+            # misleading way to discover the same fact. Raising the
+            # correctly-classified, retryable error immediately also
+            # skips a second, near-certain-to-fail LLM call (the re-prompt
+            # asking the model to "convert" nothing into JSON).
+            if not raw.content or not raw.content.strip():
+                raise LLMMalformedResponseError(
+                    f"LLM returned an empty completion for structured output ({schema_name})",
+                    provider=_infer_provider(llm),
+                )
+
             match = re.search(r"\{.*\}", raw.content, re.DOTALL)
             if match and hasattr(schema, "model_validate_json"):
                 try:
@@ -237,9 +254,23 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
             return conv_res.content
 
         except Exception as e:
-            # Fast fail on non-retriable exceptions
+            # Fast fail on non-retriable exceptions, and on malformed
+            # responses (also fast-failed here, not retried internally,
+            # because their text is model-controlled and could otherwise
+            # coincidentally match the "429"/"guided_json"/"[400]" retry
+            # checks below) - malformed responses still propagate up to
+            # invoke_structured's own bounded primary -> fallback provider
+            # switch, which is where their retry actually belongs.
             classified = classify_llm_exception(e)
-            if isinstance(classified, (LLMAuthenticationError, LLMInvalidRequestError, LLMTimeoutError)):
+            if isinstance(
+                classified,
+                (
+                    LLMAuthenticationError,
+                    LLMInvalidRequestError,
+                    LLMTimeoutError,
+                    LLMMalformedResponseError,
+                ),
+            ):
                 raise classified
 
             if ("429" in str(e) or "Too Many Requests" in str(e)) and attempt < 2:
@@ -277,6 +308,7 @@ def invoke_structured(
         is_fallback_eligible,
         LLMTimeoutError,
         LLMRateLimitError,
+        LLMMalformedResponseError,
     )
     from backend.services.llm import get_llm, get_fallback_provider
     from backend.observability.collector import telemetry_collector
@@ -319,6 +351,8 @@ def invoke_structured(
             failure_cat = "LLM_TIMEOUT"
         elif isinstance(classified_primary, LLMRateLimitError):
             failure_cat = "LLM_RATE_LIMIT"
+        elif isinstance(classified_primary, LLMMalformedResponseError):
+            failure_cat = "LLM_MALFORMED_RESPONSE"
         else:
             failure_cat = "LLM_TRANSIENT_FAILURE"
 
