@@ -280,13 +280,19 @@ class TestHITLLifecycleWithAPI:
         get_data = get_resp.json()
         assert get_data["status"] == "WAITING_APPROVAL"
         assert get_data["current_node"] == "approval"
+        patch_hash = get_data["git_diff"]["patch_hash"]
+        assert patch_hash
 
-        # 3. Resume run with approval
+        # 3. Resume run with approval. P0-4: approval is fail-closed on a
+        # missing patch_hash, so it must be submitted here to genuinely
+        # reach APPROVED - omitting it (as this test previously did) is now
+        # correctly rejected instead of silently treated as approved.
         resume_resp = client.post(
             f"/api/v1/runs/{run_id}/resume",
             json={
                 "approved": True,
                 "reviewer": "lead_engineer",
+                "patch_hash": patch_hash,
             },
         )
         assert resume_resp.status_code == 200
@@ -301,10 +307,11 @@ class TestHITLLifecycleWithAPI:
         # 5. Resuming an already-completed run with the SAME decision is now
         # an idempotent replay (Phase 8 Step 4), not a 409 - a client retry
         # after a dropped response must not error just because the first
-        # attempt actually succeeded.
+        # attempt actually succeeded. "Same decision" includes the hash -
+        # this replays exactly what step 3 submitted.
         replay_resp = client.post(
             f"/api/v1/runs/{run_id}/resume",
-            json={"approved": True},
+            json={"approved": True, "patch_hash": patch_hash},
         )
         assert replay_resp.status_code == 200
         assert replay_resp.json()["status"] == "COMPLETED"

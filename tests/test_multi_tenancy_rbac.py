@@ -230,6 +230,7 @@ class TestApprovalAuthorization:
         state = {
             "git_diff": GitDiffSummary(
                 branch_name="feature/test",
+                files_changed=["app.py"],
                 unified_diff="--- a\n+++ b",
                 risk_score="LOW",
                 patch_hash="abc123hash",
@@ -336,20 +337,70 @@ class TestTenantContextAndIsolation:
 
 class TestRAGTenantIsolation:
     def test_rag_vector_store_tenant_path(self):
-        # With tenant
-        path_scoped = get_vector_store_path("project-xyz", organization_id="tenant-123")
-        assert "tenant-123" in str(path_scoped)
-        assert "project-xyz" in str(path_scoped)
+        # Two different tenants on the same project_id resolve to disjoint,
+        # namespaced paths - never a flat, unnamespaced one.
+        path_org_a = get_vector_store_path("project-xyz", organization_id="tenant-123")
+        assert "tenant-123" in str(path_org_a)
+        assert "project-xyz" in str(path_org_a)
 
-        # Without tenant (backward compatibility)
-        path_flat = get_vector_store_path("project-xyz", organization_id=None)
-        assert "tenant-123" not in str(path_flat)
-        assert str(path_flat).endswith("project-xyz")
+        path_org_b = get_vector_store_path("project-xyz", organization_id="tenant-456")
+        assert "tenant-456" in str(path_org_b)
+        assert path_org_a != path_org_b
+
+    def test_rag_vector_store_missing_organization_id_fails_closed(self):
+        # A vector store must always be tenant-bound - no unnamespaced
+        # vector_store/<project_id> fallback is allowed.
+        with pytest.raises(ValueError):
+            get_vector_store_path("project-xyz", organization_id=None)
+        with pytest.raises(ValueError):
+            get_vector_store_path("project-xyz", organization_id="")
+
+    def test_rag_vector_store_traversal_organization_id_fails_closed(self):
+        with pytest.raises(ValueError):
+            get_vector_store_path("project-xyz", organization_id="../other-org")
+
+    def test_rag_vector_store_traversal_project_id_fails_closed(self):
+        with pytest.raises(ValueError):
+            get_vector_store_path("../other-project", organization_id="tenant-123")
 
     def test_rag_cross_tenant_retrieval_isolation(self):
         # Attempting to load another tenant's vector store index fails with FileNotFoundError
         with pytest.raises(FileNotFoundError):
             load_project_index("project-xyz", organization_id="nonexistent-tenant")
+
+    def test_rag_load_project_index_missing_organization_id_fails_closed(self):
+        with pytest.raises(ValueError):
+            load_project_index("project-xyz", organization_id=None)
+
+    def test_knowledge_node_passes_run_organization_id_to_vector_store(self, monkeypatch):
+        """knowledge_node must resolve dense retrieval against the run's own
+        tenant, never the vector-store-unaware default."""
+        from backend.graph import nodes as nodes_module
+
+        captured = {}
+
+        def fake_load_project_index(project_id, organization_id=None):
+            captured["organization_id"] = organization_id
+            raise FileNotFoundError("no index for this test")
+
+        monkeypatch.setattr(
+            "backend.rag.retriever.load_project_index", fake_load_project_index
+        )
+        def fake_answer_from_project(project_id, question, k=4, documents=None, organization_id=None):
+            captured["answer_from_project_org"] = organization_id
+            return nodes_module.KnowledgeAnswer(answer="x", sources=[], sufficient_context=False)
+
+        monkeypatch.setattr(nodes_module, "answer_from_project", fake_answer_from_project)
+
+        state = {
+            "project_id": "proj-1",
+            "organization_id": "tenant-real",
+            "user_message": "what does this do?",
+        }
+        nodes_module.knowledge_node(state)
+
+        assert captured["organization_id"] == "tenant-real"
+        assert captured["answer_from_project_org"] == "tenant-real"
 
 
 # =============================================================================

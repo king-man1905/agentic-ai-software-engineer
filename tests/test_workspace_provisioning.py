@@ -81,7 +81,7 @@ class TestEnsureWorkspaceProvisioned:
             "acme/widgets", "default-org", "widgets", full_name="acme/widgets",
         )
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "workspace" / "widgets").mkdir(parents=True)
+        (tmp_path / "workspace" / "default-org" / "widgets").mkdir(parents=True)
         clone_spy = MagicMock(return_value=True)
         monkeypatch.setattr(
             "backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy
@@ -278,7 +278,7 @@ def mocked_router_and_developer(monkeypatch):
 
     monkeypatch.setattr(
         "backend.graph.nodes.answer_from_project",
-        lambda project_id, question, k=4, documents=None: _KnowledgeAnswer(
+        lambda project_id, question, k=4, documents=None, organization_id=None: _KnowledgeAnswer(
             answer="stub knowledge answer",
             sources=[],
             sufficient_context=bool(documents),
@@ -354,7 +354,7 @@ def test_api_run_provisions_missing_repository_and_rag_sees_it(
     app = create_app(runner=runner)
     client = TestClient(app)
 
-    assert not (tmp_path / "workspace" / "widgets").exists()
+    assert not (tmp_path / "workspace" / "default-org" / "widgets").exists()
 
     resp = client.post(
         "/api/v1/runs",
@@ -367,8 +367,9 @@ def test_api_run_provisions_missing_repository_and_rag_sees_it(
     assert resp.status_code == 202
     run_id = resp.json()["run_id"]
 
-    # Workspace now exists, populated from the "cloned" source.
-    assert (tmp_path / "workspace" / "widgets" / "README.md").exists()
+    # Workspace now exists, namespaced under the caller's organization_id
+    # (dev-mode fallback: "default-org"), populated from the "cloned" source.
+    assert (tmp_path / "workspace" / "default-org" / "widgets" / "README.md").exists()
 
     state_values = runner.get_state_values(run_id, organization_id="default-org")
     assert state_values.get("rag_status") != "RAG_INSUFFICIENT_CONTEXT"
@@ -418,7 +419,7 @@ def test_repository_registration_endpoint_enables_fresh_workspace_provisioning(
 
     # Nothing registered yet - the API is the only path exercised here.
     assert tenant_manager.get_repository("acme/fresh-widgets") is None
-    assert not (tmp_path / "workspace" / "fresh-widgets").exists()
+    assert not (tmp_path / "workspace" / "org-fresh" / "fresh-widgets").exists()
 
     register_resp = client.post(
         "/api/v1/repositories",
@@ -442,8 +443,9 @@ def test_repository_registration_endpoint_enables_fresh_workspace_provisioning(
     run_id = run_resp.json()["run_id"]
 
     # The workspace that did not exist before the registration call now
-    # does, populated from the (faked) clone.
-    assert (tmp_path / "workspace" / "fresh-widgets" / "README.md").exists()
+    # does, namespaced under the requesting tenant's organization_id,
+    # populated from the (faked) clone.
+    assert (tmp_path / "workspace" / "org-fresh" / "fresh-widgets" / "README.md").exists()
 
     state_values = runner.get_state_values(run_id, organization_id="org-fresh")
     assert state_values.get("rag_status") != "RAG_INSUFFICIENT_CONTEXT"

@@ -9,6 +9,7 @@ from backend.policy.path_filter import (
     normalize_path,
     matches_protected_path,
     is_traversal_attack,
+    safe_repo_relative_path,
 )
 from backend.policy.evaluator import PolicyEvaluator
 
@@ -22,4 +23,5 @@ __all__ = [
     "normalize_path",
     "matches_protected_path",
     "is_traversal_attack",
+    "safe_repo_relative_path",
 ]

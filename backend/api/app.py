@@ -955,6 +955,7 @@ def create_app(
             GitHubApiError,
         )
         from backend.vcs.git_manager import GitWorkspaceManager, build_github_auth_header
+        from backend.vcs.workspace_paths import resolve_workspace_path
 
         # 1. Permission check
         if Permission.REPO_MANAGE not in tenant_ctx.permissions and Permission.RUN_APPROVE not in tenant_ctx.permissions:
@@ -1113,9 +1114,12 @@ def create_app(
         # actually existing locally - fails closed instead of opening a PR
         # against the wrong or missing branch.
         project_id = state_values.get("project_id") or "test_project"
-        project_path = Path("workspace") / project_id
-        if not project_path.exists():
-            project_path = Path(os.getcwd()) / "workspace" / project_id
+        project_path = resolve_workspace_path(tenant_ctx.organization_id, project_id)
+        if project_path is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="WORKSPACE_PATH_INVALID: could not resolve a safe workspace path for this run.",
+            )
 
         # SECURITY: reuses the exact same tenant-scoped `token` already
         # resolved above (step 6) via authorize_repository_access() - no

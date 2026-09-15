@@ -143,8 +143,15 @@ class TestApprovalNodeIntegrity:
         finally:
             nodes_module.interrupt = original_interrupt
 
-    def test_approval_backward_compatibility_none_hash(self):
-        """Legacy client approval omitting patch_hash still succeeds."""
+    def test_approval_rejected_when_patch_hash_omitted(self):
+        """
+        Fail-closed (P0-4): an approval decision that omits patch_hash must
+        be rejected, never silently treated as approved. This replaces a
+        previous test that asserted the opposite ("legacy client omitting
+        patch_hash still succeeds") - that was the exact gap the fix closes:
+        a missing hash used to skip the integrity check entirely instead of
+        failing it.
+        """
         def mock_interrupt(payload):
             return {"approved": True, "reviewer": "legacy-bot", "patch_hash": None}
 
@@ -170,9 +177,123 @@ class TestApprovalNodeIntegrity:
 
             output = approval_node(state)
 
-            assert output["approval_status"] == "APPROVED"
-            assert output["approval"].approved is True
-            assert route_after_approval(output) == "git_commit"
+            assert output["approval_status"] == "MISSING_APPROVAL_PATCH_HASH"
+            assert output["approval"].approved is False
+            assert route_after_approval(output) == "cleanup"
+        finally:
+            nodes_module.interrupt = original_interrupt
+
+    def test_approval_rejected_when_git_diff_missing(self):
+        """P0-4: approved=True with no git_diff at all in state must fail
+        closed - there is nothing to bind the approval to."""
+        def mock_interrupt(payload):
+            return {"approved": True, "reviewer": "dave", "patch_hash": "somehash"}
+
+        import backend.graph.nodes as nodes_module
+        original_interrupt = nodes_module.interrupt
+
+        try:
+            nodes_module.interrupt = mock_interrupt
+
+            state: AgentState = {
+                "user_message": "Change main",
+                "git_diff": None,
+            }
+
+            output = approval_node(state)
+
+            assert output["approval_status"] == "NO_OP_OR_MISSING_DIFF"
+            assert output["approval"].approved is False
+            assert route_after_approval(output) == "cleanup"
+        finally:
+            nodes_module.interrupt = original_interrupt
+
+    def test_approval_rejected_when_diff_is_no_op(self):
+        """P0-4: approved=True against a no-op diff (no files changed) must
+        fail closed - there is nothing real to commit/push."""
+        def mock_interrupt(payload):
+            return {"approved": True, "reviewer": "erin", "patch_hash": ""}
+
+        import backend.graph.nodes as nodes_module
+        original_interrupt = nodes_module.interrupt
+
+        try:
+            nodes_module.interrupt = mock_interrupt
+
+            diff = GitDiffSummary(
+                branch_name="agent/task-noop",
+                files_changed=[],
+                unified_diff="",
+                patch_hash=GitWorkspaceManager.compute_patch_hash(""),
+            )
+            state: AgentState = {
+                "user_message": "Change main",
+                "git_diff": diff,
+            }
+
+            output = approval_node(state)
+
+            assert output["approval_status"] == "NO_OP_OR_MISSING_DIFF"
+            assert output["approval"].approved is False
+            assert route_after_approval(output) == "cleanup"
+        finally:
+            nodes_module.interrupt = original_interrupt
+
+    def test_approval_rejected_when_staged_diff_hash_missing(self):
+        """P0-4: a real, non-no-op diff whose own patch_hash field is
+        somehow empty must fail closed - there is nothing valid to verify
+        the submitted hash against."""
+        def mock_interrupt(payload):
+            return {"approved": True, "reviewer": "frank", "patch_hash": "somehash"}
+
+        import backend.graph.nodes as nodes_module
+        original_interrupt = nodes_module.interrupt
+
+        try:
+            nodes_module.interrupt = mock_interrupt
+
+            diff = GitDiffSummary(
+                branch_name="agent/task-nohash",
+                files_changed=["main.py"],
+                unified_diff="+line 1",
+                patch_hash="",
+            )
+            state: AgentState = {
+                "user_message": "Change main",
+                "git_diff": diff,
+            }
+
+            output = approval_node(state)
+
+            assert output["approval_status"] == "MISSING_DIFF_HASH"
+            assert output["approval"].approved is False
+            assert route_after_approval(output) == "cleanup"
+        finally:
+            nodes_module.interrupt = original_interrupt
+
+    def test_approval_never_reaches_git_commit_without_all_hash_checks(self):
+        """P0-4 end-to-end invariant: across every failure mode, approved=True
+        must never route to git_commit unless a full, matching hash was
+        actually verified."""
+        import backend.graph.nodes as nodes_module
+        original_interrupt = nodes_module.interrupt
+
+        scenarios = [
+            (None, "somehash", None),
+            (GitDiffSummary(branch_name="b", files_changed=[], unified_diff="", patch_hash=""), "somehash", None),
+            (GitDiffSummary(branch_name="b", files_changed=["a.py"], unified_diff="+x", patch_hash=""), "somehash", None),
+            (GitDiffSummary(branch_name="b", files_changed=["a.py"], unified_diff="+x", patch_hash="realhash"), None, None),
+            (GitDiffSummary(branch_name="b", files_changed=["a.py"], unified_diff="+x", patch_hash="realhash"), "wronghash", None),
+        ]
+        try:
+            for git_diff, submitted_hash, _ in scenarios:
+                nodes_module.interrupt = lambda payload, h=submitted_hash: {
+                    "approved": True, "reviewer": "grace", "patch_hash": h
+                }
+                state: AgentState = {"user_message": "x", "git_diff": git_diff}
+                output = approval_node(state)
+                assert output["approval"].approved is False
+                assert route_after_approval(output) == "cleanup"
         finally:
             nodes_module.interrupt = original_interrupt
 

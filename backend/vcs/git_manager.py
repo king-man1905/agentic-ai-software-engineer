@@ -14,6 +14,7 @@ from backend.policy.patterns import (
     CI_CD_PATTERNS,
     INFRA_CONFIG_PATTERNS,
 )
+from backend.policy.path_filter import safe_repo_relative_path
 from backend.vcs.models import GitDiffSummary
 
 
@@ -238,9 +239,21 @@ class GitWorkspaceManager:
         takes the general path, unchanged from before.
         """
         results: Dict[str, Tuple[str, str]] = {}
+        repo_root = Path(repo_path)
 
         for patch in patches:
-            abs_path = Path(repo_path) / patch.file_path
+            # SECURITY: patch.file_path is LLM-controlled - contained
+            # before it can be joined into a filesystem path. This is the
+            # most sensitive of the read/write sites since the write below
+            # creates missing parent directories; an unsafe path fails the
+            # whole diff-preparation step rather than writing anywhere or
+            # creating directories outside repo_root.
+            abs_path = safe_repo_relative_path(repo_root, patch.file_path)
+            if abs_path is None:
+                raise ValueError(
+                    f"Refusing to apply patch: "
+                    f"'{patch.file_path}' is not a safe repository-relative path."
+                )
 
             original_content = GitWorkspaceManager._read_head_content(repo_path, patch.file_path)
 

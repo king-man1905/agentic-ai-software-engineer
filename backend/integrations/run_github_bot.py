@@ -1,6 +1,5 @@
 import argparse
 import os
-from pathlib import Path
 import subprocess
 import sys
 import uuid
@@ -14,6 +13,7 @@ from backend.integrations.github_client import GitHubClient
 from backend.integrations.github_models import GitHubPRResult
 from backend.vcs.models import ApprovalDecision
 from backend.vcs.git_manager import GitWorkspaceManager
+from backend.vcs.workspace_paths import resolve_workspace_path
 
 
 def solve_issue_and_open_pr(
@@ -74,10 +74,18 @@ def solve_issue_and_open_pr(
     run_id = f"gh_{issue.issue_number}_{uuid.uuid4().hex[:8]}"
     resolved_project_id = project_id or repo.split("/")[-1]
 
-    # Ensure workspace repository exists
-    project_path = Path("workspace") / resolved_project_id
-    if not project_path.exists():
-        project_path = Path(os.getcwd()) / "workspace" / resolved_project_id
+    # Ensure workspace repository exists. Namespaced by organization_id
+    # the same way AgentRunner.start_run's own workspace provisioning is
+    # (backend/vcs/workspace_paths.py) - this script's own clone below and
+    # start_run's internal provisioning must resolve to the identical
+    # directory, or the two silently diverge.
+    effective_org_id = organization_id or "default-org"
+    project_path = resolve_workspace_path(effective_org_id, resolved_project_id)
+    if project_path is None:
+        raise ValueError(
+            f"organization_id/project_id did not resolve to a safe "
+            f"workspace path for project '{resolved_project_id}'."
+        )
 
     git_env = {
         **os.environ,

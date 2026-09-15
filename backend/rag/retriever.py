@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -10,7 +10,7 @@ from backend.schemas.rag import RetrievedDocumentView
 VECTOR_STORE_ROOT = Path("vector_store")
 
 
-def load_project_index(project_id: str, organization_id: Optional[str] = None):
+def load_project_index(project_id: str, organization_id: str):
     index_path = get_vector_store_path(project_id, organization_id)
 
     if not index_path.exists():
@@ -33,11 +33,11 @@ def retrieve_project_context(
     project_id: str,
     query: str,
     k: int = 4,
-    organization_id: Optional[str] = None,
+    *,
+    organization_id: str,
 ) -> List[Document]:
     """
     Standard vector similarity search returning LangChain Documents.
-    Maintains 100% backward compatibility with existing callers.
     """
     vector_store = load_project_index(project_id, organization_id)
     return vector_store.similarity_search(query, k=k)
@@ -47,7 +47,8 @@ def retrieve_project_context_with_scores(
     project_id: str,
     query: str,
     k: int = 4,
-    organization_id: Optional[str] = None,
+    *,
+    organization_id: str,
 ) -> List[Tuple[Document, float]]:
     """
     Retrieves project documents along with their similarity scores.
@@ -65,7 +66,8 @@ def retrieve_structured_context(
     project_id: str,
     query: str,
     k: int = 4,
-    organization_id: Optional[str] = None,
+    *,
+    organization_id: str,
 ) -> List[RetrievedDocumentView]:
     """
     Retrieves normalized, metadata-aware documents exposing:

@@ -347,14 +347,16 @@ class TestNodeFallbacks:
         from backend.schemas.planning import ExecutionPlan
 
         project_id = "consolidation_test_proj_xyz"
-        workspace_dir = tmp_path / "workspace" / project_id
+        # Namespaced under "default-org" to match state.get("organization_id",
+        # "default-org") - the resolver P0-3 introduced (resolve_workspace_path).
+        workspace_dir = tmp_path / "workspace" / "default-org" / project_id
         workspace_dir.mkdir(parents=True)
         content = "\n".join(f"## Section {i}\nBody text for section {i}.\n" for i in range(1, 60))
         (workspace_dir / "README.md").write_text(content, encoding="utf-8")
 
         # Force nodes.py's os.getcwd()-based fallback path to resolve into
         # this tmp workspace instead of the real repo's workspace/.
-        assert not (Path("workspace") / project_id).exists()
+        assert not (Path("workspace") / "default-org" / project_id).exists()
         monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
 
         monkeypatch.setattr(
@@ -408,14 +410,16 @@ class TestNodeFallbacks:
         from backend.schemas.planning import ExecutionPlan
 
         project_id = "tiny_readme_proj"
-        workspace_dir = tmp_path / "workspace" / project_id
+        # Namespaced under "default-org" to match state.get("organization_id",
+        # "default-org") - the resolver P0-3 introduced (resolve_workspace_path).
+        workspace_dir = tmp_path / "workspace" / "default-org" / project_id
         workspace_dir.mkdir(parents=True)
         # Exactly the real repository's README: 22 bytes, one line, no
         # trailing newline.
         original_content = "# agentic-ai-test-repo"
         (workspace_dir / "README.md").write_text(original_content, encoding="utf-8")
 
-        assert not (Path("workspace") / project_id).exists()
+        assert not (Path("workspace") / "default-org" / project_id).exists()
         monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
 
         monkeypatch.setattr(
@@ -482,11 +486,13 @@ class TestNodeFallbacks:
         from backend.schemas.planning import ExecutionPlan
 
         project_id = "whole_file_prompt_proj"
-        workspace_dir = tmp_path / "workspace" / project_id
+        # Namespaced under "default-org" to match state.get("organization_id",
+        # "default-org") - the resolver P0-3 introduced (resolve_workspace_path).
+        workspace_dir = tmp_path / "workspace" / "default-org" / project_id
         workspace_dir.mkdir(parents=True)
         (workspace_dir / "README.md").write_text("# agentic-ai-test-repo", encoding="utf-8")
 
-        assert not (Path("workspace") / project_id).exists()
+        assert not (Path("workspace") / "default-org" / project_id).exists()
         monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
 
         monkeypatch.setattr(
@@ -539,12 +545,14 @@ class TestNodeFallbacks:
         from backend.schemas.planning import ExecutionPlan
 
         project_id = "whole_file_empty_snippet_proj"
-        workspace_dir = tmp_path / "workspace" / project_id
+        # Namespaced under "default-org" to match state.get("organization_id",
+        # "default-org") - the resolver P0-3 introduced (resolve_workspace_path).
+        workspace_dir = tmp_path / "workspace" / "default-org" / project_id
         workspace_dir.mkdir(parents=True)
         original_content = "# agentic-ai-test-repo"
         (workspace_dir / "README.md").write_text(original_content, encoding="utf-8")
 
-        assert not (Path("workspace") / project_id).exists()
+        assert not (Path("workspace") / "default-org" / project_id).exists()
         monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
 
         monkeypatch.setattr(
@@ -599,9 +607,11 @@ class TestNodeFallbacks:
         import os
         from pathlib import Path
 
-        workspace_dir = tmp_path / "workspace" / project_id
+        # Namespaced under "default-org" to match state.get("organization_id",
+        # "default-org") - the resolver P0-3 introduced (resolve_workspace_path).
+        workspace_dir = tmp_path / "workspace" / "default-org" / project_id
         workspace_dir.mkdir(parents=True)
-        assert not (Path("workspace") / project_id).exists()
+        assert not (Path("workspace") / "default-org" / project_id).exists()
         monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
         return workspace_dir
 

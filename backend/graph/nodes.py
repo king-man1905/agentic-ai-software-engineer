@@ -6,6 +6,7 @@ from backend.observability.telemetry import collect_usage, invoke_structured, me
 from backend.observability.collector import telemetry_collector
 from backend.schemas.telemetry import TelemetryEventType
 from backend.graph.cancellation import check_cancelled, mark_activity
+from backend.vcs.workspace_paths import resolve_workspace_path
 
 from backend.agents.router import route_task
 from backend.agents.planner import create_plan
@@ -14,6 +15,27 @@ from backend.agents.developer import generate_code_changes
 from backend.agents.qa import review_code_changes
 
 from langgraph.types import interrupt
+
+
+def _resolve_project_path(state: AgentState):
+    """
+    Resolves the tenant-namespaced workspace path (workspace/<organization_id>/
+    <project_id>) for this run's state, or None when project_id is absent
+    or the (organization_id, project_id) pair doesn't resolve to a safe
+    path. Every node in this module that needs the run's own workspace
+    directory goes through this instead of constructing
+    Path("workspace") / project_id independently - callers already treat
+    a None/missing workspace path as "no repo context available", so this
+    preserves that exact existing fallback behavior for the read-only
+    context-lookup call sites; write sites (developer_node's patch write,
+    _materialize_developer_changes) additionally fail closed with an
+    explicit error when this returns None for a project_id that IS
+    present, since a write must never silently target nowhere.
+    """
+    project_id = state.get("project_id")
+    if not project_id:
+        return None
+    return resolve_workspace_path(state.get("organization_id", "default-org"), project_id)
 
 
 def router_node(state: AgentState) -> dict:
@@ -132,12 +154,8 @@ def planner_node(state: AgentState) -> dict:
             "tests": list(dict.fromkeys(c.file_path for c in repo_context if getattr(c, "symbol_type", "") == "test" or "test" in c.file_path.lower())),
         }
     elif state.get("project_id"):
-        import os
-        from pathlib import Path
-        project_path = Path("workspace") / state["project_id"]
-        if not project_path.exists():
-            project_path = Path(os.getcwd()) / "workspace" / state["project_id"]
-        if project_path.exists():
+        project_path = _resolve_project_path(state)
+        if project_path is not None and project_path.exists():
             try:
                 from backend.indexer.scanner import scan_repository
                 scanned = scan_repository(str(project_path))
@@ -188,8 +206,6 @@ def knowledge_node(state: AgentState) -> dict:
             "rag_status": "RAG_INSUFFICIENT_CONTEXT",
         }
 
-    import os
-    from pathlib import Path
     from backend.indexer.scanner import scan_repository
     from backend.indexer.ast_chunker import chunk_file
     from backend.indexer.retriever import SimpleBM25Index, HybridRetriever
@@ -198,12 +214,10 @@ def knowledge_node(state: AgentState) -> dict:
     from backend.schemas.rag import RAGTelemetry, RAGStatus
 
     sparse_candidates = []
-    project_path = Path("workspace") / project_id
-    if not project_path.exists():
-        project_path = Path(os.getcwd()) / "workspace" / project_id
+    project_path = _resolve_project_path(state)
 
     all_chunks = []
-    if project_path.exists():
+    if project_path is not None and project_path.exists():
         try:
             scanned_files = scan_repository(str(project_path))
             for sf in scanned_files:
@@ -224,11 +238,12 @@ def knowledge_node(state: AgentState) -> dict:
     # raises before assignment, so answer_from_project can tell "retrieval
     # genuinely failed" apart from "retrieval succeeded with zero matches"
     # and fall back to its own retrieval/error-handling accordingly.
+    organization_id = state.get("organization_id", "default-org")
     docs = None
     dense_candidates = []
     try:
         from backend.rag.retriever import load_project_index
-        vector_store = load_project_index(project_id)
+        vector_store = load_project_index(project_id, organization_id=organization_id)
         docs = vector_store.similarity_search(state["user_message"], k=20)
         for doc in docs:
             dense_candidates.append(
@@ -254,6 +269,7 @@ def knowledge_node(state: AgentState) -> dict:
             project_id=project_id,
             question=state["user_message"],
             documents=docs,
+            organization_id=organization_id,
         )
     except Exception as e:
         knowledge = KnowledgeAnswer(
@@ -383,47 +399,28 @@ def _safe_repo_relative_target(project_path, file_path: str):
     """
     Resolves an LLM-generated, repository-relative `file_path` to an
     absolute path strictly inside `project_path`, or returns None when it
-    is unsafe: empty, a '..' traversal, or absolute (POSIX '/', Windows
-    '\\', or drive-qualified like 'C:...'). Reuses the same traversal
-    check the policy engine already applies to patch paths
-    (backend/policy/path_filter.is_traversal_attack) rather than
-    re-implementing it.
+    is unsafe: empty, a '..' traversal, absolute, drive-qualified, or a
+    symlink that resolves outside `project_path`.
 
-    Used by _materialize_developer_changes (developer_node's and
-    revision_node's no-repo-context fallback write paths, which
-    materialize a full generated file directly from
-    DeveloperResult.changes - the exact-snippet LLM-patch path above it
-    already writes relative to a fixed workspace root via string
-    concatenation, not a caller-controlled join, so it isn't exposed to
-    this same risk).
+    Thin wrapper around the single shared containment check
+    (backend.policy.path_filter.safe_repo_relative_path) every LLM-
+    controlled file_path read/write site in this codebase must use -
+    kept here under its original name since call sites throughout this
+    module already reference it, but no longer duplicates the logic
+    itself.
     """
-    import re
-    from pathlib import Path
-    from backend.policy.path_filter import is_traversal_attack
+    from backend.policy.path_filter import safe_repo_relative_path
 
-    candidate = (file_path or "").strip()
-    if (
-        not candidate
-        or is_traversal_attack(candidate)
-        or candidate.startswith(("/", "\\"))
-        or re.match(r"^[a-zA-Z]:", candidate)
-        or Path(candidate).is_absolute()
-    ):
-        return None
-
-    resolved_root = project_path.resolve()
-    target = (project_path / candidate).resolve()
-    if target != resolved_root and resolved_root not in target.parents:
-        return None
-    return target
+    return safe_repo_relative_path(project_path, file_path)
 
 
-def _materialize_developer_changes(changes, project_id: str) -> list:
+def _materialize_developer_changes(changes, project_id: str, organization_id: str = "default-org") -> list:
     """
     Writes each non-empty FileChange directly to disk under
-    workspace/<project_id> and returns the corresponding FilePatch list,
-    using the same full-file-write convention as the exact-snippet patch
-    path (empty original_code_snippet - see backend/developer/patcher.py).
+    workspace/<organization_id>/<project_id> and returns the corresponding
+    FilePatch list, using the same full-file-write convention as the
+    exact-snippet patch path (empty original_code_snippet - see
+    backend/developer/patcher.py).
 
     Shared by developer_node's own no-repo-context fallback and
     revision_node's blind-revision fallback (when generate_revision_patches
@@ -433,15 +430,18 @@ def _materialize_developer_changes(changes, project_id: str) -> list:
 
     Invariant preserved: an effective (non-empty-content) change must
     either become a FilePatch or this call fails explicitly (ValueError) -
-    it must never silently vanish.
+    it must never silently vanish. The same applies if organization_id/
+    project_id don't resolve to a safe workspace path at all.
     """
     from backend.developer.models import FilePatch
-    import os
-    from pathlib import Path
 
-    project_path = Path("workspace") / project_id
-    if not project_path.exists():
-        project_path = Path(os.getcwd()) / "workspace" / project_id
+    project_path = resolve_workspace_path(organization_id, project_id)
+    if project_path is None:
+        raise ValueError(
+            f"Refusing to materialize generated changes: organization_id/"
+            f"project_id did not resolve to a safe workspace path for "
+            f"project '{project_id}'."
+        )
 
     patches = []
     for ch in changes:
@@ -557,13 +557,7 @@ def developer_node(state: AgentState) -> dict:
         # self-scan gate below - never inferred/defaulted, so consolidation
         # can't accidentally read a different project's workspace when
         # repo_context was supplied without a project_id.
-        project_path = None
-        if state.get("project_id"):
-            import os
-            from pathlib import Path
-            project_path = Path("workspace") / state["project_id"]
-            if not project_path.exists():
-                project_path = Path(os.getcwd()) / "workspace" / state["project_id"]
+        project_path = _resolve_project_path(state)
 
         if not repo_context and project_path is not None and project_path.exists():
             try:
@@ -629,16 +623,33 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
 
             # Perform AST pre-flight validation
             from backend.developer.patcher import SafePatcher
-            import os
-            from pathlib import Path
 
             for patch in patches:
                 project_id = state.get("project_id", "test_project")
-                project_path = Path("workspace") / project_id
-                if not project_path.exists():
-                    project_path = Path(os.getcwd()) / "workspace" / project_id
+                project_path = resolve_workspace_path(
+                    state.get("organization_id", "default-org"), project_id
+                )
+                if project_path is None:
+                    raise ValueError(
+                        f"Refusing to apply generated patch: organization_id/"
+                        f"project_id did not resolve to a safe workspace path "
+                        f"for project '{project_id}'."
+                    )
 
-                abs_file_path = project_path / patch.file_path
+                # SECURITY: patch.file_path is LLM-controlled. Every
+                # filesystem access it drives must be contained inside
+                # project_path - never a raw project_path / patch.file_path
+                # join, which a '../' or absolute path (or a symlink inside
+                # the cloned repo) could escape. An unsafe path fails this
+                # patch explicitly rather than silently skipping it or
+                # falling back to writing anywhere.
+                abs_file_path = _safe_repo_relative_target(project_path, patch.file_path)
+                if abs_file_path is None:
+                    raise ValueError(
+                        f"Refusing to apply generated patch: "
+                        f"'{patch.file_path}' is not a safe repository-relative path."
+                    )
+
                 source_content = ""
                 if abs_file_path.exists():
                     try:
@@ -652,8 +663,9 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
                     raise ValueError(
                         f"AST pre-flight validation failed for {patch.file_path}: {val_result.syntax_errors}"
                     )
-                if val_result.applied_content is not None and abs_file_path.parent.exists():
+                if val_result.applied_content is not None:
                     try:
+                        abs_file_path.parent.mkdir(parents=True, exist_ok=True)
                         with open(abs_file_path, "w", encoding="utf-8") as f:
                             f.write(val_result.applied_content)
                     except Exception as e:
@@ -662,7 +674,9 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
 
         if not generated_patches and developer_result and developer_result.changes:
             generated_patches = _materialize_developer_changes(
-                developer_result.changes, state.get("project_id", "test_project")
+                developer_result.changes,
+                state.get("project_id", "test_project"),
+                state.get("organization_id", "default-org"),
             )
 
 
@@ -718,14 +732,15 @@ def qa_node(state: AgentState) -> dict:
     )
 
     project_id = state.get("project_id", "test_project")
-    import os
-    from pathlib import Path
     from backend.qa.pipeline import QualityPipeline
     from backend.qa.judge import StructuredQAJudge
 
-    project_path = Path("workspace") / project_id
-    if not project_path.exists():
-        project_path = Path(os.getcwd()) / "workspace" / project_id
+    project_path = resolve_workspace_path(state.get("organization_id", "default-org"), project_id)
+    if project_path is None:
+        raise ValueError(
+            f"Refusing to run QA: organization_id/project_id did not "
+            f"resolve to a safe workspace path for project '{project_id}'."
+        )
 
     patches = state.get("generated_patches") or []
 
@@ -906,6 +921,7 @@ def revision_node(state: AgentState) -> dict:
                     repo_context=repo_context,
                     revision_history=revision_history,
                     project_id=state.get("project_id", "test_project"),
+                    organization_id=state.get("organization_id", "default-org"),
                 )
                 if revised_patches:
                     generated_patches = revised_patches
@@ -925,7 +941,9 @@ def revision_node(state: AgentState) -> dict:
         # be empty and this fallback would never run.
         if not context_aware_patch_produced and revised_result and revised_result.changes:
             generated_patches = _materialize_developer_changes(
-                revised_result.changes, state.get("project_id", "test_project")
+                revised_result.changes,
+                state.get("project_id", "test_project"),
+                state.get("organization_id", "default-org"),
             )
 
     # 7. Record this revision attempt with structured telemetry
@@ -999,19 +1017,14 @@ def git_prepare_node(state: AgentState) -> dict:
     mark_activity(state, "git_prepare")
     from backend.vcs.git_manager import GitWorkspaceManager
     from backend.vcs.models import GitDiffSummary
-    import os
-    from pathlib import Path
 
     patches = state.get("generated_patches") or []
     project_id = state.get("project_id", "test_project")
     task_id = state.get("run_id") or project_id
 
+    project_path = resolve_workspace_path(state.get("organization_id", "default-org"), project_id)
 
-    project_path = Path("workspace") / project_id
-    if not project_path.exists():
-        project_path = Path(os.getcwd()) / "workspace" / project_id
-
-    if not patches or not project_path.exists():
+    if not patches or project_path is None or not project_path.exists():
         # No patches to stage or no workspace; produce an empty diff summary
         branch_name = GitWorkspaceManager.generate_branch_name(task_id)
         empty_hash = GitWorkspaceManager.compute_patch_hash("")
@@ -1200,27 +1213,53 @@ def approval_node(state: AgentState) -> dict:
         rejection_reason = decision if isinstance(decision, str) else "Rejected by reviewer."
         approval = ApprovalDecision(approved=False, rejection_reason=rejection_reason)
 
-    # Cryptographic Approval Integrity Check:
-    # If the approval decision explicitly specifies a patch_hash and it does not match
-    # the staged diff's hash, mark approval invalid and reject publication.
-    if approval.approved and approval.patch_hash and patch_hash:
-        if approval.patch_hash != patch_hash:
-            approval = ApprovalDecision(
-                approved=False,
-                reviewer=approval.reviewer,
-                rejection_reason=(
-                    f"PATCH_HASH_MISMATCH: Approved diff hash '{approval.patch_hash}' "
-                    f"does not match staged diff hash '{patch_hash}'."
-                ),
-                patch_hash=approval.patch_hash,
-                timestamp=approval.timestamp,
-                reviewer_role=approval.reviewer_role,
-                user_id=approval.user_id,
+    # Cryptographic Approval Integrity Check (fail-closed):
+    # An approval can only proceed when there IS a real, non-no-op diff,
+    # that diff has a hash, the reviewer's decision carries a hash, and the
+    # two match exactly. Any missing piece rejects the approval outright -
+    # previously, a decision that simply omitted patch_hash skipped this
+    # entire check (`approval.patch_hash and patch_hash` were both
+    # required to be truthy just to *enter* the comparison), silently
+    # treating "no hash submitted" the same as "hash verified". That is
+    # the opposite of fail-closed and is deliberately not preserved.
+    def _reject_for_hash_integrity(reason_code: str, detail: str) -> dict:
+        rejected = ApprovalDecision(
+            approved=False,
+            reviewer=approval.reviewer,
+            rejection_reason=f"{reason_code}: {detail}",
+            patch_hash=approval.patch_hash,
+            timestamp=approval.timestamp,
+            reviewer_role=approval.reviewer_role,
+            user_id=approval.user_id,
+        )
+        return {
+            "approval": rejected,
+            "approval_status": reason_code,
+        }
+
+    if approval.approved:
+        if git_diff is None or git_diff.is_no_op:
+            return _reject_for_hash_integrity(
+                "NO_OP_OR_MISSING_DIFF",
+                "There is no non-empty diff staged for this run to approve.",
             )
-            return {
-                "approval": approval,
-                "approval_status": "PATCH_HASH_MISMATCH",
-            }
+        if not patch_hash:
+            return _reject_for_hash_integrity(
+                "MISSING_DIFF_HASH",
+                "The staged diff has no patch_hash to bind this approval to.",
+            )
+        if not approval.patch_hash:
+            return _reject_for_hash_integrity(
+                "MISSING_APPROVAL_PATCH_HASH",
+                "The approval decision did not submit a patch_hash to verify "
+                "against the staged diff.",
+            )
+        if approval.patch_hash != patch_hash:
+            return _reject_for_hash_integrity(
+                "PATCH_HASH_MISMATCH",
+                f"Approved diff hash '{approval.patch_hash}' does not match "
+                f"staged diff hash '{patch_hash}'.",
+            )
 
     # RBAC Authorization Check:
     if approval.approved and approval.reviewer_role:
@@ -1301,8 +1340,6 @@ def git_commit_node(state: AgentState) -> dict:
     check_cancelled(state)
     mark_activity(state, "git_commit")
     from backend.vcs.git_manager import GitWorkspaceManager
-    import os
-    from pathlib import Path
 
     git_diff = state.get("git_diff")
     if git_diff is None or git_diff.is_no_op:
@@ -1311,9 +1348,12 @@ def git_commit_node(state: AgentState) -> dict:
         }
 
     project_id = state.get("project_id", "test_project")
-    project_path = Path("workspace") / project_id
-    if not project_path.exists():
-        project_path = Path(os.getcwd()) / "workspace" / project_id
+    project_path = resolve_workspace_path(state.get("organization_id", "default-org"), project_id)
+    if project_path is None:
+        raise ValueError(
+            f"Refusing to commit: organization_id/project_id did not "
+            f"resolve to a safe workspace path for project '{project_id}'."
+        )
 
     # Pre-commit drift and tamper verification:
     # Ensure working tree diff still matches the approved patch_hash
@@ -1373,21 +1413,18 @@ def cleanup_node(state: AgentState) -> dict:
     """
     from backend.vcs.git_manager import GitWorkspaceManager
     from backend.schemas.policy import PolicyDecision
-    import os
-    from pathlib import Path
 
     git_diff = state.get("git_diff")
     project_id = state.get("project_id", "test_project")
-    project_path = Path("workspace") / project_id
-    if not project_path.exists():
-        project_path = Path(os.getcwd()) / "workspace" / project_id
+    project_path = resolve_workspace_path(state.get("organization_id", "default-org"), project_id)
 
     branch_name = git_diff.branch_name if git_diff else "agent/task-unknown"
 
-    GitWorkspaceManager.cleanup_branch(
-        repo_path=str(project_path),
-        branch_name=branch_name,
-    )
+    if project_path is not None:
+        GitWorkspaceManager.cleanup_branch(
+            repo_path=str(project_path),
+            branch_name=branch_name,
+        )
 
     approval = state.get("approval")
     policy_result = state.get("policy_result")

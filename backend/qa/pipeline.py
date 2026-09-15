@@ -8,8 +8,9 @@ from typing import Callable, List, Optional, Tuple
 
 from backend.developer.models import FilePatch
 from backend.developer.patcher import SafePatcher
+from backend.policy.path_filter import safe_repo_relative_path
 from backend.sandbox.models import TestExecutionResult
-from backend.sandbox.runner import SandboxRunner, get_sandbox_env
+from backend.sandbox.runner import SandboxRunner, get_sandbox_env, isolated_workspace
 from backend.schemas.qa import FailureCategory, QualityCheck, QualityCheckStatus
 
 
@@ -63,8 +64,19 @@ class QualityPipeline:
         has_patch_preflight_failure = False
 
         for patch in patches:
-            abs_path = repo / patch.file_path
+            # SECURITY: patch.file_path is LLM-controlled - contained the
+            # same way every other read/write site in this codebase must
+            # be. An unsafe path is treated as a patch pre-flight failure
+            # (surfaces as a normal QA FAIL, routing to revision/rejection)
+            # rather than being read from wherever it might actually point.
+            abs_path = safe_repo_relative_path(repo, patch.file_path)
             source = ""
+            if abs_path is None:
+                syntax_errors.append(
+                    f"{patch.file_path}: not a safe repository-relative path."
+                )
+                has_patch_preflight_failure = True
+                continue
             if abs_path.exists():
                 try:
                     with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -413,25 +425,54 @@ class QualityPipeline:
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Tuple[List[QualityCheck], Optional[TestExecutionResult]]:
         """
-        Executes all configured quality checks in sequence.
-        Returns the list of QualityCheck items and the raw TestExecutionResult.
+        Executes all configured quality checks. Order matters for safety,
+        not just reporting:
+
+        1. check_ast       - syntax-only preflight, no execution.
+        2. check_security  - static AST/regex scan of the patch content
+                              itself (in-memory, no execution) - runs
+                              BEFORE anything is executed, not after.
+        3. Only if check_security passes: check_pytest, check_lint,
+           check_typecheck - the only checks that actually execute code -
+           run inside a disposable copy of repo_path (isolated_workspace),
+           never against the persistent, git-tracked workspace itself.
+           If check_security fails, all three are skipped outright rather
+           than executed anyway and merely reported alongside the failure.
+
+        repo_path remains the sole source of truth for the proposed diff/
+        commit throughout - only the copy used for execution is disposable;
+        nothing written by pytest/lint/typecheck can reach it.
         """
         files = [p.file_path for p in patches]
 
-        # 1. AST Validation
+        # 1. AST Validation - reads repo_path, executes nothing.
         ast_check = cls.check_ast(repo_path, patches)
 
-        # 2. Pytest Execution
-        pytest_check, test_result = cls.check_pytest(repo_path, timeout=timeout, cancel_check=cancel_check)
-
-        # 3. Static Security Scan
+        # 2. Static Security Scan - in-memory only, executes nothing.
+        # Deliberately runs before any execution-based check: it must be
+        # able to block them, not just be reported alongside them.
         security_check = cls.check_security(repo_path, patches)
 
-        # 4. Optional Linting (ruff / flake8)
-        lint_check = cls.check_lint(repo_path, files)
+        if security_check.status == QualityCheckStatus.FAIL.value:
+            blocked_reason = "BLOCKED_BY_SECURITY_GATE: static security scan failed; execution was not attempted."
+            skipped = lambda name: QualityCheck(
+                name=name,
+                status=QualityCheckStatus.SKIPPED.value,
+                exit_code=0,
+                duration_ms=0,
+                reason=blocked_reason,
+            )
+            all_checks = [ast_check, skipped("pytest"), security_check, skipped("lint"), skipped("typecheck")]
+            return all_checks, None
 
-        # 5. Optional Type Checking (mypy)
-        type_check = cls.check_typecheck(repo_path, files)
+        # 3. Execution-based checks run inside a disposable copy of
+        # repo_path - never directly against the persistent workspace.
+        with isolated_workspace(repo_path) as sandbox_dir:
+            pytest_check, test_result = cls.check_pytest(
+                sandbox_dir, timeout=timeout, cancel_check=cancel_check
+            )
+            lint_check = cls.check_lint(sandbox_dir, files)
+            type_check = cls.check_typecheck(sandbox_dir, files)
 
         all_checks = [ast_check, pytest_check, security_check, lint_check, type_check]
         return all_checks, test_result

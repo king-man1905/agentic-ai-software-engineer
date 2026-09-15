@@ -2,6 +2,7 @@ import fnmatch
 import os
 import posixpath
 import re
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 
@@ -41,6 +42,41 @@ def normalize_path(path_str: str) -> str:
         normalized = ""
 
     return normalized
+
+
+def safe_repo_relative_path(root: "Path", candidate_path: str) -> Optional["Path"]:
+    """
+    Resolves an LLM-generated, repository-relative `candidate_path` to an
+    absolute path strictly inside `root`, or returns None when it is
+    unsafe: empty, a '..' traversal, or absolute (POSIX '/', Windows '\\',
+    or drive-qualified like 'C:...').
+
+    This is the single shared containment check every call site that joins
+    a workspace/project root with an LLM-controlled file_path must use -
+    never a naive string-prefix comparison, which is not symlink-safe.
+    Both `root` and the candidate join are resolved via Path.resolve()
+    (which follows symlinks) before the containment check runs, so a
+    pre-existing symlink inside the workspace that points outside it is
+    correctly rejected too, not just a literal '../' token.
+
+    Callers MUST treat a None return as a hard failure: refuse to read or
+    write anything, and never fall back to a different (unvalidated) path.
+    """
+    candidate = (candidate_path or "").strip()
+    if (
+        not candidate
+        or is_traversal_attack(candidate)
+        or candidate.startswith(("/", "\\"))
+        or re.match(r"^[a-zA-Z]:", candidate)
+        or Path(candidate).is_absolute()
+    ):
+        return None
+
+    resolved_root = root.resolve()
+    target = (root / candidate).resolve()
+    if target != resolved_root and resolved_root not in target.parents:
+        return None
+    return target
 
 
 def matches_protected_path(

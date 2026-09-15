@@ -13,6 +13,8 @@ def answer_from_project(
     question: str,
     k: int = 4,
     documents: Optional[List[Document]] = None,
+    *,
+    organization_id: str,
 ) -> KnowledgeAnswer:
     """
     Answers a question using project context. If `documents` is already
@@ -21,12 +23,17 @@ def answer_from_project(
     reused directly instead of loading the vector index and re-running an
     identical similarity search a second time. Pass None (the default) to
     have this function perform its own retrieval, as before.
+
+    organization_id is mandatory even when documents is supplied, matching
+    the tenant-scoped vector store's own fail-closed contract - a caller
+    that got here from a real run always has one.
     """
     if documents is None:
         documents = retrieve_project_context(
             project_id=project_id,
             query=question,
             k=k,
+            organization_id=organization_id,
         )
     else:
         documents = documents[:k]
