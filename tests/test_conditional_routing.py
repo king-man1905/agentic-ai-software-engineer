@@ -474,10 +474,19 @@ class TestNodeFallbacks:
     def test_developer_node_prompt_instructs_empty_snippet_for_whole_file(self, tmp_path, monkeypatch):
         """
         Root-cause fix regression test: the patch-generation prompt must
-        explicitly tell the model to use the empty-original_code_snippet
-        whole-file-replace convention for [COMPLETE FILE CONTENT] blocks -
-        never ask it to quote/copy the existing content as an anchor,
-        which is what produced non-matching snippets in practice.
+        still document the empty-original_code_snippet whole-file-replace
+        convention for [COMPLETE FILE CONTENT] blocks, for when it's
+        actually appropriate (an explicit rewrite request).
+
+        Superseded in one respect by a later fix: the prompt no longer
+        unconditionally pushes every [COMPLETE FILE CONTENT] file toward
+        that convention - doing so let the model reach for a full rewrite
+        even for purely additive requests ("add a section"), replacing
+        most of the file instead of inserting into it. For an additive
+        request the prompt now asks for a short anchor "copied verbatim"
+        from the shown content (still never invented/paraphrased, which is
+        the original mismatched-snippet failure mode this test guards
+        against) rather than "do not quote anything at all".
         """
         import os
         from pathlib import Path
@@ -526,7 +535,12 @@ class TestNodeFallbacks:
         assert "[COMPLETE FILE CONTENT - verbatim, nothing omitted]" in prompt
         assert 'set original_code_snippet to an empty string ("")' in prompt
         assert 'replace the entire file with updated_code_snippet' in prompt
-        assert "Do NOT quote, copy, or paraphrase" in prompt
+        # The whole-file convention is still documented, but only for an
+        # explicit rewrite - never as the default just because the file
+        # was shown in full (that default is exactly what over-deleted the
+        # real README in production).
+        assert "explicitly asks to rewrite" in prompt
+        assert "copied verbatim" in prompt
 
     def test_developer_node_whole_file_empty_snippet_patch_applies_successfully(self, tmp_path, monkeypatch):
         """

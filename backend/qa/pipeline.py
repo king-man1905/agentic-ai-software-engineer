@@ -131,6 +131,88 @@ class QualityPipeline:
         )
 
     @classmethod
+    def check_patch_scope(
+        cls,
+        repo_path: str,
+        patches: List[FilePatch],
+        user_request: str = "",
+    ) -> QualityCheck:
+        """
+        Deterministic guard (backend/developer/patch_scope.py): for an
+        additive request, rejects a patch that deletes a large fraction of
+        an existing non-Python file's original content instead of
+        preserving it, unless the user explicitly asked for a rewrite.
+
+        Never applies to .py files: developer_node's exact-snippet prompt
+        for Python files is built from AST-fragment context, never a
+        whole-file view (see backend/indexer/ast_chunker.py's
+        whole_file_chunk_for_patch_context, which explicitly excludes .py),
+        so this specific failure mode cannot occur there.
+        """
+        from backend.developer.patch_scope import detect_unsafe_additive_rewrite
+
+        start = time.time()
+        if not patches or not user_request:
+            return QualityCheck(
+                name="patch_scope",
+                status=QualityCheckStatus.PASS.value,
+                exit_code=0,
+                duration_ms=int((time.time() - start) * 1000),
+                stdout_summary="No patches or no user request to evaluate.",
+            )
+
+        repo = Path(repo_path)
+        violations = []
+
+        for patch in patches:
+            if patch.file_path.lower().endswith(".py"):
+                continue
+
+            abs_path = safe_repo_relative_path(repo, patch.file_path)
+            if abs_path is None or not abs_path.exists():
+                continue
+
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+                    original = f.read()
+            except Exception:
+                continue
+
+            result = SafePatcher.apply_patch(original, patch)
+            if not result.is_valid or result.applied_content is None:
+                # Already reported (or will be) by check_ast - not this
+                # check's concern.
+                continue
+
+            reason = detect_unsafe_additive_rewrite(user_request, original, result.applied_content)
+            if reason:
+                violations.append(f"{patch.file_path}: {reason}")
+
+        duration_ms = int((time.time() - start) * 1000)
+
+        if violations:
+            return QualityCheck(
+                name="patch_scope",
+                status=QualityCheckStatus.FAIL.value,
+                exit_code=1,
+                duration_ms=duration_ms,
+                stderr_summary="\n".join(violations),
+                reason=(
+                    "Additive request produced a patch that deletes most of "
+                    "an existing file's content instead of preserving it."
+                ),
+                category=FailureCategory.PATCH_APPLICATION_FAILURE.value,
+            )
+
+        return QualityCheck(
+            name="patch_scope",
+            status=QualityCheckStatus.PASS.value,
+            exit_code=0,
+            duration_ms=duration_ms,
+            stdout_summary="No unsafe additive-rewrite patches detected.",
+        )
+
+    @classmethod
     def check_pytest(
         cls,
         repo_path: str,
@@ -423,16 +505,19 @@ class QualityPipeline:
         patches: List[FilePatch],
         timeout: float = 30.0,
         cancel_check: Optional[Callable[[], bool]] = None,
+        user_request: str = "",
     ) -> Tuple[List[QualityCheck], Optional[TestExecutionResult]]:
         """
         Executes all configured quality checks. Order matters for safety,
         not just reporting:
 
-        1. check_ast       - syntax-only preflight, no execution.
-        2. check_security  - static AST/regex scan of the patch content
-                              itself (in-memory, no execution) - runs
-                              BEFORE anything is executed, not after.
-        3. Only if check_security passes: check_pytest, check_lint,
+        1. check_ast         - syntax-only preflight, no execution.
+        2. check_patch_scope - deterministic additive-vs-rewrite deletion
+                                guard (in-memory diff, no execution).
+        3. check_security    - static AST/regex scan of the patch content
+                                itself (in-memory, no execution) - runs
+                                BEFORE anything is executed, not after.
+        4. Only if check_security passes: check_pytest, check_lint,
            check_typecheck - the only checks that actually execute code -
            run inside a disposable copy of repo_path (isolated_workspace),
            never against the persistent, git-tracked workspace itself.
@@ -448,7 +533,11 @@ class QualityPipeline:
         # 1. AST Validation - reads repo_path, executes nothing.
         ast_check = cls.check_ast(repo_path, patches)
 
-        # 2. Static Security Scan - in-memory only, executes nothing.
+        # 2. Deterministic additive-vs-rewrite scope guard - in-memory
+        # diff only, executes nothing.
+        scope_check = cls.check_patch_scope(repo_path, patches, user_request=user_request)
+
+        # 3. Static Security Scan - in-memory only, executes nothing.
         # Deliberately runs before any execution-based check: it must be
         # able to block them, not just be reported alongside them.
         security_check = cls.check_security(repo_path, patches)
@@ -462,10 +551,10 @@ class QualityPipeline:
                 duration_ms=0,
                 reason=blocked_reason,
             )
-            all_checks = [ast_check, skipped("pytest"), security_check, skipped("lint"), skipped("typecheck")]
+            all_checks = [ast_check, skipped("pytest"), security_check, skipped("lint"), skipped("typecheck"), scope_check]
             return all_checks, None
 
-        # 3. Execution-based checks run inside a disposable copy of
+        # 4. Execution-based checks run inside a disposable copy of
         # repo_path - never directly against the persistent workspace.
         with isolated_workspace(repo_path) as sandbox_dir:
             pytest_check, test_result = cls.check_pytest(
@@ -474,5 +563,5 @@ class QualityPipeline:
             lint_check = cls.check_lint(sandbox_dir, files)
             type_check = cls.check_typecheck(sandbox_dir, files)
 
-        all_checks = [ast_check, pytest_check, security_check, lint_check, type_check]
+        all_checks = [ast_check, pytest_check, security_check, lint_check, type_check, scope_check]
         return all_checks, test_result

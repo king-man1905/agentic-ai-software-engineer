@@ -608,7 +608,12 @@ STRUCTURED REPOSITORY CONTEXT:
 
 Return a list of precise FilePatches. For each patch, provide the file path, the exact original code snippet to be replaced, and the updated code snippet.
 
-For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitted], that block IS the file's entire current content. Do NOT quote, copy, or paraphrase any part of it into original_code_snippet. Instead, set original_code_snippet to an empty string ("") and put the file's complete new content - the whole file, not just the changed part - in updated_code_snippet. An empty original_code_snippet always means "replace the entire file with updated_code_snippet".
+Modify ONLY what the user's request actually asks for. Preserve all unrelated existing content exactly as shown - do not rewrite, reformat, reorder, or paraphrase any part of a file the user did not ask you to change, and do not remove existing sections.
+
+For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitted], that block IS the file's entire current content.
+
+- If the request is additive (e.g. "add", "append", "insert", "add a section", "update section") and does NOT explicitly ask for a rewrite, replacement, restructuring, or regeneration of the file: do NOT use the whole-file convention below. Instead, quote a short, exact anchor copied verbatim from the shown content (e.g. the file's last few lines, or an existing heading) as original_code_snippet, and set updated_code_snippet to that same anchor plus only the new content - so every other part of the file is left byte-for-byte untouched.
+- Only when the user explicitly asks to rewrite, replace, completely restructure, or regenerate the file should you use the whole-file convention: set original_code_snippet to an empty string ("") and put the file's complete new content - the whole file, not just the changed part - in updated_code_snippet. An empty original_code_snippet always means "replace the entire file with updated_code_snippet" - use it deliberately, never as a default just because the complete file was shown to you.
 """
             from backend.services.llm import get_llm
             from backend.developer.models import FilePatch
@@ -756,6 +761,7 @@ def qa_node(state: AgentState) -> dict:
         patches=patches,
         timeout=30.0,
         cancel_check=cancel_check,
+        user_request=state["user_message"],
     )
 
     # 3. Structured QA Judge Evaluation with Strict Objective Priority

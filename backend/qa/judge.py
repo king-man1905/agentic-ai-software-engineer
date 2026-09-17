@@ -42,6 +42,7 @@ class StructuredQAJudge:
         security_check = check_map.get("security")
         lint_check = check_map.get("lint")
         type_check = check_map.get("typecheck")
+        scope_check = check_map.get("patch_scope")
 
         failed_checks: List[QualityCheck] = [
             c for c in checks if c.status == QualityCheckStatus.FAIL.value
@@ -102,6 +103,35 @@ class StructuredQAJudge:
                 failure_category=result_category,
                 issues=issues,
                 summary=f"{summary_prefix}\n{ast_check.stderr_summary}",
+            )
+
+        # Rule B2: Deterministic additive-vs-rewrite patch-scope guard
+        # (backend/developer/patch_scope.py via QualityPipeline.check_patch_scope).
+        # Evaluated from the actual request text and diff, never an LLM
+        # judgment - and, like Rules A/B/C, this can never be overridden by
+        # an optimistic LLM advisory review (see the real-world bug this
+        # guards against: an additive "add an E2E Test section" request
+        # that replaced ~90% of an existing README, which the LLM QA
+        # reviewer incorrectly reported as PASS).
+        if scope_check and scope_check.status == QualityCheckStatus.FAIL.value:
+            issues.append(
+                QAIssue(
+                    file_path="patch_scope",
+                    issue=scope_check.stderr_summary or "Additive request produced a destructive patch.",
+                    severity="HIGH",
+                )
+            )
+            return QAResult(
+                status="FAIL",
+                confidence=0.15,
+                regression_risk="HIGH",
+                checks=checks,
+                failure_category=FailureCategory.PATCH_APPLICATION_FAILURE.value,
+                issues=issues,
+                summary=(
+                    "Quality Gate FAILED: Additive request produced a patch that deletes most "
+                    f"of an existing file's content instead of preserving it.\n{scope_check.stderr_summary}"
+                ),
             )
 
         # Rule C: Pytest execution failure (LLM can NEVER override this)
