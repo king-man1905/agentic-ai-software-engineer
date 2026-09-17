@@ -148,6 +148,48 @@ def _infer_provider(llm: Any) -> str:
     return (LLM_PROVIDER or "nvidia").lower()
 
 
+def _invoke_nvidia_single_format_structured(llm: Any, schema: Any, prompt: str) -> Any:
+    """
+    Single-round-trip structured-output attempt for NVIDIA gpt-oss models.
+
+    Binds the OpenAI-compatible `response_format` json_schema parameter -
+    the exact same request field ChatNVIDIA.with_structured_output() uses
+    as its primary format for hosted endpoints internally, via the same
+    public `.bind()` mechanism Runnable already exposes - then parses the
+    JSON from the response using this module's own extraction/validation.
+    Returns None (never raises) on an empty or unparseable completion, so
+    the caller's existing empty-completion / malformed-JSON handling in
+    `_invoke_single_provider` applies exactly as it does for any other
+    provider, without duplicating that classification logic here.
+    """
+    import re
+
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": getattr(schema, "__name__", "response"),
+            "schema": schema.model_json_schema(),
+            "strict": True,
+        },
+    }
+    # Only the network call itself is left free to raise: a timeout, 5xx, or
+    # rate limit here is a real failure the caller needs to see immediately
+    # (see the caller's comment on why it isn't swallowed). A response that
+    # arrives but is empty or fails schema validation is this function's own
+    # "didn't work" outcome, not the caller's problem to classify - it's
+    # reported back as None, same as any other unusable completion.
+    raw = llm.bind(response_format=response_format).invoke(prompt)
+    if not raw.content or not raw.content.strip():
+        return None
+    match = re.search(r"\{.*\}", raw.content, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return schema.model_validate_json(match.group(0))
+    except Exception:
+        return None
+
+
 def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
     """
     Performs the structured output invocation against a single provider instance.
@@ -165,6 +207,26 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
 
     model_name = getattr(llm, "model", None) or getattr(llm, "model_name", "unknown")
     schema_name = getattr(schema, "__name__", str(schema))
+    # ChatNVIDIA.with_structured_output(), for hosted endpoints, always
+    # tries up to 3 request formats in sequence (OpenAI response_format,
+    # then guided_json direct, then guided_json via nvext) whenever a
+    # format's parser can't build the schema object - see the installed
+    # langchain-nvidia-ai-endpoints==1.4.3 source, whose own docstring
+    # calls formats 2-3 "mostly defensive" since format 1 is "expected to
+    # succeed" for hosted models. For openai/gpt-oss-* specifically, an
+    # empty completion (the model itself produced nothing, not a
+    # format-compatibility problem) makes all 3 formats fail identically,
+    # so the caller pays for 3 full round-trips - confirmed on real
+    # hardware to take up to ~130s - before this function's own raw-invoke
+    # fallback further below even runs. Binding the same primary
+    # response_format directly (via the standard, public `.bind()`
+    # mechanism the library itself uses internally) gets the identical
+    # "expected to succeed" attempt in a single call, so an empty
+    # completion is discovered - and classified as LLMMalformedResponseError
+    # by the unchanged logic below - without the other two redundant
+    # attempts. Gated strictly to NVIDIA gpt-oss models; every other
+    # provider/model keeps the original with_structured_output() path.
+    is_nvidia_gpt_oss = _infer_provider(llm) == "nvidia" and "gpt-oss" in str(model_name).lower()
     print(f"[LLM] Requesting structured output for {schema_name} from {model_name}...", flush=True)
     t0 = time.time()
 
@@ -178,14 +240,31 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
                 if "guided_json" in str(inner_exc) or "[400]" in str(inner_exc):
                     pass
                 elif isinstance(inner_exc, NotImplementedError):
-                    try:
-                        structured = llm.with_structured_output(schema)
-                        res = structured.invoke(prompt)
+                    if is_nvidia_gpt_oss:
+                        # Deliberately NOT wrapped in a swallowing
+                        # try/except like the branch below: a genuine
+                        # network failure (timeout, 5xx, rate limit) here
+                        # must propagate immediately so it gets classified
+                        # and can trigger the safe provider fallback below,
+                        # rather than being silently discarded and paying
+                        # for a second, likely-equally-slow direct-invoke
+                        # attempt. Only an empty/malformed *response*
+                        # (returned as None, not raised) falls through to
+                        # that direct-invoke fallback - the same graceful
+                        # degradation every other provider already gets.
+                        res = _invoke_nvidia_single_format_structured(llm, schema, prompt)
                         if res is not None:
                             print(f"[LLM] Response received in {time.time()-t0:.2f}s", flush=True)
                             return res
-                    except Exception:
-                        pass
+                    else:
+                        try:
+                            structured = llm.with_structured_output(schema)
+                            res = structured.invoke(prompt)
+                            if res is not None:
+                                print(f"[LLM] Response received in {time.time()-t0:.2f}s", flush=True)
+                                return res
+                        except Exception:
+                            pass
                 else:
                     raise inner_exc
 
