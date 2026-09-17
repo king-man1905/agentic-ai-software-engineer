@@ -81,7 +81,7 @@ def _mock_offline_graph_dependencies(monkeypatch):
     )
     monkeypatch.setattr(
         "backend.qa.pipeline.QualityPipeline.run_all",
-        lambda repo_path, patches, timeout=30.0, cancel_check=None, user_request="": ([], None),
+        lambda repo_path, patches, timeout=30.0, cancel_check=None, user_request="", original_file_snapshots=None: ([], None),
     )
     monkeypatch.setattr(
         "backend.agents.developer.revise_code_changes",

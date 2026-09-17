@@ -136,6 +136,7 @@ class QualityPipeline:
         repo_path: str,
         patches: List[FilePatch],
         user_request: str = "",
+        original_file_snapshots: Optional[dict] = None,
     ) -> QualityCheck:
         """
         Deterministic guard (backend/developer/patch_scope.py): for an
@@ -148,6 +149,19 @@ class QualityPipeline:
         whole-file view (see backend/indexer/ast_chunker.py's
         whole_file_chunk_for_patch_context, which explicitly excludes .py),
         so this specific failure mode cannot occur there.
+
+        `original_file_snapshots` (file_path -> content immediately before
+        the patch was written - see developer_node/revision_node) MUST be
+        preferred over a fresh disk read when available: by the time
+        qa_node runs, developer_node has typically already written the
+        patched result to repo_path, so re-reading the file from disk here
+        would just compare the patched content against itself and always
+        report 0% deletion - this was the exact discrepancy that let a
+        real ~83%-deletion patch through as "PASS" (patch_scope was
+        unit-tested only against never-yet-mutated tmp_path fixtures,
+        which don't reproduce that write-then-check ordering). Falls back
+        to reading from disk only when no snapshot was recorded for that
+        file (e.g. a caller/test that never wrote to repo_path first).
         """
         from backend.developer.patch_scope import detect_unsafe_additive_rewrite
 
@@ -168,15 +182,19 @@ class QualityPipeline:
             if patch.file_path.lower().endswith(".py"):
                 continue
 
-            abs_path = safe_repo_relative_path(repo, patch.file_path)
-            if abs_path is None or not abs_path.exists():
-                continue
-
-            try:
-                with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
-                    original = f.read()
-            except Exception:
-                continue
+            original = None
+            has_snapshot = original_file_snapshots is not None and patch.file_path in original_file_snapshots
+            if has_snapshot:
+                original = original_file_snapshots[patch.file_path]
+            else:
+                abs_path = safe_repo_relative_path(repo, patch.file_path)
+                if abs_path is None or not abs_path.exists():
+                    continue
+                try:
+                    with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+                        original = f.read()
+                except Exception:
+                    continue
 
             result = SafePatcher.apply_patch(original, patch)
             if not result.is_valid or result.applied_content is None:
@@ -506,6 +524,7 @@ class QualityPipeline:
         timeout: float = 30.0,
         cancel_check: Optional[Callable[[], bool]] = None,
         user_request: str = "",
+        original_file_snapshots: Optional[dict] = None,
     ) -> Tuple[List[QualityCheck], Optional[TestExecutionResult]]:
         """
         Executes all configured quality checks. Order matters for safety,
@@ -535,7 +554,9 @@ class QualityPipeline:
 
         # 2. Deterministic additive-vs-rewrite scope guard - in-memory
         # diff only, executes nothing.
-        scope_check = cls.check_patch_scope(repo_path, patches, user_request=user_request)
+        scope_check = cls.check_patch_scope(
+            repo_path, patches, user_request=user_request, original_file_snapshots=original_file_snapshots
+        )
 
         # 3. Static Security Scan - in-memory only, executes nothing.
         # Deliberately runs before any execution-based check: it must be

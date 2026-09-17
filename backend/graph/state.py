@@ -38,6 +38,12 @@ class AgentState(TypedDict, total=False):
     approval_status: str
     repo_context: Optional[List[CodeChunk]]
     generated_patches: Optional[List[FilePatch]]
+    # Per-file content immediately before developer_node/revision_node's own
+    # disk write of that file's patch - see their docstrings and
+    # QualityPipeline.check_patch_scope, which needs the true pre-patch
+    # content and cannot get it from a fresh disk read once this node has
+    # already overwritten the file with the patched result.
+    pre_patch_snapshots: Optional[Dict[str, str]]
     test_result: Optional[TestExecutionResult]
     git_diff: Optional[GitDiffSummary]
     approval: Optional[ApprovalDecision]

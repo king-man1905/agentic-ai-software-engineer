@@ -431,3 +431,230 @@ class TestDeveloperPromptGuidance:
         assert "preserve all unrelated existing content" in prompt.lower()
         assert "do not remove existing sections" in prompt.lower()
         assert "explicitly asks to rewrite" in prompt.lower() or "explicitly ask for a rewrite" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# Real E2E regression: run_558b917f75d1
+#
+# patch_scope reported PASS on a real, live run with the exact bug-report
+# request against a real 134-line README and a real destructive patch
+# (+25/-120, 83% deletion). Root cause: developer_node writes the patched
+# content to repo_path BEFORE qa_node's checks ever run. check_patch_scope
+# then re-read "original" straight off that same, already-mutated disk
+# path - comparing the destructive content against itself and finding 0%
+# deletion. Every prior unit test (including this file's own) built a
+# pristine tmp_path and called check_patch_scope directly, without ever
+# reproducing that write-then-check ordering - which is exactly why they
+# all passed while the real run didn't.
+#
+# Fixed by having developer_node/revision_node record each file's true
+# pre-write content (AgentState["pre_patch_snapshots"]) and having
+# check_patch_scope/run_all prefer that snapshot over a live disk read.
+#
+# These tests exercise the REAL developer_node (real git workspace, real
+# disk write) followed by the REAL QualityPipeline/StructuredQAJudge, not
+# hand-constructed fixtures, so they fail exactly the way the real run did
+# if the write-then-check ordering bug ever comes back.
+# ---------------------------------------------------------------------------
+
+def _real_git_workspace_with_readme(tmp_path, monkeypatch, project_id: str, readme_content: str):
+    import os
+    import subprocess
+
+    workspace_dir = tmp_path / "workspace" / "default-org" / project_id
+    workspace_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(workspace_dir), capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(workspace_dir), capture_output=True, text=True)
+    (workspace_dir / "README.md").write_text(readme_content, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+    monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+    return workspace_dir
+
+
+def _run_real_developer_node(tmp_path, monkeypatch, project_id, user_message, readme_content, destructive_patch):
+    from backend.graph.nodes import developer_node
+    from backend.indexer.models import CodeChunk
+    from backend.schemas.developer import DeveloperResult
+
+    _real_git_workspace_with_readme(tmp_path, monkeypatch, project_id, readme_content)
+
+    class _FakePatchResult:
+        patches = [destructive_patch]
+
+    monkeypatch.setattr(
+        "backend.graph.nodes.generate_code_changes",
+        lambda user_request, plan, knowledge: DeveloperResult(
+            summary="stub", changes=[], requires_testing=True, notes=[]
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.graph.nodes.invoke_structured",
+        lambda llm, schema_cls, prompt, *a, **k: _FakePatchResult(),
+    )
+
+    state = {
+        "user_message": user_message,
+        "project_id": project_id,
+        "repo_context": [
+            CodeChunk(
+                file_path="README.md",
+                content=readme_content,
+                start_line=1,
+                end_line=len(readme_content.splitlines()),
+                chunk_type="module",
+            )
+        ],
+    }
+    return developer_node(state)
+
+
+_DESTRUCTIVE_README_PATCH = FilePatch(
+    file_path="README.md",
+    original_code_snippet="",  # whole-file convention - matches the real run
+    updated_code_snippet=(
+        "# Agentic AI Software Engineer\n\n## E2E Test\n\n"
+        "This section verifies the autonomous software-engineering "
+        "pipeline and GitHub pull-request workflow.\n"
+    ),
+    explanation="Add E2E Test section",
+)
+
+
+class TestRealE2EWriteThenCheckOrderingBug:
+    """A. Exact 134-line README + exact additive request + a destructive
+    (~98% deletion) whole-file patch, driven through the REAL developer_node
+    (which really writes the patched content to disk) -> patch_scope must
+    still FAIL, because it must consult the pre-write snapshot, not disk."""
+
+    def test_real_developer_node_write_then_check_patch_scope_fails(self, tmp_path, monkeypatch):
+        original = _readme_134_lines()
+        output = _run_real_developer_node(
+            tmp_path, monkeypatch, "e2e-bug-repro", ADDITIVE_REQUEST, original, _DESTRUCTIVE_README_PATCH
+        )
+
+        # developer_node really did write the destructive content to disk,
+        # exactly like production - this is the condition that broke the
+        # old (disk-read-only) implementation.
+        readme_path = tmp_path / "workspace" / "default-org" / "e2e-bug-repro" / "README.md"
+        assert readme_path.read_text(encoding="utf-8") == _DESTRUCTIVE_README_PATCH.updated_code_snippet
+
+        pre_patch_snapshots = output["pre_patch_snapshots"]
+        assert pre_patch_snapshots["README.md"] == original  # true original, not the mutated disk content
+
+        check = QualityPipeline.check_patch_scope(
+            str(readme_path.parent),
+            output["generated_patches"],
+            user_request=ADDITIVE_REQUEST,
+            original_file_snapshots=pre_patch_snapshots,
+        )
+        assert check.status == QualityCheckStatus.FAIL.value
+        assert check.category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+
+    def test_without_snapshot_reproduces_the_original_bug(self, tmp_path, monkeypatch):
+        """Proves the fix is actually load-bearing: omitting the snapshot
+        (the old call signature/behavior) reproduces the exact false PASS
+        from run_558b917f75d1."""
+        original = _readme_134_lines()
+        output = _run_real_developer_node(
+            tmp_path, monkeypatch, "e2e-bug-repro-no-snapshot", ADDITIVE_REQUEST, original, _DESTRUCTIVE_README_PATCH
+        )
+        readme_path = tmp_path / "workspace" / "default-org" / "e2e-bug-repro-no-snapshot" / "README.md"
+
+        check_without_snapshot = QualityPipeline.check_patch_scope(
+            str(readme_path.parent), output["generated_patches"], user_request=ADDITIVE_REQUEST
+        )
+        assert check_without_snapshot.status == QualityCheckStatus.PASS.value  # the bug, reproduced
+
+
+class TestRealE2EThroughRunAll:
+    """B. Same case through QualityPipeline.run_all() -> FAIL."""
+
+    def test_run_all_fails_on_the_real_destructive_patch(self, tmp_path, monkeypatch):
+        original = _readme_134_lines()
+        output = _run_real_developer_node(
+            tmp_path, monkeypatch, "e2e-bug-run-all", ADDITIVE_REQUEST, original, _DESTRUCTIVE_README_PATCH
+        )
+        readme_path = tmp_path / "workspace" / "default-org" / "e2e-bug-run-all" / "README.md"
+
+        checks, _ = QualityPipeline.run_all(
+            str(readme_path.parent),
+            output["generated_patches"],
+            user_request=ADDITIVE_REQUEST,
+            original_file_snapshots=output["pre_patch_snapshots"],
+        )
+        by_name = {c.name: c for c in checks}
+        assert by_name["patch_scope"].status == QualityCheckStatus.FAIL.value
+        assert by_name["patch_scope"].category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+
+
+class TestRealE2EThroughJudge:
+    """C. Same case through judge/B2 -> FAIL even if the LLM says PASS."""
+
+    def test_judge_fails_despite_optimistic_llm_review(self, tmp_path, monkeypatch):
+        from backend.schemas.qa import QAResult
+
+        original = _readme_134_lines()
+        output = _run_real_developer_node(
+            tmp_path, monkeypatch, "e2e-bug-judge", ADDITIVE_REQUEST, original, _DESTRUCTIVE_README_PATCH
+        )
+        readme_path = tmp_path / "workspace" / "default-org" / "e2e-bug-judge" / "README.md"
+
+        checks, test_result = QualityPipeline.run_all(
+            str(readme_path.parent),
+            output["generated_patches"],
+            user_request=ADDITIVE_REQUEST,
+            original_file_snapshots=output["pre_patch_snapshots"],
+        )
+        optimistic_llm_pass = QAResult(status="PASS", confidence=0.95, summary="Looks complete and correct.")
+
+        qa_result = StructuredQAJudge.evaluate(checks, test_result=test_result, llm_qa_result=optimistic_llm_pass)
+
+        assert qa_result.status == "FAIL"
+        assert qa_result.failure_category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+
+
+class TestRealE2EExplicitRewriteAllowed:
+    """D. Explicit rewrite request -> allowed, through the real
+    developer_node write-then-check sequence."""
+
+    def test_explicit_rewrite_passes_through_real_sequence(self, tmp_path, monkeypatch):
+        original = _readme_134_lines()
+        rewrite_request = "Please rewrite the entire README from scratch with a simpler structure."
+        output = _run_real_developer_node(
+            tmp_path, monkeypatch, "e2e-bug-rewrite", rewrite_request, original, _DESTRUCTIVE_README_PATCH
+        )
+        readme_path = tmp_path / "workspace" / "default-org" / "e2e-bug-rewrite" / "README.md"
+
+        checks, _ = QualityPipeline.run_all(
+            str(readme_path.parent),
+            output["generated_patches"],
+            user_request=rewrite_request,
+            original_file_snapshots=output["pre_patch_snapshots"],
+        )
+        by_name = {c.name: c for c in checks}
+        assert by_name["patch_scope"].status == QualityCheckStatus.PASS.value
+
+
+class TestRealE2EMixedAdditiveAndTargetedRemoval:
+    """E. Mixed additive + single targeted removal, but the actual patch is
+    still a destructive rewrite -> FAIL, through the real sequence."""
+
+    def test_mixed_request_with_destructive_patch_still_fails(self, tmp_path, monkeypatch):
+        original = _readme_134_lines()
+        mixed_request = "Add an E2E Test section and remove the obsolete section."
+        output = _run_real_developer_node(
+            tmp_path, monkeypatch, "e2e-bug-mixed", mixed_request, original, _DESTRUCTIVE_README_PATCH
+        )
+        readme_path = tmp_path / "workspace" / "default-org" / "e2e-bug-mixed" / "README.md"
+
+        checks, _ = QualityPipeline.run_all(
+            str(readme_path.parent),
+            output["generated_patches"],
+            user_request=mixed_request,
+            original_file_snapshots=output["pre_patch_snapshots"],
+        )
+        by_name = {c.name: c for c in checks}
+        assert by_name["patch_scope"].status == QualityCheckStatus.FAIL.value
+        assert by_name["patch_scope"].category == FailureCategory.PATCH_APPLICATION_FAILURE.value

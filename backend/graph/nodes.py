@@ -1,3 +1,5 @@
+from typing import Optional
+
 from backend.graph.state import AgentState
 from backend.schemas.routing import TaskType
 from backend.schemas.knowledge import KnowledgeAnswer
@@ -414,7 +416,9 @@ def _safe_repo_relative_target(project_path, file_path: str):
     return safe_repo_relative_path(project_path, file_path)
 
 
-def _materialize_developer_changes(changes, project_id: str, organization_id: str = "default-org") -> list:
+def _materialize_developer_changes(
+    changes, project_id: str, organization_id: str = "default-org", snapshot_sink: Optional[dict] = None
+) -> list:
     """
     Writes each non-empty FileChange directly to disk under
     workspace/<organization_id>/<project_id> and returns the corresponding
@@ -432,6 +436,14 @@ def _materialize_developer_changes(changes, project_id: str, organization_id: st
     either become a FilePatch or this call fails explicitly (ValueError) -
     it must never silently vanish. The same applies if organization_id/
     project_id don't resolve to a safe workspace path at all.
+
+    If `snapshot_sink` is given, records each file's on-disk content from
+    immediately BEFORE this write into it (file_path -> content, "" for a
+    genuinely new file). This is the file's true pre-patch state - qa_node
+    reads it right back off disk moments later, after this write already
+    happened, so anything that needs to compare against "before this
+    patch" (see QualityPipeline.check_patch_scope) cannot rely on a fresh
+    disk read at that point - it would just see this write's own result.
     """
     from backend.developer.models import FilePatch
 
@@ -457,6 +469,16 @@ def _materialize_developer_changes(changes, project_id: str, organization_id: st
                 f"Refusing to materialize generated file change: "
                 f"'{ch.file_path}' is not a safe repository-relative path."
             )
+
+        if snapshot_sink is not None:
+            before_content = ""
+            if abs_f.exists():
+                try:
+                    with open(abs_f, "r", encoding="utf-8", errors="ignore") as f:
+                        before_content = f.read()
+                except Exception:
+                    pass
+            snapshot_sink[ch.file_path] = before_content
 
         try:
             abs_f.parent.mkdir(parents=True, exist_ok=True)
@@ -572,6 +594,14 @@ def developer_node(state: AgentState) -> dict:
                 print(f"Developer node context scan notice: {e}")
 
         generated_patches = []
+        # Each file's true content immediately BEFORE this node writes any
+        # patch to it - captured here because qa_node reads the same path
+        # back off disk moments later, by which point this node has
+        # already overwritten it with the patched result. Without this,
+        # any later check that needs "the original" (e.g.
+        # QualityPipeline.check_patch_scope's additive-deletion guard)
+        # would silently compare the patched file against itself.
+        pre_patch_snapshots: dict = {}
 
         if repo_context:
             # Give the exact-snippet patch-generation prompt below one
@@ -662,6 +692,7 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
                             source_content = f.read()
                     except Exception:
                         pass
+                pre_patch_snapshots[patch.file_path] = source_content
 
                 val_result = SafePatcher.apply_patch(source_content, patch)
                 if not val_result.is_valid:
@@ -682,6 +713,7 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
                 developer_result.changes,
                 state.get("project_id", "test_project"),
                 state.get("organization_id", "default-org"),
+                snapshot_sink=pre_patch_snapshots,
             )
 
 
@@ -708,6 +740,7 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
         # tokens ever pass through this value.
         "repo_context": repo_context,
         "metrics": merge_usage(state.get("metrics"), usage),
+        "pre_patch_snapshots": pre_patch_snapshots,
     }
 
 
@@ -762,6 +795,7 @@ def qa_node(state: AgentState) -> dict:
         timeout=30.0,
         cancel_check=cancel_check,
         user_request=state["user_message"],
+        original_file_snapshots=state.get("pre_patch_snapshots"),
     )
 
     # 3. Structured QA Judge Evaluation with Strict Objective Priority
@@ -945,11 +979,13 @@ def revision_node(state: AgentState) -> dict:
         # generated_patches already holds the PREVIOUS (rejected) attempt
         # on every revision past the first, so that would otherwise never
         # be empty and this fallback would never run.
+        pre_patch_snapshots = dict(state.get("pre_patch_snapshots") or {})
         if not context_aware_patch_produced and revised_result and revised_result.changes:
             generated_patches = _materialize_developer_changes(
                 revised_result.changes,
                 state.get("project_id", "test_project"),
                 state.get("organization_id", "default-org"),
+                snapshot_sink=pre_patch_snapshots,
             )
 
     # 7. Record this revision attempt with structured telemetry
@@ -1011,6 +1047,7 @@ def revision_node(state: AgentState) -> dict:
         "revision_history": revision_history,
         "generated_patches": generated_patches,
         "metrics": merge_usage(state.get("metrics"), usage),
+        "pre_patch_snapshots": pre_patch_snapshots,
     }
 
 
