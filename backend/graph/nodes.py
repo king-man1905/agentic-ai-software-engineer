@@ -987,6 +987,27 @@ def revision_node(state: AgentState) -> dict:
                 state.get("organization_id", "default-org"),
                 snapshot_sink=pre_patch_snapshots,
             )
+        elif context_aware_patch_produced:
+            # generate_revision_patches (backend/agents/revision.py) never
+            # writes to disk - it validates each candidate's
+            # original_code_snippet anchor against CURRENT live disk
+            # content and stops there. Carrying forward an earlier cycle's
+            # snapshot for these same files would hand qa_node's
+            # check_patch_scope a STALE "original" that this candidate was
+            # never generated or validated against: if the anchor doesn't
+            # happen to also exist verbatim in that stale snapshot (e.g. a
+            # prior attempt already changed the file), SafePatcher reports
+            # the patch invalid against it, and check_patch_scope silently
+            # skips the patch as "check_ast's concern" - while check_ast
+            # (which always reads live disk) validates it just fine,
+            # letting a destructive patch through as an unremarked PASS on
+            # both checks. Dropping the stale entry here makes
+            # check_patch_scope fall back to the same live disk read
+            # check_ast and generate_revision_patches already used, which
+            # is the correct "before" baseline for a patch that was never
+            # written anywhere.
+            for p in generated_patches:
+                pre_patch_snapshots.pop(p.file_path, None)
 
     # 7. Record this revision attempt with structured telemetry
     new_revision_count = revision_count + 1

@@ -657,4 +657,194 @@ class TestRealE2EMixedAdditiveAndTargetedRemoval:
         )
         by_name = {c.name: c for c in checks}
         assert by_name["patch_scope"].status == QualityCheckStatus.FAIL.value
+
+
+# ---------------------------------------------------------------------------
+# Real E2E regression #2: run_d36ddab60993
+#
+# Even after the pre_patch_snapshots fix (commit 8bb3fde), a second real run
+# still got patch_scope=PASS on a ~79% deletion patch. Root cause this time:
+# generate_revision_patches() (backend/agents/revision.py) - the
+# CONTEXT-AWARE revision path - never writes to disk; it validates its
+# candidate's original_code_snippet anchor against CURRENT LIVE disk
+# content and stops there. revision_node was carrying the FIRST attempt's
+# pre_patch_snapshots forward unconditionally into every later cycle. When
+# a later revision's candidate patch has an anchor that exists in the
+# current (already-once-modified) disk content but NOT in that stale,
+# carried-forward snapshot, check_patch_scope's SafePatcher.apply_patch(
+# stale_snapshot, patch) reports the patch invalid (anchor not found) and
+# check_patch_scope silently skips it ("check_ast's concern") - while
+# check_ast itself validates fine, because it always reads live disk.
+# Net effect: patch_scope PASS, AST PASS, on a genuinely destructive patch.
+#
+# Fixed by having revision_node drop any stale snapshot entry for files a
+# context-aware-produced candidate touches, so check_patch_scope falls back
+# to the same live-disk read check_ast and generate_revision_patches
+# already use - the correct baseline for a patch that was never written
+# anywhere.
+# ---------------------------------------------------------------------------
+
+class TestRealE2ERevisionCycleStaleSnapshotBug:
+    def test_revision_node_with_stale_snapshot_and_live_disk_mismatch_reproduced_directly(self, tmp_path):
+        """
+        Direct reproduction of the exact runtime discrepancy (without the
+        full revision_node plumbing) - proves the mechanism precisely:
+        a patch that validates against LIVE disk (as check_ast and
+        generate_revision_patches both check) but not against a STALE
+        snapshot from an earlier attempt gets silently skipped by
+        check_patch_scope, producing a false PASS on a ~97% deletion.
+        This is exactly commit 8bb3fde's residual bug - it would have
+        FAILED (reported PASS) against that commit.
+        """
+        from backend.developer.patcher import SafePatcher
+
+        original = _readme_134_lines()
+        # Attempt 1 already wrote a slightly different (but still safe)
+        # version to disk - a real, legitimate small prior change.
+        attempt1_output = (
+            "# Agentic AI Software Engineer\n\n(attempt 1 safe note)\n\n"
+            + "\n".join(original.splitlines()[1:])
+            + "\n"
+        )
+        (tmp_path / "README.md").write_text(attempt1_output, encoding="utf-8")
+
+        # generate_revision_patches's candidate: anchor exists in CURRENT
+        # disk (attempt1_output) - its own validation would pass - but the
+        # anchor text ("(attempt 1 safe note)...") never existed in the
+        # TRUE original at all.
+        anchor = "(attempt 1 safe note)\n\n" + "\n".join(attempt1_output.splitlines()[4:])
+        destructive_revision_patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet=anchor,
+            updated_code_snippet="## E2E Test\n\nDescribes the pipeline.\n",
+            explanation="revision: add E2E Test section",
+        )
+
+        # Sanity: this is exactly what generate_revision_patches's own
+        # validation loop and check_ast both do - validate against LIVE
+        # disk - and it passes, matching the real run's observed AST PASS.
+        live_validation = SafePatcher.apply_patch(attempt1_output, destructive_revision_patch)
+        assert live_validation.is_valid is True
+        ast_check = QualityPipeline.check_ast(str(tmp_path), [destructive_revision_patch])
+        assert ast_check.status == QualityCheckStatus.PASS.value
+
+        stale_snapshot_from_attempt_1 = {"README.md": original}  # true original, now stale
+
+        # THE BUG (commit 8bb3fde behavior): carrying the stale snapshot
+        # forward makes check_patch_scope silently skip the patch.
+        check_with_stale_snapshot = QualityPipeline.check_patch_scope(
+            str(tmp_path),
+            [destructive_revision_patch],
+            user_request=ADDITIVE_REQUEST,
+            original_file_snapshots=stale_snapshot_from_attempt_1,
+        )
+        assert check_with_stale_snapshot.status == QualityCheckStatus.PASS.value  # the bug, reproduced
+
+        # THE FIX: dropping the stale entry (what revision_node now does
+        # for context-aware-produced candidates) makes check_patch_scope
+        # fall back to a live disk read and correctly reject it.
+        check_without_stale_entry = QualityPipeline.check_patch_scope(
+            str(tmp_path),
+            [destructive_revision_patch],
+            user_request=ADDITIVE_REQUEST,
+            original_file_snapshots={},
+        )
+        assert check_without_stale_entry.status == QualityCheckStatus.FAIL.value
+        assert check_without_stale_entry.category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+
+    def test_real_revision_node_drops_stale_snapshot_for_context_aware_candidate(self, tmp_path, monkeypatch):
+        """
+        Full integration: drives the REAL revision_node() - not a manual
+        simulation - through the exact scenario above, and confirms its
+        returned pre_patch_snapshots no longer contains the stale entry,
+        so the QA cycle that follows evaluates the candidate correctly.
+        """
+        import os
+        import subprocess
+
+        from backend.graph.nodes import revision_node
+        from backend.indexer.models import CodeChunk
+        from backend.schemas.developer import DeveloperResult
+        from backend.schemas.planning import ExecutionPlan
+        from backend.schemas.qa import QAResult
+
+        project_id = "e2e-revision-stale-snapshot"
+        workspace_dir = tmp_path / "workspace" / "default-org" / project_id
+        workspace_dir.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(workspace_dir), capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(workspace_dir), capture_output=True, text=True)
+
+        original = _readme_134_lines()
+        attempt1_output = (
+            "# Agentic AI Software Engineer\n\n(attempt 1 safe note)\n\n"
+            + "\n".join(original.splitlines()[1:])
+            + "\n"
+        )
+        (workspace_dir / "README.md").write_text(attempt1_output, encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "commit", "-m", "attempt 1"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+        monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+
+        anchor = "(attempt 1 safe note)\n\n" + "\n".join(attempt1_output.splitlines()[4:])
+        destructive_revision_patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet=anchor,
+            updated_code_snippet="## E2E Test\n\nDescribes the pipeline.\n",
+            explanation="revision: add E2E Test section",
+        )
+
+        monkeypatch.setattr(
+            "backend.agents.developer.revise_code_changes",
+            lambda user_request, plan, previous_result, qa_result: DeveloperResult(
+                summary="revised", changes=[], requires_testing=True, notes=[]
+            ),
+        )
+        monkeypatch.setattr(
+            "backend.agents.revision.generate_revision_patches",
+            lambda **kwargs: [destructive_revision_patch],
+        )
+
+        state = {
+            "user_message": ADDITIVE_REQUEST,
+            "project_id": project_id,
+            "plan": ExecutionPlan(goal=ADDITIVE_REQUEST, steps=[], success_criteria="Done"),
+            "developer_result": DeveloperResult(summary="attempt 1", changes=[], requires_testing=True, notes=[]),
+            "generated_patches": [
+                FilePatch(
+                    file_path="README.md",
+                    original_code_snippet="",
+                    updated_code_snippet=attempt1_output,
+                    explanation="attempt 1",
+                )
+            ],
+            "qa_result": QAResult(status="FAIL", summary="attempt 1 rejected"),
+            "revision_count": 0,
+            # Carried over from the FIRST developer_node call - the true,
+            # now-stale, pre-attempt-1 original.
+            "pre_patch_snapshots": {"README.md": original},
+            "repo_context": [
+                CodeChunk(
+                    file_path="README.md", content=attempt1_output, start_line=1,
+                    end_line=len(attempt1_output.splitlines()), chunk_type="module",
+                )
+            ],
+        }
+
+        output = revision_node(state)
+
+        assert output["generated_patches"] == [destructive_revision_patch]
+        # The stale entry must be gone - not merely unused, actually absent -
+        # so check_patch_scope is forced to fall back to a live disk read.
+        assert "README.md" not in output["pre_patch_snapshots"]
+
+        checks, _ = QualityPipeline.run_all(
+            str(workspace_dir),
+            output["generated_patches"],
+            user_request=ADDITIVE_REQUEST,
+            original_file_snapshots=output["pre_patch_snapshots"],
+        )
+        by_name = {c.name: c for c in checks}
+        assert by_name["patch_scope"].status == QualityCheckStatus.FAIL.value
+        assert by_name["patch_scope"].category == FailureCategory.PATCH_APPLICATION_FAILURE.value
         assert by_name["patch_scope"].category == FailureCategory.PATCH_APPLICATION_FAILURE.value
