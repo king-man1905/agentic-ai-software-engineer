@@ -334,6 +334,7 @@ class PolicyEvaluator:
             checks=checks,
             policy_version=policy.policy_version,
             evaluated_at=now_iso,
+            requires_human_approval=final_decision != PolicyDecision.ALLOW,
         )
 
     @classmethod
