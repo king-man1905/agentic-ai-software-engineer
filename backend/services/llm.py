@@ -40,7 +40,20 @@ def get_llm(provider: Optional[str] = None, timeout: Optional[float] = None):
 
     if eff_provider == "nvidia":
         from langchain_nvidia_ai_endpoints import ChatNVIDIA
-        client = ChatNVIDIA(model=model, api_key=nvidia_key, temperature=0, timeout=eff_timeout)
+        extra_kwargs = {}
+        # openai/gpt-oss-* are reasoning models: by default they spend a
+        # large, variable amount of hidden "thinking" tokens before the
+        # final answer, which is what makes plain classification calls slow
+        # enough to threaten LLM_REQUEST_TIMEOUT_SECONDS. `reasoning_effort`
+        # is the NVIDIA-hosted, OpenAI-compatible request parameter these
+        # models accept to bound that thinking budget; ChatNVIDIA has no
+        # dedicated field for it, but its pydantic model passes unknown
+        # constructor kwargs through to `model_kwargs`, which is merged
+        # into the outbound request payload - the smallest mechanism this
+        # installed version supports, without inventing a new parameter.
+        if "gpt-oss" in model.lower():
+            extra_kwargs["reasoning_effort"] = "low"
+        client = ChatNVIDIA(model=model, api_key=nvidia_key, temperature=0, timeout=eff_timeout, **extra_kwargs)
         setattr(client, "_provider", "nvidia")
         setattr(client, "_timeout", eff_timeout)
         return client

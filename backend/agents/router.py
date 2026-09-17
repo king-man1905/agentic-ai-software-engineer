@@ -6,76 +6,30 @@ from backend.schemas.routing import RoutingDecision
 def route_task(user_message: str) -> RoutingDecision:
     llm = get_llm()
 
+    # Kept short deliberately: this is a single classification call, and a
+    # long, example-heavy prompt makes reasoning models (e.g. NVIDIA's
+    # openai/gpt-oss-20b) spend far more hidden "thinking" time before
+    # answering, risking request timeouts for no gain on this simple task.
+    prompt = f"""Classify this software engineering request. This is a simple classification task - do not reason at length.
 
-    prompt = f"""
-You are the PM/Router of an Agentic AI Software Engineer.
-
-Your job is to classify the user's software engineering request.
-
-Available task types:
-
-- CODE_GENERATION
-- BUG_FIX
-- CODE_REVIEW
-- CODE_EXPLANATION
-- DOCUMENTATION
-- DATA_ANALYSIS
-- KNOWLEDGE_SEARCH
-- GENERAL
+task_type - exactly one of:
+CODE_GENERATION, BUG_FIX, CODE_REVIEW, CODE_EXPLANATION, DOCUMENTATION, DATA_ANALYSIS, KNOWLEDGE_SEARCH, GENERAL
 
 Rules:
+- BUG_FIX: fixing an error or broken behavior.
+- CODE_REVIEW: reviewing or improving existing code.
+- CODE_EXPLANATION: explaining code the user provided or pointed to.
+- DOCUMENTATION: README, comments, or technical docs.
+- DATA_ANALYSIS: analyzing CSV/SQL/database/structured data.
+- KNOWLEDGE_SEARCH: finding/locating/searching where something exists in the project (not CODE_EXPLANATION).
+- CODE_GENERATION: new code, feature, function, API, or component.
+- GENERAL: none of the above.
 
-1. CODE_GENERATION:
-   User wants new code, feature, function, API, or component.
+requires_planning - true only if the request needs multiple engineering steps.
+requires_knowledge - true only if it needs existing project context, files, docs, data, or external info.
+reasoning - one short sentence. No long explanation.
 
-2. BUG_FIX:
-   User wants an error, bug, or broken behavior fixed.
-
-3. CODE_REVIEW:
-   User wants existing code reviewed or improved.
-
-4. CODE_EXPLANATION:
-   User provides or refers to specific existing code and wants
-   to understand what that code does.
-
-   Do NOT use CODE_EXPLANATION when the user is asking to locate
-   or search for code inside a project. Those requests are
-   KNOWLEDGE_SEARCH.
-
-5. DOCUMENTATION:
-   User wants README, comments, docs, or technical documentation.
-
-6. DATA_ANALYSIS:
-   User wants analysis of CSV, SQL, database, or structured data.
-
-7. KNOWLEDGE_SEARCH:
-   User needs information from project files, documentation,
-   RAG, or external knowledge sources.
-
-   IMPORTANT:
-   If the user asks to FIND, LOCATE, SEARCH, or IDENTIFY WHERE
-   something exists in a project/codebase, classify it as
-   KNOWLEDGE_SEARCH, not CODE_EXPLANATION.
-
-   Examples:
-   - "Find where authentication is implemented in my project"
-     → KNOWLEDGE_SEARCH
-   - "Which file contains the login logic?"
-     → KNOWLEDGE_SEARCH
-   - "Search my project for database configuration"
-     → KNOWLEDGE_SEARCH.
-
-8. GENERAL:
-   Request does not fit the categories above.
-
-Set requires_planning=true when the request requires multiple
-engineering steps.
-
-Set requires_knowledge=true when solving the request requires
-existing project context, files, documentation, data, or external
-information.
-
-Keep reasoning short and specific.
+Return only the required structured fields, nothing else.
 
 User request:
 {user_message}
