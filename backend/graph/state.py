@@ -44,6 +44,19 @@ class AgentState(TypedDict, total=False):
     # content and cannot get it from a fresh disk read once this node has
     # already overwritten the file with the patched result.
     pre_patch_snapshots: Optional[Dict[str, str]]
+    # Per-file content as it existed before this RUN ever touched it -
+    # captured once (developer_node's first read/write of a file) and never
+    # overwritten or dropped for any later revision cycle, unlike
+    # pre_patch_snapshots above (which intentionally reflects only the
+    # immediate pre-write state for whichever write happened most
+    # recently). QualityPipeline.check_patch_scope's destructiveness
+    # measurement (detect_unsafe_additive_rewrite) must always compare a
+    # candidate's applied content against this true, run-lifetime original -
+    # comparing it against an intermediate (possibly also-destructive,
+    # already-rejected) revision attempt's content instead can hide a
+    # whole-file-replacement fabrication that merely resembles the earlier
+    # rejected one.
+    true_original_snapshots: Optional[Dict[str, str]]
     test_result: Optional[TestExecutionResult]
     git_diff: Optional[GitDiffSummary]
     approval: Optional[ApprovalDecision]

@@ -235,6 +235,111 @@ def test_quality_pipeline_optional_tool_graceful(tmp_path):
         assert "NOT_AVAILABLE" in (type_res.reason or "")
 
 
+class TestPytestNoTestsCollectedClassification:
+    """Regression coverage for the confirmed AWS E2E finding: pytest exit
+    code 5 ("no tests collected") was silently reported as an unqualified
+    QualityCheckStatus.PASS, indistinguishable from a repository whose
+    tests genuinely ran and passed. The project architecture intentionally
+    permits repositories without a test suite (e.g. a fresh documentation
+    repo like king-man1905/agentic-ai-test-repo), so this must not be
+    treated as a FAILURE either - but it must be explicitly classified, not
+    silently folded into PASS, consistent with the SKIPPED semantics
+    already used elsewhere in this same pipeline (check_lint/check_typecheck
+    when the tool itself isn't installed)."""
+
+    def test_check_pytest_real_no_tests_collected_is_skipped_not_pass(self, tmp_path):
+        """A. Real pytest execution (no mocking) against a repository with
+        no test files at all must produce exit_code 5, and check_pytest
+        must classify it as SKIPPED with an explicit reason - never PASS."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "README.md").write_text("# no tests here\n", encoding="utf-8")
+
+        check, test_result = QualityPipeline.check_pytest(str(repo), timeout=30.0)
+
+        assert test_result is not None
+        assert test_result.exit_code == 5
+        assert check.status == QualityCheckStatus.SKIPPED.value
+        assert check.exit_code == 5
+        assert "no tests collected" in (check.reason or "").lower()
+        assert "not treated as a failure" in (check.reason or "").lower()
+
+    def test_check_pytest_real_genuine_pass_is_still_pass(self, tmp_path):
+        """B. A repository whose tests genuinely run and pass must still
+        report PASS (with exit_code 0), unaffected by the exit-code-5
+        classification change."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "test_ok.py").write_text(
+            "def test_ok():\n    assert 1 == 1\n", encoding="utf-8"
+        )
+
+        check, test_result = QualityPipeline.check_pytest(str(repo), timeout=30.0)
+
+        assert test_result is not None
+        assert test_result.exit_code == 0
+        assert check.status == QualityCheckStatus.PASS.value
+        assert check.reason is None
+
+    def test_check_pytest_real_genuine_failure_is_still_fail(self, tmp_path):
+        """C. A repository whose tests genuinely fail must still report
+        FAIL (with the real, non-5 exit code), unaffected by the
+        exit-code-5 classification change."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "test_bad.py").write_text(
+            "def test_bad():\n    assert 1 == 2\n", encoding="utf-8"
+        )
+
+        check, test_result = QualityPipeline.check_pytest(str(repo), timeout=30.0)
+
+        assert test_result is not None
+        assert test_result.exit_code not in (0, 5)
+        assert check.status == QualityCheckStatus.FAIL.value
+        assert check.reason
+
+    def test_no_tests_collected_does_not_block_overall_qa_pass(self, tmp_path):
+        """D. StructuredQAJudge must not treat a SKIPPED pytest check (no
+        tests collected) as a blocking failure - a documentation-only
+        change to a test-less repository can still reach an overall PASS,
+        exactly as the architecture intends for repositories without a
+        test suite. SKIPPED checks are already non-blocking (only a small
+        confidence reduction) via the same code path lint/typecheck use."""
+        no_tests_check = QualityCheck(
+            name="pytest",
+            status=QualityCheckStatus.SKIPPED.value,
+            exit_code=5,
+            reason="No tests collected (pytest exit code 5) - repository has no test suite; not treated as a failure.",
+        )
+        ast_check = QualityCheck(name="ast", status=QualityCheckStatus.PASS.value, exit_code=0)
+        security_check = QualityCheck(name="security", status=QualityCheckStatus.PASS.value, exit_code=0)
+
+        result = StructuredQAJudge.evaluate(checks=[ast_check, no_tests_check, security_check])
+
+        assert result.status == "PASS"
+        # A SKIPPED check must not silently read as "tests were verified" -
+        # the objective evidence (exit_code=5, 0 items collected) is
+        # preserved and inspectable on the check itself.
+        pytest_result_check = next(c for c in result.checks if c.name == "pytest")
+        assert pytest_result_check.status == QualityCheckStatus.SKIPPED.value
+        assert pytest_result_check.exit_code == 5
+
+    def test_no_tests_collected_is_distinguishable_from_genuine_pass_in_summary_data(self):
+        """E. The objective evidence (exit_code + status) must make it
+        possible to tell "no tests ran" apart from "tests ran and passed"
+        purely from the QAResult - the exact gap the AWS E2E run exposed
+        (QA reported PASS with no visible distinction from a real test
+        pass)."""
+        genuine_pass_check = QualityCheck(name="pytest", status=QualityCheckStatus.PASS.value, exit_code=0)
+        no_tests_check = QualityCheck(
+            name="pytest", status=QualityCheckStatus.SKIPPED.value, exit_code=5,
+            reason="No tests collected (pytest exit code 5) - repository has no test suite; not treated as a failure.",
+        )
+
+        assert genuine_pass_check.status != no_tests_check.status
+        assert genuine_pass_check.exit_code != no_tests_check.exit_code
+
+
 def test_quality_pipeline_run_all_success(tmp_path):
     """Verify run_all runs checks and aggregates results."""
     mock_test_res = TestExecutionResult(

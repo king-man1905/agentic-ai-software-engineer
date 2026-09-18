@@ -325,7 +325,7 @@ def mocked_router_and_developer(monkeypatch):
     # tests fast/offline.
     monkeypatch.setattr(
         "backend.qa.pipeline.QualityPipeline.run_all",
-        lambda repo_path, patches, timeout=30.0, cancel_check=None, user_request="", original_file_snapshots=None: ([], None),
+        lambda repo_path, patches, timeout=30.0, cancel_check=None, user_request="", original_file_snapshots=None, true_original_snapshots=None: ([], None),
     )
     # developer_node does its OWN inline real LLM call (get_llm +
     # invoke_structured for a locally-defined PatchResponse schema) to turn

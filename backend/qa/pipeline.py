@@ -137,6 +137,7 @@ class QualityPipeline:
         patches: List[FilePatch],
         user_request: str = "",
         original_file_snapshots: Optional[dict] = None,
+        true_original_snapshots: Optional[dict] = None,
     ) -> QualityCheck:
         """
         Deterministic guard (backend/developer/patch_scope.py): for an
@@ -150,18 +151,39 @@ class QualityPipeline:
         whole_file_chunk_for_patch_context, which explicitly excludes .py),
         so this specific failure mode cannot occur there.
 
-        `original_file_snapshots` (file_path -> content immediately before
-        the patch was written - see developer_node/revision_node) MUST be
-        preferred over a fresh disk read when available: by the time
-        qa_node runs, developer_node has typically already written the
-        patched result to repo_path, so re-reading the file from disk here
-        would just compare the patched content against itself and always
-        report 0% deletion - this was the exact discrepancy that let a
-        real ~83%-deletion patch through as "PASS" (patch_scope was
-        unit-tested only against never-yet-mutated tmp_path fixtures,
-        which don't reproduce that write-then-check ordering). Falls back
-        to reading from disk only when no snapshot was recorded for that
-        file (e.g. a caller/test that never wrote to repo_path first).
+        Two different "before" values are used deliberately, for two
+        different purposes:
+
+        - `original_file_snapshots` (file_path -> content immediately
+          before THIS candidate was written - see developer_node/
+          revision_node) is used to actually apply the patch
+          (SafePatcher.apply_patch), since an anchor-based candidate's
+          original_code_snippet may only match whatever was on disk right
+          before it, not the file's original content from before this run
+          started. Preferred over a fresh disk read when available: by the
+          time qa_node runs, developer_node has typically already written
+          the patched result to repo_path, so re-reading the file from
+          disk here would just compare the patched content against itself
+          - this was the exact discrepancy that let a real ~83%-deletion
+          patch through as "PASS". Falls back to a disk read only when no
+          snapshot was recorded for that file.
+        - `true_original_snapshots` (file_path -> content from before this
+          RUN ever touched the file - see AgentState.true_original_snapshots,
+          captured once and never overwritten across revision cycles) is
+          what the actual destructiveness measurement
+          (detect_unsafe_additive_rewrite) below always compares the
+          applied result against. Using `original_file_snapshots` (or a
+          live disk read) for this instead would compare a new candidate
+          against an intermediate, possibly ALSO-fabricated, already-
+          rejected revision attempt rather than the real original - which
+          a whole-file-replacement candidate (empty original_code_snippet,
+          always accepted by SafePatcher regardless of the baseline) can
+          exploit: two independently-fabricated rewrites that happen to
+          resemble each other would show a low/safe deletion fraction
+          against each other while both are 100% destructive relative to
+          the true original. Falls back to whatever baseline validated the
+          patch when no true-original entry was ever recorded (e.g. a
+          caller/test that never populated it).
         """
         from backend.developer.patch_scope import detect_unsafe_additive_rewrite
 
@@ -202,7 +224,12 @@ class QualityPipeline:
                 # check's concern.
                 continue
 
-            reason = detect_unsafe_additive_rewrite(user_request, original, result.applied_content)
+            has_true_original = (
+                true_original_snapshots is not None and patch.file_path in true_original_snapshots
+            )
+            true_original = true_original_snapshots[patch.file_path] if has_true_original else original
+
+            reason = detect_unsafe_additive_rewrite(user_request, true_original, result.applied_content)
             if reason:
                 violations.append(f"{patch.file_path}: {reason}")
 
@@ -275,16 +302,33 @@ class QualityPipeline:
 
         duration_ms = int((time.time() - start) * 1000)
 
-        # Pytest exit code 5 means "no tests collected", treated as PASS (no failing tests)
-        passed = test_result.success or test_result.exit_code == 5
-        status = QualityCheckStatus.PASS.value if passed else QualityCheckStatus.FAIL.value
-
         stdout_summary = (
             f"Passed: {test_result.passed_count}, Failed: {test_result.failed_count}"
             if test_result.passed_count > 0 or test_result.failed_count > 0
             else (test_result.stdout[:200] if test_result.stdout else "Pytest completed.")
         )
         stderr_summary = test_result.error_summary or (test_result.stderr[:300] if test_result.stderr else "")
+
+        # Pytest exit code 5 ("no tests collected") is neither a pass nor a
+        # failure of any actual test - the project architecture permits
+        # repositories without a test suite, so it must never block QA the
+        # way a genuine test failure would. But it is also not evidence
+        # that anything was verified, so it is classified the same way any
+        # other check that produced no real pass/fail signal already is
+        # here (lint/typecheck when the tool itself isn't installed):
+        # SKIPPED, with an explicit reason - never silently reported as an
+        # unqualified PASS that could be mistaken for "tests ran and
+        # passed". StructuredQAJudge already treats SKIPPED checks as
+        # non-blocking (confidence is adjusted down slightly, not failed).
+        if test_result.exit_code == 5:
+            status = QualityCheckStatus.SKIPPED.value
+            reason = "No tests collected (pytest exit code 5) - repository has no test suite; not treated as a failure."
+        elif test_result.success:
+            status = QualityCheckStatus.PASS.value
+            reason = None
+        else:
+            status = QualityCheckStatus.FAIL.value
+            reason = stderr_summary
 
         check = QualityCheck(
             name="pytest",
@@ -293,7 +337,7 @@ class QualityPipeline:
             duration_ms=duration_ms,
             stdout_summary=stdout_summary,
             stderr_summary=stderr_summary,
-            reason=stderr_summary if not passed else None,
+            reason=reason,
         )
 
         return check, test_result
@@ -525,6 +569,7 @@ class QualityPipeline:
         cancel_check: Optional[Callable[[], bool]] = None,
         user_request: str = "",
         original_file_snapshots: Optional[dict] = None,
+        true_original_snapshots: Optional[dict] = None,
     ) -> Tuple[List[QualityCheck], Optional[TestExecutionResult]]:
         """
         Executes all configured quality checks. Order matters for safety,
@@ -555,7 +600,9 @@ class QualityPipeline:
         # 2. Deterministic additive-vs-rewrite scope guard - in-memory
         # diff only, executes nothing.
         scope_check = cls.check_patch_scope(
-            repo_path, patches, user_request=user_request, original_file_snapshots=original_file_snapshots
+            repo_path, patches, user_request=user_request,
+            original_file_snapshots=original_file_snapshots,
+            true_original_snapshots=true_original_snapshots,
         )
 
         # 3. Static Security Scan - in-memory only, executes nothing.
