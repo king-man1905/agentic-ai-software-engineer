@@ -4,6 +4,7 @@ from backend.graph.state import AgentState
 from backend.schemas.routing import TaskType
 from backend.schemas.knowledge import KnowledgeAnswer
 from backend.schemas.planning import ExecutionPlan
+from backend.schemas.qa import QualityCheck, QualityCheckStatus, FailureCategory
 from backend.observability.telemetry import collect_usage, invoke_structured, merge_usage
 from backend.observability.collector import telemetry_collector
 from backend.schemas.telemetry import TelemetryEventType
@@ -602,6 +603,8 @@ def developer_node(state: AgentState) -> dict:
         # QualityPipeline.check_patch_scope's additive-deletion guard)
         # would silently compare the patched file against itself.
         pre_patch_snapshots: dict = {}
+        recoverable_patch_failure_check = None
+        developer_qa_result = None
 
         if repo_context:
             # Give the exact-snippet patch-generation prompt below one
@@ -696,9 +699,35 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
 
                 val_result = SafePatcher.apply_patch(source_content, patch)
                 if not val_result.is_valid:
-                    raise ValueError(
-                        f"AST pre-flight validation failed for {patch.file_path}: {val_result.syntax_errors}"
+                    # Mirror QualityPipeline.check_ast's own distinction
+                    # (backend/qa/pipeline.py): a non-Python file's mismatch
+                    # is exclusively "the anchor didn't match the real file"
+                    # - never a Python syntax/AST violation, since SafePatcher
+                    # only runs its Python-syntax check after a successful
+                    # snippet replacement. That is a recoverable
+                    # patch-generation problem (the LLM's anchor was stale or
+                    # fragmented), not a security or code-safety violation,
+                    # so it is routed to the existing bounded revision loop
+                    # instead of hard-failing the run. A .py file's failure
+                    # keeps hard-failing unchanged, since it may reflect a
+                    # genuine AST/syntax problem that must not be bypassed.
+                    if patch.file_path.lower().endswith(".py"):
+                        raise ValueError(
+                            f"AST pre-flight validation failed for {patch.file_path}: {val_result.syntax_errors}"
+                        )
+                    recoverable_patch_failure_check = QualityCheck(
+                        name="ast",
+                        status=QualityCheckStatus.FAIL.value,
+                        exit_code=1,
+                        stderr_summary=f"{patch.file_path}: {', '.join(val_result.syntax_errors or ['Target snippet not found'])}",
+                        reason="Patch pre-flight validation failed (target snippet not found; not a Python syntax error).",
+                        category=FailureCategory.PATCH_APPLICATION_FAILURE.value,
                     )
+                    # Nothing from this batch is trusted once one patch's
+                    # anchor didn't match - never apply the rest partially,
+                    # and never let a failed batch look like a success.
+                    generated_patches = []
+                    break
                 if val_result.applied_content is not None:
                     try:
                         abs_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -708,7 +737,11 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
                         print(f"Notice: could not write patched file: {e}")
                 generated_patches.append(patch)
 
-        if not generated_patches and developer_result and developer_result.changes:
+        # Skipped when the exact-snippet path hit a recoverable mismatch
+        # above: that failure is real feedback for the revision loop, and
+        # silently replacing it with a fresh blind patch here would erase
+        # the classification before route_after_developer ever sees it.
+        if not generated_patches and not recoverable_patch_failure_check and developer_result and developer_result.changes:
             generated_patches = _materialize_developer_changes(
                 developer_result.changes,
                 state.get("project_id", "test_project"),
@@ -716,6 +749,9 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
                 snapshot_sink=pre_patch_snapshots,
             )
 
+        if recoverable_patch_failure_check is not None:
+            from backend.qa.judge import StructuredQAJudge
+            developer_qa_result = StructuredQAJudge.evaluate(checks=[recoverable_patch_failure_check])
 
     run_id = state.get("run_id")
     if run_id:
@@ -726,7 +762,7 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
             metadata={"patches_count": len(generated_patches)},
         )
 
-    return {
+    result = {
         "developer_result": developer_result,
         "plan": plan,
         "generated_patches": generated_patches,
@@ -742,6 +778,15 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
         "metrics": merge_usage(state.get("metrics"), usage),
         "pre_patch_snapshots": pre_patch_snapshots,
     }
+    if developer_qa_result is not None:
+        # Set only for the narrow recoverable patch-application mismatch
+        # above (never for a normal successful attempt) so
+        # route_after_developer can send this run through the existing
+        # bounded revision loop instead of qa_node. revision_node already
+        # knows how to consume qa_result.summary via ErrorTraceAnalyzer -
+        # reusing the same field means no new consumption path is needed.
+        result["qa_result"] = developer_qa_result
+    return result
 
 
 def qa_node(state: AgentState) -> dict:
@@ -856,6 +901,30 @@ def route_after_knowledge(state: AgentState) -> str:
 
 
 MAX_REVISIONS = 3
+
+
+def route_after_developer(state: AgentState) -> str:
+    """
+    Sends a run to the existing bounded revision loop instead of qa_node
+    only for the narrow recoverable failure developer_node itself can
+    detect and classify (FailureCategory.PATCH_APPLICATION_FAILURE - a
+    generated patch's anchor didn't match the real file, on a non-Python
+    file). developer_node runs exactly once per run (nothing loops back
+    to it), so revision_count is always 0 here; a bounded-retries branch
+    is unnecessary; MAX_REVISIONS is still enforced normally afterwards,
+    by qa_router, for every subsequent revision -> qa cycle.
+    Every other outcome - success, or any hard-fail ValueError raised
+    above (unsafe workspace path, unsafe file path, genuine AST/syntax
+    violation) - is unaffected and continues to qa_node exactly as before.
+    """
+    qa_result = state.get("qa_result")
+    if (
+        qa_result is not None
+        and (qa_result.status or "").strip().upper() == "FAIL"
+        and getattr(qa_result, "failure_category", None) == FailureCategory.PATCH_APPLICATION_FAILURE.value
+    ):
+        return "revision"
+    return "qa"
 
 
 def qa_router(state: AgentState) -> str:
