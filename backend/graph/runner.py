@@ -97,6 +97,7 @@ def _build_graph(checkpointer: BaseCheckpointSaver):
         developer_node,
         qa_node,
         qa_router,
+        route_after_developer,
         route_after_router,
         route_after_planner,
         route_after_knowledge,
@@ -142,7 +143,11 @@ def _build_graph(checkpointer: BaseCheckpointSaver):
         {"developer": "developer", "end": END},
     )
 
-    builder.add_edge("developer", "qa")
+    builder.add_conditional_edges(
+        "developer",
+        route_after_developer,
+        {"qa": "qa", "revision": "revision"},
+    )
     builder.add_conditional_edges(
         "qa",
         qa_router,
