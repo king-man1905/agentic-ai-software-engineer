@@ -68,11 +68,51 @@ def is_additive_request(user_request: str) -> bool:
     return any(re.search(p, text) for p in _ADDITIVE_PATTERNS)
 
 
+
+# Negation cues that flip a rewrite keyword's meaning when they appear in
+# the same clause immediately before it - "do not rewrite" is an additive-
+# preservation instruction, not a rewrite request, even though it contains
+# the word "rewrite". Deliberately simple phrase matching, matching the
+# rest of this module's approach: a false negative here just means the
+# negation isn't recognized and the (safe) rewrite-request classification
+# stands; there is no false-positive risk since this only ever suppresses
+# a match, never creates one.
+_NEGATION_CUES = [
+    r"\bdo not\b", r"\bdon't\b", r"\bdont\b",
+    r"\bdoes not\b", r"\bdoesn't\b",
+    r"\bshould not\b", r"\bshouldn't\b",
+    r"\bmust not\b", r"\bmustn't\b",
+    r"\bcannot\b", r"\bcan't\b", r"\bcan not\b",
+    r"\bnever\b", r"\bwithout\b", r"\bavoid\b",
+]
+_NEGATION_RE = re.compile("|".join(_NEGATION_CUES))
+_CLAUSE_BOUNDARY_RE = re.compile(r"[.\n;]")
+
+
+def _is_negated_at(text: str, match_start: int) -> bool:
+    """True when a negation cue (see _NEGATION_CUES) appears earlier in the
+    SAME clause as the match at `match_start` - i.e. after the previous
+    sentence/clause boundary (., newline, or ;) and before the match
+    itself. A negation in an earlier, unrelated sentence never suppresses
+    a later, genuine rewrite request."""
+    boundaries = [m.end() for m in _CLAUSE_BOUNDARY_RE.finditer(text, 0, match_start)]
+    clause_start = boundaries[-1] if boundaries else 0
+    clause = text[clause_start:match_start]
+    return bool(_NEGATION_RE.search(clause))
+
+
 def is_explicit_rewrite_request(user_request: str) -> bool:
     """True when the user explicitly asked to rewrite, replace, restructure,
-    regenerate, or remove sections from the document."""
+    regenerate, or remove sections from the document - but NOT when that
+    same instruction is negated in the same clause (e.g. "do not rewrite
+    the existing content"), which is an additive-preservation instruction,
+    not a rewrite request."""
     text = (user_request or "").lower()
-    return any(re.search(p, text) for p in _REWRITE_PATTERNS)
+    for pattern in _REWRITE_PATTERNS:
+        for match in re.finditer(pattern, text):
+            if not _is_negated_at(text, match.start()):
+                return True
+    return False
 
 
 def compute_deletion_fraction(original_content: str, updated_content: str) -> float:
