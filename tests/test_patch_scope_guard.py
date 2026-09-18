@@ -364,6 +364,105 @@ class TestAdditiveAndRewriteClassification:
         assert compute_deletion_fraction("", "brand new content\n") == 0.0
 
 
+# ============================================================================
+# Negated-rewrite-instruction bug: is_explicit_rewrite_request() matched bare
+# keywords ("rewrite", "replace", "restructure", "regenerate") even when
+# they appeared in a negated instruction like "Do not rewrite the existing
+# README content." - causing detect_unsafe_additive_rewrite() to (wrongly)
+# treat the request as an explicit rewrite authorization and skip the
+# deletion-fraction guard entirely, exactly when a destructive patch is
+# handed a request that explicitly tells it not to be destructive.
+# ============================================================================
+
+PROD_ADDITIVE_NEGATED_REWRITE_REQUEST = (
+    "Add a small E2E Test section to README.md with a short description. "
+    "Do not rewrite or replace the existing README content. "
+    "Make the smallest additive change possible."
+)
+
+
+class TestNegatedRewriteInstructionIsNotAnExplicitRewrite:
+    def test_genuine_rewrite_requests_still_classified_true(self):
+        assert is_explicit_rewrite_request("Please rewrite the README.") is True
+        assert is_explicit_rewrite_request("Replace the contents of the file.") is True
+        assert is_explicit_rewrite_request("Completely restructure this document.") is True
+        assert is_explicit_rewrite_request("Regenerate the document.") is True
+        assert is_explicit_rewrite_request("Remove the specified sections.") is True
+
+    def test_plain_additive_request_is_false(self):
+        assert is_explicit_rewrite_request("Add an E2E Test section.") is False
+
+    def test_negated_rewrite_instructions_are_false(self):
+        assert is_explicit_rewrite_request("Do not rewrite the existing README content.") is False
+        assert is_explicit_rewrite_request("Do not replace the existing README content.") is False
+        assert is_explicit_rewrite_request(
+            "Do not rewrite, replace, restructure, or regenerate existing content."
+        ) is False
+
+    def test_exact_production_request_is_not_an_explicit_rewrite(self):
+        assert is_explicit_rewrite_request(PROD_ADDITIVE_NEGATED_REWRITE_REQUEST) is False
+
+    def test_negation_in_an_earlier_unrelated_sentence_does_not_suppress_a_later_genuine_rewrite(self):
+        """A negation cue must only suppress a rewrite keyword in the SAME
+        clause - an unrelated earlier negation must never mask a genuine,
+        later rewrite request."""
+        text = "Do not worry about formatting. Please rewrite the README from scratch."
+        assert is_explicit_rewrite_request(text) is True
+
+    def test_detect_unsafe_additive_rewrite_still_flags_destructive_patch_under_negated_request(self):
+        """The exact production scenario: an additive request that
+        explicitly forbids rewriting/replacing must still trigger the
+        deletion-fraction guard against a destructive whole-file
+        replacement - the guard must not be bypassed just because the
+        word "rewrite" appears (negated) in the request."""
+        original = "# agentic-ai-test-repo"
+        destructive_update = (
+            "# Project Title\n\n"
+            "*(Existing project description goes here.)*\n\n"
+            "## E2E Test\nShort description.\n"
+        )
+        reason = detect_unsafe_additive_rewrite(
+            PROD_ADDITIVE_NEGATED_REWRITE_REQUEST, original, destructive_update
+        )
+        assert reason is not None
+        assert "%" in reason
+
+    def test_detect_unsafe_additive_rewrite_still_allows_genuine_minimal_additive_patch(self):
+        """Sanity check in the other direction: a genuinely minimal,
+        content-preserving patch under the same negated-rewrite request
+        must still be allowed."""
+        original = "# agentic-ai-test-repo"
+        safe_update = "# agentic-ai-test-repo\n\n## E2E Test\nShort description.\n"
+        reason = detect_unsafe_additive_rewrite(
+            PROD_ADDITIVE_NEGATED_REWRITE_REQUEST, original, safe_update
+        )
+        assert reason is None
+
+    def test_quality_pipeline_check_patch_scope_fails_closed_under_negated_request(self, tmp_path):
+        """Full check_patch_scope integration: the exact production
+        request + a substantial destructive replacement of the original
+        README must be a FAIL (PATCH_APPLICATION_FAILURE), never a PASS."""
+        original = "# agentic-ai-test-repo"
+        (tmp_path / "README.md").write_text(original, encoding="utf-8")
+
+        destructive_patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet="",
+            updated_code_snippet=(
+                "# Project Title\n\n"
+                "*(Existing project description goes here.)*\n\n"
+                "## E2E Test\nShort description.\n"
+            ),
+            explanation="Add E2E Test section",
+        )
+
+        check = QualityPipeline.check_patch_scope(
+            str(tmp_path), [destructive_patch], user_request=PROD_ADDITIVE_NEGATED_REWRITE_REQUEST,
+        )
+        assert check.status == QualityCheckStatus.FAIL.value
+        assert check.category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+
+
 class TestDeveloperPromptGuidance:
     """Requirement B: the developer prompt explicitly instructs minimal,
     content-preserving patches for additive requests."""
