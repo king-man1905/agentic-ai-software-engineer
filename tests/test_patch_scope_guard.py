@@ -847,4 +847,175 @@ class TestRealE2ERevisionCycleStaleSnapshotBug:
         by_name = {c.name: c for c in checks}
         assert by_name["patch_scope"].status == QualityCheckStatus.FAIL.value
         assert by_name["patch_scope"].category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+
+
+# ============================================================================
+# run_b1c04b69ba54 investigation: a SECOND (or later) whole-file-replacement
+# revision candidate slipped through patch_scope as PASS. Root cause: an
+# earlier, ALSO-rejected revision attempt had already written its own
+# fabricated content to disk (via the blind fallback path). Once that
+# happened, popping the snapshot for a later context-aware candidate (the
+# fix for TestRealE2ERevisionCycleStaleSnapshotBug above) made
+# check_patch_scope fall back to a live disk read - but "live disk" was no
+# longer the true original, it was the EARLIER rejected attempt's own
+# fabrication. Comparing one fabricated whole-file rewrite against another
+# (rather than against the real original) can show a low/safe deletion
+# fraction even though both are 100% destructive relative to the truth,
+# because SafePatcher.apply_patch always accepts an empty
+# original_code_snippet regardless of what "original" is.
+#
+# Fix: AgentState.true_original_snapshots is captured once (developer_node's
+# first read of a file) and never overwritten/popped for the rest of the
+# run - check_patch_scope's destructiveness measurement always compares
+# against it, independently of whatever baseline validated the candidate.
+# ============================================================================
+
+class TestRealE2EMultiCycleFabricationBug:
+    def _real_git_repo(self, path, content):
+        import subprocess
+        path.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=str(path), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(path), capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(path), capture_output=True, text=True)
+        (path / "README.md").write_text(content, encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(path), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(path), capture_output=True, text=True, check=True)
+
+    def test_disk_fallback_without_true_original_reproduces_the_bug(self, tmp_path):
+        """A. Direct reproduction of the exact mechanism, without the full
+        revision_node plumbing: once disk holds an earlier REJECTED
+        whole-file-replacement attempt, comparing a second, similarly
+        generic fabrication against that (instead of the real original)
+        via a popped/absent true-original baseline lets it through as
+        PASS - proving the vulnerability existed."""
+        repo = tmp_path / "repo"
+        self._real_git_repo(repo, "# agentic-ai-test-repo")
+
+        # Attempt 1 (rejected, but already written to disk by the blind
+        # fallback path before rejection).
+        attempt1 = "# Project Title\n\n*(Existing project description goes here.)*\n\n## E2E Test\nSection body v1.\n"
+        (repo / "README.md").write_text(attempt1, encoding="utf-8")
+
+        # Attempt 2: independently fabricated, but similar generic
+        # scaffolding to attempt 1 - 100% destructive relative to the true
+        # 1-line original, but low deletion relative to attempt 1.
+        attempt2 = FilePatch(
+            file_path="README.md", original_code_snippet="",
+            updated_code_snippet="# Project Title\n\n*(Existing project description goes here.)*\n\n## E2E Test\nSection body v2, reworded.\n",
+            explanation="revised patch attempt 2",
+        )
+
+        # The bug: no true-original baseline recorded, only a (popped/absent)
+        # original_file_snapshots entry - falls back to the now-contaminated
+        # live disk (attempt 1's content) for the destructiveness comparison.
+        buggy_check = QualityPipeline.check_patch_scope(
+            str(repo), [attempt2], user_request=ADDITIVE_REQUEST, original_file_snapshots={},
+        )
+        assert buggy_check.status == QualityCheckStatus.PASS.value  # the bug, reproduced
+
+    def test_true_original_snapshot_fixes_the_bug(self, tmp_path):
+        """B. The fix: passing true_original_snapshots (the real,
+        run-lifetime original, captured once) makes check_patch_scope
+        correctly reject attempt 2 as destructive, regardless of what
+        disk currently holds."""
+        repo = tmp_path / "repo"
+        self._real_git_repo(repo, "# agentic-ai-test-repo")
+
+        attempt1 = "# Project Title\n\n*(Existing project description goes here.)*\n\n## E2E Test\nSection body v1.\n"
+        (repo / "README.md").write_text(attempt1, encoding="utf-8")
+
+        attempt2 = FilePatch(
+            file_path="README.md", original_code_snippet="",
+            updated_code_snippet="# Project Title\n\n*(Existing project description goes here.)*\n\n## E2E Test\nSection body v2, reworded.\n",
+            explanation="revised patch attempt 2",
+        )
+
+        fixed_check = QualityPipeline.check_patch_scope(
+            str(repo), [attempt2], user_request=ADDITIVE_REQUEST,
+            original_file_snapshots={},
+            true_original_snapshots={"README.md": "# agentic-ai-test-repo"},
+        )
+        assert fixed_check.status == QualityCheckStatus.FAIL.value
+        assert fixed_check.category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+
+    def test_real_multi_cycle_revision_node_preserves_true_original_and_catches_fabrication(self, tmp_path, monkeypatch):
+        """C. Full integration: drives the REAL developer_node-failure ->
+        revision cycle 1 (blind fallback, writes to disk, rejected) ->
+        revision cycle 2 (context-aware, independently fabricated,
+        similar-looking whole-file replacement) - and confirms the final
+        QA evaluation still correctly rejects it, because
+        true_original_snapshots survived both cycles unmodified."""
+        import os
+        from backend.graph.nodes import revision_node
+        from backend.schemas.developer import DeveloperResult, FileChange
+        from backend.schemas.qa import QAResult
+
+        project_id = "e2e-multi-cycle-fabrication"
+        workspace_dir = tmp_path / "workspace" / "default-org" / project_id
+        self._real_git_repo(workspace_dir, "# agentic-ai-test-repo")
+        monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+
+        base_state = {
+            "user_message": ADDITIVE_REQUEST,
+            "project_id": project_id,
+            "qa_result": QAResult(status="FAIL", summary="anchor mismatch"),
+            "generated_patches": [],
+            "developer_result": DeveloperResult(summary="stub", changes=[], requires_testing=True, notes=[]),
+            "repo_context": None,
+            "revision_count": 0,
+            "pre_patch_snapshots": {"README.md": "# agentic-ai-test-repo"},
+            "true_original_snapshots": {"README.md": "# agentic-ai-test-repo"},
+        }
+
+        attempt1_content = "# Project Title\n\n*(Existing project description goes here.)*\n\n## E2E Test\nSection body v1.\n"
+        monkeypatch.setattr(
+            "backend.agents.developer.revise_code_changes",
+            lambda **k: DeveloperResult(
+                summary="revised", changes=[FileChange(file_path="README.md", action="MODIFY", content=attempt1_content, reasoning="x")],
+                requires_testing=True, notes=[],
+            ),
+        )
+        cycle1_output = revision_node(base_state)
+
+        assert (workspace_dir / "README.md").read_text(encoding="utf-8") == attempt1_content
+        assert cycle1_output["true_original_snapshots"]["README.md"] == "# agentic-ai-test-repo"
+
+        attempt2_patch = FilePatch(
+            file_path="README.md", original_code_snippet="",
+            updated_code_snippet="# Project Title\n\n*(Existing project description goes here.)*\n\n## E2E Test\nSection body v2, reworded.\n",
+            explanation="revised patch attempt 2",
+        )
+        cycle2_state = {
+            **base_state,
+            "qa_result": QAResult(status="FAIL", summary="attempt 1 rejected"),
+            "generated_patches": cycle1_output["generated_patches"],
+            "developer_result": cycle1_output["developer_result"],
+            "repo_context": [1],
+            "revision_count": 1,
+            "pre_patch_snapshots": cycle1_output["pre_patch_snapshots"],
+            "true_original_snapshots": cycle1_output["true_original_snapshots"],
+        }
+        monkeypatch.setattr(
+            "backend.agents.developer.revise_code_changes",
+            lambda **k: DeveloperResult(summary="revised2", changes=[], requires_testing=True, notes=[]),
+        )
+        monkeypatch.setattr(
+            "backend.agents.revision.generate_revision_patches",
+            lambda **k: [attempt2_patch],
+        )
+        cycle2_output = revision_node(cycle2_state)
+
+        # True original must have survived both cycles unchanged.
+        assert cycle2_output["true_original_snapshots"]["README.md"] == "# agentic-ai-test-repo"
+
+        checks, _ = QualityPipeline.run_all(
+            str(workspace_dir),
+            cycle2_output["generated_patches"],
+            user_request=ADDITIVE_REQUEST,
+            original_file_snapshots=cycle2_output["pre_patch_snapshots"],
+            true_original_snapshots=cycle2_output["true_original_snapshots"],
+        )
+        by_name = {c.name: c for c in checks}
+        assert by_name["patch_scope"].status == QualityCheckStatus.FAIL.value
+        assert by_name["patch_scope"].category == FailureCategory.PATCH_APPLICATION_FAILURE.value
         assert by_name["patch_scope"].category == FailureCategory.PATCH_APPLICATION_FAILURE.value

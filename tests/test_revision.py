@@ -679,7 +679,7 @@ class TestQaAndRevisionSeeActualPatch:
         monkeypatch.setattr("backend.graph.nodes.review_code_changes", fake_review)
         monkeypatch.setattr(
             "backend.qa.pipeline.QualityPipeline.run_all",
-            lambda repo_path, patches, timeout=30.0, cancel_check=None, user_request="", original_file_snapshots=None: ([], None),
+            lambda repo_path, patches, timeout=30.0, cancel_check=None, user_request="", original_file_snapshots=None, true_original_snapshots=None: ([], None),
         )
 
         state: AgentState = {
@@ -792,7 +792,7 @@ class TestQaAndRevisionSeeActualPatch:
         monkeypatch.setattr("backend.graph.nodes.review_code_changes", fake_review)
         monkeypatch.setattr(
             "backend.qa.pipeline.QualityPipeline.run_all",
-            lambda repo_path, patches, timeout=30.0, cancel_check=None, user_request="", original_file_snapshots=None: ([], None),
+            lambda repo_path, patches, timeout=30.0, cancel_check=None, user_request="", original_file_snapshots=None, true_original_snapshots=None: ([], None),
         )
 
         state: AgentState = {
