@@ -502,26 +502,42 @@ class AgentRunner:
     ) -> None:
         """
         Clones the registered, authorized repository behind `repository_id`
-        into workspace/<organization_id>/<project_id> when that directory
-        doesn't already exist - the only place in the API-driven run path
-        that turns a registered GitHub repository into a local checkout
-        (previously only backend/integrations/run_github_bot.py's
-        standalone CLI had this, unreachable from POST /api/v1/runs).
+        into workspace/<organization_id>/<project_id> unless that directory
+        is ALREADY a valid git clone of that same repository - the only
+        place in the API-driven run path that turns a registered GitHub
+        repository into a local checkout (previously only
+        backend/integrations/run_github_bot.py's standalone CLI had this,
+        unreachable from POST /api/v1/runs).
 
         A no-op (returns immediately, nothing cloned) when:
         - project_id or repository_id is missing - runs with no associated
           repository are unaffected.
-        - the workspace already exists - idempotent, never re-clones.
-        - the repository isn't registered/authorized for this tenant -
-          never clones a repo this caller isn't authorized to access;
-          existing RAG_INSUFFICIENT_CONTEXT/"don't guess" behavior takes
-          over unchanged, exactly as if this method didn't exist.
-
+        - the workspace is already a git repository whose `origin` remote
+          matches repository_id - idempotent, never re-clones. Checked via
+          the directory actually containing its own .git and a matching
+          remote, NOT mere existence: a project workspace that exists only
+          as a plain directory (never actually cloned - e.g. a stale or
+          manually created leftover) or that's a git clone of a DIFFERENT
+          repository is never trusted as "already provisioned" - both fall
+          through to reauthorization and an attempted (re-)clone below,
+          exactly as if the path were empty. Production had a workspace
+          exactly like the first case: an existing non-git directory that
+          silently skipped both cloning AND the authorization check ever
+          since, for every run against that project_id.
         Raises RuntimeError (caught by start_run's existing exception
-        handler, which records an explicit FAILED run) if the repository
-        IS authorized but cloning it fails - never falls through silently
-        to a misleading RAG_INSUFFICIENT_CONTEXT/QA-failure trail. Also
-        raises RuntimeError if organization_id/project_id can't be
+        handler, which records an explicit FAILED run) whenever
+        repository_id is supplied but a genuinely provisioned, verified
+        workspace can't be produced: the repository isn't
+        registered/authorized for this tenant, cloning an authorized
+        repository fails, or a "successful" clone doesn't actually leave a
+        `.git` behind with an origin matching repository_id. A caller that
+        explicitly names a repository_id is never silently downgraded to a
+        context-less/blind run - that silent degradation is exactly what
+        let developer_node/git_commit_node previously operate against an
+        unprovisioned workspace directory, where a git command falls
+        through to the nearest ANCESTOR .git (e.g. the application's own
+        checkout, if workspace/ lives inside it) instead of erroring.
+        Also raises RuntimeError if organization_id/project_id can't be
         resolved to a safe workspace path at all (see
         resolve_workspace_path) - fails closed rather than guessing.
 
@@ -552,16 +568,39 @@ class AgentRunner:
                 f"could not be resolved to a safe workspace path for project "
                 f"'{project_id}'."
             )
-        if project_path.exists():
-            return
+        if (project_path / ".git").is_dir():
+            # A pre-existing plain directory (never actually cloned - e.g.
+            # a stale or manually created leftover) must NOT short-circuit
+            # here: production had exactly this happen for a project whose
+            # workspace existed without a .git, permanently skipping both
+            # cloning AND the authorization check below on every run.
+            # Only a genuine, already-cloned git repository is trusted -
+            # and only when it's for the SAME repository being requested
+            # now, checked next, so a project_id can never silently keep
+            # serving a DIFFERENT repository's stale clone either.
+            existing_remote = GitWorkspaceManager.get_remote_url(str(project_path))
+            if existing_remote and existing_remote.rstrip("/").lower().endswith(f"/{repository_id}.git".lower()):
+                return
+            # Existing git workspace, but for a different repository than
+            # repository_id now requests (or its remote couldn't be read):
+            # never silently reuse it - fall through to reauthorize below,
+            # exactly as if nothing existed at this path.
 
         try:
             repo = tenant_manager.authorize_repository_access(
                 organization_id=organization_id,
                 repo_full_name=repository_id,
             )
-        except (TenantAccessDeniedError, RepositoryAccessDeniedError):
-            return
+        except (TenantAccessDeniedError, RepositoryAccessDeniedError) as e:
+            # repository_id was explicitly supplied by the caller - never
+            # silently proceed as if no repository had been named (that
+            # let developer_node's blind fallback and any later Git
+            # operation run against a directory that was never actually
+            # provisioned). Fail closed instead.
+            raise RuntimeError(
+                f"WORKSPACE_PROVISIONING_FAILED: repository '{repository_id}' "
+                f"is not authorized for organization '{organization_id}'."
+            ) from e
 
         full_name = repo.full_name or repository_id
         token = repo.github_token or os.environ.get("GITHUB_TOKEN")
@@ -573,6 +612,29 @@ class AgentRunner:
             raise RuntimeError(
                 f"WORKSPACE_PROVISIONING_FAILED: could not clone repository "
                 f"for project '{project_id}'."
+            )
+
+        # Defense in depth: never trust clone_repository()'s boolean return
+        # value alone as proof the workspace is safe to hand to
+        # developer/QA/Git-operating nodes. Re-verify the exact same
+        # invariant used for workspace reuse above - its own `.git` and a
+        # matching origin - so a clone that reports success without
+        # actually producing a valid, correctly-scoped repository (a bug
+        # in clone_repository, an interrupted clone, etc.) still fails
+        # closed here rather than leaving a directory that a later git
+        # command could silently resolve against an ancestor .git.
+        if not (project_path / ".git").is_dir():
+            raise RuntimeError(
+                f"WORKSPACE_PROVISIONING_FAILED: clone reported success but "
+                f"'{project_path}' has no .git directory for project "
+                f"'{project_id}'."
+            )
+        cloned_remote = GitWorkspaceManager.get_remote_url(str(project_path))
+        if not cloned_remote or not cloned_remote.rstrip("/").lower().endswith(f"/{repository_id}.git".lower()):
+            raise RuntimeError(
+                f"WORKSPACE_PROVISIONING_FAILED: cloned workspace at "
+                f"'{project_path}' does not have an origin remote matching "
+                f"'{repository_id}'."
             )
 
     def start_run(

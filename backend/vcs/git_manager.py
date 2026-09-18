@@ -53,6 +53,25 @@ def _git_env() -> Dict[str, str]:
     }
 
 
+def _is_own_git_repo(repo_path: str) -> bool:
+    """
+    True only when repo_path is itself a git repository root (repo_path/.git
+    exists). Every git-mutating call in this module must check this before
+    running any git subprocess with cwd=repo_path: a plain `git` command run
+    from a directory that isn't a repo root of its own doesn't fail just
+    because that directory lacks history - git walks up to the nearest
+    ANCESTOR repository instead (e.g. this tool's own checkout, for a
+    project workspace nested under it) and silently operates there instead,
+    with a normal success exit code. Confirmed in production: this let
+    `git show HEAD:<path>` return an unrelated file from the wrong
+    repository (see _read_head_content), and would equally let
+    `git checkout -b`/`git add .`/`git commit` create branches and commits
+    in that unrelated repository - never a code path that should be
+    reachable for a project workspace that was never actually git-cloned.
+    """
+    return (Path(repo_path) / ".git").is_dir()
+
+
 def _run_git(
     args: List[str],
     repo_path: str,
@@ -138,11 +157,18 @@ class GitWorkspaceManager:
         """
         Clones `clone_url` into `project_path` via the same non-interactive
         git subprocess convention every other operation in this module
-        uses. Idempotent: if `project_path` already exists, returns True
-        immediately without touching it or attempting to clone - callers
-        never need their own existence check first. Returns False (never
-        raises) on any clone failure, so callers decide how to surface
-        that (e.g. as an explicit run failure).
+        uses. Idempotent: if `project_path` is ALREADY a git repository in
+        its own right (has its own .git), returns True immediately without
+        touching it or attempting to clone - callers never need their own
+        validity check first. A `project_path` that merely exists as a
+        plain directory (never actually cloned - e.g. a stale or manually
+        created leftover) is NOT treated as already-provisioned: git
+        itself will refuse to clone into a non-empty directory, so this
+        correctly falls through to an attempted (and failing, `False`)
+        clone rather than silently claiming success over content that was
+        never actually verified to be the right repository. Returns False
+        (never raises) on any clone failure, so callers decide how to
+        surface that (e.g. as an explicit run failure).
 
         This function is intentionally URL-agnostic - it doesn't know
         about GitHub, tokens, or authorization; a caller that needs
@@ -160,7 +186,7 @@ class GitWorkspaceManager:
         failure) - callers must uphold the same rule with whatever they build.
         """
         dest = Path(project_path)
-        if dest.exists():
+        if _is_own_git_repo(str(dest)):
             return True
         args = _with_auth_config(["clone", clone_url, str(dest)], auth_header)
         try:
@@ -176,7 +202,17 @@ class GitWorkspaceManager:
         Creates and checks out a new feature branch in the given repository.
         If the branch already exists, checks it out.
         Returns True on success, False on failure.
+
+        Fails closed (False, no git command run at all) when repo_path
+        isn't a git repository in its own right - see _is_own_git_repo.
+        Without this, `git checkout -b` for such a path would silently
+        create and check out the branch in the nearest ANCESTOR
+        repository instead (confirmed in production: this tool's own
+        checkout), rather than failing or no-op'ing for a project that
+        was never actually git-cloned.
         """
+        if not _is_own_git_repo(repo_path):
+            return False
         try:
             _run_git(["checkout", "-b", branch_name], repo_path)
             return True
@@ -198,7 +234,23 @@ class GitWorkspaceManager:
         (e.g. the developer agent writes its patch directly to disk so QA
         can test the real fix) - the committed blob is unaffected by that.
         Returns "" if there's no commit history yet or the file is new.
+
+        Requires repo_path to be a git repository ROOT in its own right
+        (i.e. repo_path/.git exists) before ever running `git show`. A
+        project workspace that was never `git init`/cloned (common for ad
+        hoc test projects) has no .git of its own; running a bare `git`
+        command with cwd=repo_path in that case doesn't fail - git walks
+        up to the nearest ANCESTOR repository (e.g. this tool's own
+        checkout, if the workspace happens to live under it) and
+        `git show HEAD:<path>` resolves <path> relative to THAT repo's
+        root, silently returning a completely unrelated file's content
+        with exit code 0. That produced a real, confirmed production bug:
+        risk/diff scoring compared an unrelated 134-line file against the
+        actual patch, reporting a bogus ~79% "deletion" that had nothing
+        to do with what was actually written to the target project.
         """
+        if not _is_own_git_repo(repo_path):
+            return ""
         try:
             result = _run_git(["show", f"HEAD:{file_path}"], repo_path, check=False)
             if result.returncode == 0:
@@ -206,6 +258,29 @@ class GitWorkspaceManager:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
         return ""
+
+    @staticmethod
+    def get_remote_url(repo_path: str, remote: str = "origin") -> Optional[str]:
+        """
+        Returns the configured URL for `remote` in repo_path's own git
+        config, or None if repo_path isn't a git repository in its own
+        right or the remote isn't configured. Used to verify an existing,
+        already-cloned workspace actually corresponds to the repository
+        currently being authorized for it before trusting it as
+        "already provisioned" - see
+        AgentRunner._ensure_workspace_provisioned, which must never
+        silently reuse a workspace that was cloned from a DIFFERENT
+        repository under the same project_id.
+        """
+        if not _is_own_git_repo(repo_path):
+            return None
+        try:
+            result = _run_git(["remote", "get-url", remote], repo_path, check=False)
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        return None
 
     @staticmethod
     def apply_patches(
@@ -399,7 +474,17 @@ class GitWorkspaceManager:
     def stage_and_commit(repo_path: str, message: str) -> bool:
         """
         Stages all changes and creates a commit. Returns True on success.
+
+        Fails closed (False, no git command run at all) when repo_path
+        isn't a git repository in its own right - see _is_own_git_repo.
+        Without this, `git add .` + `git commit` for such a path would
+        silently stage and commit whatever is in the nearest ANCESTOR
+        repository's working tree (confirmed in production: this tool's
+        own checkout) instead of failing for a project that was never
+        actually git-cloned.
         """
+        if not _is_own_git_repo(repo_path):
+            return False
         try:
             _run_git(["add", "."], repo_path)
             _run_git(["commit", "-m", message], repo_path)
@@ -422,7 +507,16 @@ class GitWorkspaceManager:
         clone_repository() (see build_github_auth_header()), supplied via a
         process-scoped `-c http.extraHeader=...` flag - push no longer
         relies on a credential embedded in the remote's stored URL.
+
+        Fails closed (False, no git command run at all) when repo_path
+        isn't a git repository in its own right - see _is_own_git_repo.
+        The highest-severity instance of this class of bug: pushing a
+        branch_name that happens to already exist in the nearest ANCESTOR
+        repository (e.g. this tool's own checkout) would push straight to
+        its real, unrelated remote.
         """
+        if not _is_own_git_repo(repo_path):
+            return False
         args = _with_auth_config(["push", "-u", remote, branch_name], auth_header)
         try:
             _run_git(args, repo_path)
