@@ -493,6 +493,19 @@ def _materialize_developer_changes(
             if true_original_sink is not None:
                 true_original_sink.setdefault(ch.file_path, before_content)
 
+        from backend.developer.patch_scope import (
+            PatchWrapperArtifactError,
+            detect_patch_wrapper_artifacts,
+        )
+
+        wrapper_reason = detect_patch_wrapper_artifacts(ch.content)
+        if wrapper_reason:
+            # Never write a hallucinated patch-tool wrapper (e.g. "*** Begin
+            # Patch") to disk as if it were real file content - see
+            # PatchWrapperArtifactError's docstring for how callers route
+            # this into the existing bounded revision loop instead.
+            raise PatchWrapperArtifactError(ch.file_path, wrapper_reason)
+
         try:
             abs_f.parent.mkdir(parents=True, exist_ok=True)
             with open(abs_f, "w", encoding="utf-8") as f:
@@ -747,6 +760,28 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
                     generated_patches = []
                     break
                 if val_result.applied_content is not None:
+                    from backend.developer.patch_scope import detect_patch_wrapper_artifacts
+
+                    wrapper_reason = detect_patch_wrapper_artifacts(val_result.applied_content)
+                    if wrapper_reason:
+                        # The LLM hallucinated a patch-editor tool's wrapper
+                        # syntax (e.g. "*** Begin Patch") instead of real
+                        # file content. Never write that to disk - treat it
+                        # exactly like a SafePatcher anchor mismatch above
+                        # (a recoverable patch-generation problem, not a
+                        # security violation), so the run gets a chance to
+                        # regenerate instead of corrupting the workspace
+                        # file with tool syntax.
+                        recoverable_patch_failure_check = QualityCheck(
+                            name="ast",
+                            status=QualityCheckStatus.FAIL.value,
+                            exit_code=1,
+                            stderr_summary=f"{patch.file_path}: {wrapper_reason}",
+                            reason="Patch pre-flight validation failed (hallucinated patch-tool wrapper syntax; not real file content).",
+                            category=FailureCategory.PATCH_APPLICATION_FAILURE.value,
+                        )
+                        generated_patches = []
+                        break
                     try:
                         abs_file_path.parent.mkdir(parents=True, exist_ok=True)
                         with open(abs_file_path, "w", encoding="utf-8") as f:
@@ -760,13 +795,26 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
         # silently replacing it with a fresh blind patch here would erase
         # the classification before route_after_developer ever sees it.
         if not generated_patches and not recoverable_patch_failure_check and developer_result and developer_result.changes:
-            generated_patches = _materialize_developer_changes(
-                developer_result.changes,
-                state.get("project_id", "test_project"),
-                state.get("organization_id", "default-org"),
-                snapshot_sink=pre_patch_snapshots,
-                true_original_sink=true_original_snapshots,
-            )
+            from backend.developer.patch_scope import PatchWrapperArtifactError
+
+            try:
+                generated_patches = _materialize_developer_changes(
+                    developer_result.changes,
+                    state.get("project_id", "test_project"),
+                    state.get("organization_id", "default-org"),
+                    snapshot_sink=pre_patch_snapshots,
+                    true_original_sink=true_original_snapshots,
+                )
+            except PatchWrapperArtifactError as e:
+                recoverable_patch_failure_check = QualityCheck(
+                    name="ast",
+                    status=QualityCheckStatus.FAIL.value,
+                    exit_code=1,
+                    stderr_summary=str(e),
+                    reason="Patch pre-flight validation failed (hallucinated patch-tool wrapper syntax; not real file content).",
+                    category=FailureCategory.PATCH_APPLICATION_FAILURE.value,
+                )
+                generated_patches = []
 
         if recoverable_patch_failure_check is not None:
             from backend.qa.judge import StructuredQAJudge
@@ -1077,13 +1125,25 @@ def revision_node(state: AgentState) -> dict:
         # takes.
         true_original_snapshots = dict(state.get("true_original_snapshots") or {})
         if not context_aware_patch_produced and revised_result and revised_result.changes:
-            generated_patches = _materialize_developer_changes(
-                revised_result.changes,
-                state.get("project_id", "test_project"),
-                state.get("organization_id", "default-org"),
-                snapshot_sink=pre_patch_snapshots,
-                true_original_sink=true_original_snapshots,
-            )
+            from backend.developer.patch_scope import PatchWrapperArtifactError
+
+            try:
+                generated_patches = _materialize_developer_changes(
+                    revised_result.changes,
+                    state.get("project_id", "test_project"),
+                    state.get("organization_id", "default-org"),
+                    snapshot_sink=pre_patch_snapshots,
+                    true_original_sink=true_original_snapshots,
+                )
+            except PatchWrapperArtifactError as e:
+                # Never write a hallucinated patch-tool wrapper to disk.
+                # Leave generated_patches as the previous (already-rejected)
+                # candidate this cycle failed to improve on - qa_node will
+                # re-evaluate it, correctly fail it again, and the bounded
+                # revision loop continues (or exhausts MAX_REVISIONS)
+                # exactly as it already does when generate_revision_patches
+                # itself raises, above.
+                print(f"Revision patch materialization notice: {e}")
         elif context_aware_patch_produced:
             # generate_revision_patches (backend/agents/revision.py) never
             # writes to disk - it validates each candidate's
