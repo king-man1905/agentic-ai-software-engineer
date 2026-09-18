@@ -87,10 +87,16 @@ class TestEnsureWorkspaceProvisionedTenantIsolation:
         cloned_urls = []
 
         def fake_clone(clone_url, project_path, timeout=60, auth_header=None):
+            import subprocess
             cloned_urls.append((clone_url, project_path))
             from pathlib import Path
             Path(project_path).mkdir(parents=True, exist_ok=True)
             (Path(project_path) / "MARKER.txt").write_text(clone_url, encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=project_path, capture_output=True, text=True, check=True)
+            subprocess.run(
+                ["git", "remote", "add", "origin", clone_url],
+                cwd=project_path, capture_output=True, text=True, check=True,
+            )
             return True
 
         monkeypatch.setattr(
@@ -119,13 +125,32 @@ class TestEnsureWorkspaceProvisionedTenantIsolation:
 
     def test_provisioning_is_idempotent_within_same_tenant(self, tmp_path, monkeypatch):
         """A second call for the same (org, project_id) never re-clones -
-        the pre-existing idempotency guarantee, unaffected by namespacing."""
+        the pre-existing idempotency guarantee, unaffected by namespacing.
+        Idempotency is keyed on the workspace actually being a valid git
+        clone of the same repository (see
+        TestWorkspaceProvisioningGitValidityCheck in
+        tests/test_workspace_provisioning.py for the case where it isn't),
+        not mere directory existence - so this simulates what a genuine
+        successful clone leaves behind (its own .git + matching remote)
+        rather than an empty directory the mocked clone_repository()
+        never actually populated."""
+        import os
+        import subprocess
+
         tenant_manager.create_organization("org-a", "Org A")
         tenant_manager.register_repository(
             "acme/widgets", "org-a", "widgets", full_name="acme/widgets",
         )
         monkeypatch.chdir(tmp_path)
-        clone_spy = MagicMock(return_value=True)
+        project_path = tmp_path / "workspace" / "org-a" / "widgets"
+
+        def fake_clone(clone_url, dest, timeout=60, auth_header=None):
+            os.makedirs(dest, exist_ok=True)
+            subprocess.run(["git", "init"], cwd=dest, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "remote", "add", "origin", clone_url], cwd=dest, capture_output=True, text=True, check=True)
+            return True
+
+        clone_spy = MagicMock(side_effect=fake_clone)
         monkeypatch.setattr(
             "backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy
         )
@@ -135,13 +160,13 @@ class TestEnsureWorkspaceProvisionedTenantIsolation:
             project_id="widgets", repository_id="acme/widgets", organization_id="org-a",
         )
         assert clone_spy.call_count == 1
+        assert (project_path / ".git").is_dir()
 
-        (tmp_path / "workspace" / "org-a" / "widgets").mkdir(parents=True, exist_ok=True)
         runner._ensure_workspace_provisioned(
             project_id="widgets", repository_id="acme/widgets", organization_id="org-a",
         )
         # Still just the one clone from the first call - the second found
-        # its own (org-a-namespaced) workspace already there.
+        # its own (org-a-namespaced), already-cloned workspace there.
         assert clone_spy.call_count == 1
 
     def test_traversal_organization_id_fails_closed_not_silently_ignored(self, tmp_path, monkeypatch):

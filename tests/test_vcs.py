@@ -507,18 +507,37 @@ class TestGitOperationsIsolated:
         assert dest.exists()
         assert (dest / "README.md").read_text(encoding="utf-8") == "# Test\n"
 
-    def test_clone_repository_idempotent_when_destination_exists(self, tmp_path):
-        """An already-existing destination is left untouched - no clone is
-        even attempted (proven by passing a source that would fail if
-        actually used)."""
+    def test_clone_repository_idempotent_when_destination_is_already_a_git_repo(self, tmp_path):
+        """An already-existing destination that is ITSELF a valid git
+        repository is left untouched - no clone is even attempted (proven
+        by passing a source that would fail if actually used)."""
         dest = tmp_path / "already_there"
         dest.mkdir()
+        subprocess.run(["git", "init"], cwd=str(dest), capture_output=True, text=True, check=True)
         (dest / "marker.txt").write_text("pre-existing content\n", encoding="utf-8")
 
         result = GitWorkspaceManager.clone_repository("/no/such/source", str(dest))
 
         assert result is True
         assert (dest / "marker.txt").read_text(encoding="utf-8") == "pre-existing content\n"
+
+    def test_clone_repository_does_not_treat_plain_existing_directory_as_cloned(self, tmp_path):
+        """run_26511e289d84 root cause: a destination that merely EXISTS
+        as a plain directory (never actually git-cloned - a stale or
+        manually created leftover) must NOT be silently treated as
+        already-provisioned. Since git refuses to clone into a non-empty
+        directory, this correctly attempts (and fails, False) rather than
+        claiming success over unverified content."""
+        dest = tmp_path / "stale_leftover"
+        dest.mkdir()
+        (dest / "marker.txt").write_text("never actually cloned\n", encoding="utf-8")
+
+        result = GitWorkspaceManager.clone_repository("/no/such/source", str(dest))
+
+        assert result is False
+        assert not (dest / ".git").exists()
+        # The stale content is never deleted or overwritten.
+        assert (dest / "marker.txt").read_text(encoding="utf-8") == "never actually cloned\n"
 
     def test_clone_repository_returns_false_on_invalid_source(self, tmp_path):
         """A source that git can't clone from fails closed - False, no
@@ -695,6 +714,8 @@ class TestGitOperationsIsolated:
         """E (defense in depth). Even if some future git error message DID
         echo the auth_header verbatim in stderr, push_branch()'s own
         redaction must strip it before printing."""
+        (tmp_path / ".git").mkdir()  # satisfies the repo-boundary guard; _run_git itself is mocked below
+
         fake_token = "ghp_FAKE_TEST_TOKEN_redact"
         auth_header_value = build_github_auth_header(fake_token)
 
@@ -927,3 +948,144 @@ class TestGraphCompilation:
         # LangGraph may add __start__ / __end__ meta nodes
         for expected in expected_nodes:
             assert expected in node_names, f"Missing node: {expected}"
+
+
+# ============================================================================
+# Cross-repository git leak (run_26511e289d84 investigation)
+#
+# Root cause: a project workspace that was never `git init`/cloned has no
+# .git of its own. Running a bare `git` subprocess with cwd=that_directory
+# doesn't fail on that account - git walks up to the nearest ANCESTOR
+# repository (in production: this tool's own checkout, since project
+# workspaces live under it) and silently operates there instead, exiting
+# 0. Confirmed in production: _read_head_content's `git show HEAD:<path>`
+# returned this tool's own unrelated 134-line top-level README.md instead
+# of the real (much smaller) target file, producing a bogus ~79%
+# "deletion" risk score that had nothing to do with what was actually
+# written. The same pattern in create_feature_branch/stage_and_commit/
+# push_branch would create branches and commits in that unrelated
+# repository and could push them to its real remote.
+#
+# check_patch_scope (backend/qa/pipeline.py) is unaffected by this bug -
+# it never shells out to git - and its PASS verdict for that run was very
+# likely correct relative to the real (small) file content, which this bug
+# had nothing to do with evaluating.
+# ============================================================================
+
+class TestGitRepositoryBoundaryLeak:
+    def _outer_repo_with_poisoned_file(self, tmp_path):
+        """A real git repo (simulating this tool's own checkout) with a
+        substantial, unrelated README.md committed at its ROOT - matching
+        production exactly: `git show HEAD:<path>` always resolves <path>
+        relative to the repository ROOT, regardless of cwd, so a bare
+        "README.md" patch.file_path leaks to the ancestor repo's TOP-LEVEL
+        file, not anything nested. Also creates an empty "nested/"
+        subdirectory (no README.md of its own) to stand in for the
+        non-git project workspace."""
+        outer = tmp_path / "outer_repo"
+        outer.mkdir()
+        subprocess.run(["git", "init"], cwd=str(outer), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(outer), capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(outer), capture_output=True, text=True)
+        (outer / "README.md").write_text("\n".join(f"line {i}" for i in range(134)) + "\n", encoding="utf-8")
+        (outer / "nested").mkdir()
+        subprocess.run(["git", "add", "."], cwd=str(outer), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "commit", "-m", "outer repo content"], cwd=str(outer), capture_output=True, text=True, check=True)
+        return outer
+
+    def test_read_head_content_does_not_leak_to_ancestor_repo(self, tmp_path):
+        """The exact production bug: a non-git project workspace nested
+        inside a real repo must never return that ancestor repo's file."""
+        outer = self._outer_repo_with_poisoned_file(tmp_path)
+        nested_workspace = outer / "nested"  # has no .git of its own
+
+        content = GitWorkspaceManager._read_head_content(str(nested_workspace), "README.md")
+        assert content == ""  # fails closed, never the outer repo's 134-line file
+
+    def test_read_head_content_works_normally_for_a_real_repo(self, tmp_path):
+        """Regression guard: a project workspace that IS its own git repo
+        must continue to have its HEAD content read normally."""
+        repo = tmp_path / "real_repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(repo), capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(repo), capture_output=True, text=True)
+        (repo / "README.md").write_text("real content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, text=True, check=True)
+
+        content = GitWorkspaceManager._read_head_content(str(repo), "README.md")
+        assert content == "real content\n"
+
+    def test_create_feature_branch_does_not_leak_to_ancestor_repo(self, tmp_path):
+        outer = self._outer_repo_with_poisoned_file(tmp_path)
+        original_branch = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=str(outer), capture_output=True, text=True, check=True
+        ).stdout.strip()
+        nested_workspace = outer / "nested"
+
+        result = GitWorkspaceManager.create_feature_branch(str(nested_workspace), "agent/task-should-not-exist")
+        assert result is False
+
+        # The ancestor repo's own branch must be completely untouched.
+        current_branch = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=str(outer), capture_output=True, text=True, check=True
+        ).stdout.strip()
+        assert current_branch == original_branch
+        all_branches = subprocess.run(
+            ["git", "branch", "-a"], cwd=str(outer), capture_output=True, text=True, check=True
+        ).stdout
+        assert "agent/task-should-not-exist" not in all_branches
+
+    def test_stage_and_commit_does_not_leak_to_ancestor_repo(self, tmp_path):
+        outer = self._outer_repo_with_poisoned_file(tmp_path)
+        original_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(outer), capture_output=True, text=True, check=True
+        ).stdout.strip()
+        nested_workspace = outer / "nested"
+        (nested_workspace / "new_untracked_file.txt").write_text("should never be committed\n", encoding="utf-8")
+
+        result = GitWorkspaceManager.stage_and_commit(str(nested_workspace), "should never happen")
+        assert result is False
+
+        # The ancestor repo's HEAD must be completely untouched.
+        current_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(outer), capture_output=True, text=True, check=True
+        ).stdout.strip()
+        assert current_head == original_head
+
+    def test_push_branch_does_not_leak_to_ancestor_repo(self, tmp_path):
+        outer = self._outer_repo_with_poisoned_file(tmp_path)
+        nested_workspace = outer / "nested"
+
+        result = GitWorkspaceManager.push_branch(str(nested_workspace), "main")
+        assert result is False  # fails closed before ever invoking git push
+
+    def test_apply_patches_treats_non_git_workspace_as_new_file_not_ancestor_content(self, tmp_path):
+        """End-to-end through apply_patches/prepare_diff_summary: a patch
+        against a non-git project workspace must be diffed against ""
+        (new file), never the ancestor repo's unrelated committed content -
+        this is what previously produced the bogus ~79% deletion risk
+        score for a file that was never actually that large."""
+        outer = self._outer_repo_with_poisoned_file(tmp_path)
+        nested_workspace = outer / "nested"
+
+        patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet="",
+            updated_code_snippet="# New project\n\nGenerated content.\n",
+            explanation="Add E2E Test section",
+        )
+
+        file_changes = GitWorkspaceManager.apply_patches(str(nested_workspace), [patch])
+        original_content, patched_content = file_changes["README.md"]
+
+        # Must NOT be the outer repo's 134-line poisoned content.
+        assert original_content == ""
+        assert len(original_content.splitlines()) == 0
+
+        _, lines_added, lines_deleted = GitWorkspaceManager.compute_diff(file_changes)
+        # A brand-new 3-line file: no deletions at all, not a ~118-line
+        # deletion against unrelated ancestor content.
+        assert lines_deleted == 0
+        assert lines_added == 3

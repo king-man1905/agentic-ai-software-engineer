@@ -153,7 +153,7 @@ class TestRegisterRepositoryEndpoint:
         assert repo.github_token == "new-token"
 
     def test_registered_repository_enables_workspace_provisioning_and_pr_publish(
-        self, tmp_path, monkeypatch, client
+        self, tmp_path, monkeypatch, client, fake_clone_creates_real_git_repo
     ):
         """End-to-end wiring proof: a repository registered through this
         endpoint is exactly what _ensure_workspace_provisioned (the run
@@ -171,7 +171,7 @@ class TestRegisterRepositoryEndpoint:
         assert resp.status_code == 201
 
         monkeypatch.chdir(tmp_path)
-        clone_spy = MagicMock(return_value=True)
+        clone_spy = MagicMock(side_effect=fake_clone_creates_real_git_repo)
         monkeypatch.setattr(
             "backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy
         )

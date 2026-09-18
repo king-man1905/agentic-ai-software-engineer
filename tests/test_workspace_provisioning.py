@@ -11,6 +11,7 @@ run_github_bot.py CLI script had clone logic, unreachable from the API.
 """
 
 import shutil
+import subprocess
 from unittest.mock import MagicMock
 
 import pytest
@@ -52,7 +53,7 @@ def isolated_state(tmp_path, monkeypatch):
 
 
 class TestEnsureWorkspaceProvisioned:
-    def test_clones_when_missing_and_authorized(self, tmp_path, monkeypatch):
+    def test_clones_when_missing_and_authorized(self, tmp_path, monkeypatch, fake_clone_creates_real_git_repo):
         """A. Missing workspace + registered/authorized repo -> clone is
         attempted with a URL identifying the correct repository."""
         tenant_manager.register_repository(
@@ -60,7 +61,7 @@ class TestEnsureWorkspaceProvisioned:
             full_name="acme/widgets", github_token="secret-token-abc",
         )
         monkeypatch.chdir(tmp_path)
-        clone_spy = MagicMock(return_value=True)
+        clone_spy = MagicMock(side_effect=fake_clone_creates_real_git_repo)
         monkeypatch.setattr(
             "backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy
         )
@@ -75,13 +76,22 @@ class TestEnsureWorkspaceProvisioned:
         assert "acme/widgets" in clone_url
         assert project_path.endswith("widgets")
 
-    def test_skips_clone_when_workspace_exists(self, tmp_path, monkeypatch):
-        """B. Existing workspace -> clone is never attempted (idempotent)."""
+    def test_skips_clone_when_valid_git_workspace_for_same_repo_exists(self, tmp_path, monkeypatch):
+        """B. Existing, valid git workspace already cloned from the SAME
+        repository -> clone is never attempted (idempotent reuse)."""
+        import subprocess
+
         tenant_manager.register_repository(
             "acme/widgets", "default-org", "widgets", full_name="acme/widgets",
         )
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "workspace" / "default-org" / "widgets").mkdir(parents=True)
+        project_path = tmp_path / "workspace" / "default-org" / "widgets"
+        project_path.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=str(project_path), capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://github.com/acme/widgets.git"],
+            cwd=str(project_path), capture_output=True, text=True, check=True,
+        )
         clone_spy = MagicMock(return_value=True)
         monkeypatch.setattr(
             "backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy
@@ -96,8 +106,11 @@ class TestEnsureWorkspaceProvisioned:
 
     def test_never_clones_unauthorized_or_unregistered_repo(self, tmp_path, monkeypatch):
         """C. No matching registered repository -> clone is never
-        attempted; this is a silent no-op (existing insufficient-context
-        behavior takes over unchanged), not a hard failure."""
+        attempted, and since repository_id was explicitly supplied by the
+        caller, this now fails closed (an explicit RuntimeError) rather
+        than silently degrading to a context-less/blind run - the silent
+        no-op was exactly what let a later Git operation run against an
+        unprovisioned workspace directory."""
         monkeypatch.chdir(tmp_path)
         clone_spy = MagicMock(return_value=True)
         monkeypatch.setattr(
@@ -105,9 +118,10 @@ class TestEnsureWorkspaceProvisioned:
         )
 
         runner = AgentRunner()
-        runner._ensure_workspace_provisioned(
-            project_id="widgets", repository_id="acme/widgets", organization_id="default-org",
-        )
+        with pytest.raises(RuntimeError, match="WORKSPACE_PROVISIONING_FAILED"):
+            runner._ensure_workspace_provisioned(
+                project_id="widgets", repository_id="acme/widgets", organization_id="default-org",
+            )
 
         clone_spy.assert_not_called()
 
@@ -167,7 +181,7 @@ class TestEnsureWorkspaceProvisioned:
 
         clone_spy.assert_not_called()
 
-    def test_clone_url_is_clean_and_token_passed_separately(self, tmp_path, monkeypatch):
+    def test_clone_url_is_clean_and_token_passed_separately(self, tmp_path, monkeypatch, fake_clone_creates_real_git_repo):
         """F. _ensure_workspace_provisioned must pass a clean,
         credential-free URL to clone_repository() and the resolved token
         only via the separate auth_header parameter - never embedded in
@@ -178,7 +192,7 @@ class TestEnsureWorkspaceProvisioned:
             full_name="acme/widgets", github_token="fake-provisioning-token",
         )
         monkeypatch.chdir(tmp_path)
-        clone_spy = MagicMock(return_value=True)
+        clone_spy = MagicMock(side_effect=fake_clone_creates_real_git_repo)
         monkeypatch.setattr(
             "backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy
         )
@@ -344,6 +358,11 @@ def test_api_run_provisions_missing_repository_and_rag_sees_it(
 
     def fake_clone(clone_url, project_path, timeout=60, auth_header=None):
         shutil.copytree(str(source_repo_fixture), project_path)
+        subprocess.run(["git", "init"], cwd=project_path, capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", clone_url],
+            cwd=project_path, capture_output=True, text=True, check=True,
+        )
         return True
 
     monkeypatch.setattr(
@@ -402,6 +421,11 @@ def test_repository_registration_endpoint_enables_fresh_workspace_provisioning(
 
     def fake_clone(clone_url, project_path, timeout=60, auth_header=None):
         shutil.copytree(str(source_repo_fixture), project_path)
+        subprocess.run(["git", "init"], cwd=project_path, capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", clone_url],
+            cwd=project_path, capture_output=True, text=True, check=True,
+        )
         return True
 
     monkeypatch.setattr(
@@ -526,3 +550,298 @@ def test_api_run_without_repository_id_keeps_existing_insufficient_context_behav
     dev_result = state_values.get("developer_result")
     assert dev_result is not None
     assert dev_result.changes == []
+
+
+# ============================================================================
+# run_26511e289d84 investigation: workspace/default-org/e2e-test existed as
+# a plain directory (no .git) forever, because _ensure_workspace_provisioned
+# treated ANY existing path as "already provisioned" - skipping both
+# cloning AND the authorization check below it - rather than verifying it
+# was actually a valid, correctly-authorized git clone.
+# ============================================================================
+
+class TestWorkspaceProvisioningGitValidityCheck:
+    def _real_git_repo_with_remote(self, path, remote_url):
+        import subprocess
+        path.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=str(path), capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", remote_url],
+            cwd=str(path), capture_output=True, text=True, check=True,
+        )
+
+    def test_A_missing_workspace_clones(self, tmp_path, monkeypatch, fake_clone_creates_real_git_repo):
+        """A. No workspace directory at all -> clone is attempted."""
+        tenant_manager.register_repository(
+            "acme/widgets", "default-org", "widgets", full_name="acme/widgets",
+        )
+        monkeypatch.chdir(tmp_path)
+        clone_spy = MagicMock(side_effect=fake_clone_creates_real_git_repo)
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy)
+
+        AgentRunner()._ensure_workspace_provisioned(
+            project_id="widgets", repository_id="acme/widgets", organization_id="default-org",
+        )
+        clone_spy.assert_called_once()
+
+    def test_B_valid_git_workspace_for_same_repo_is_reused(self, tmp_path, monkeypatch):
+        """B. Existing, valid git workspace already cloned from the SAME
+        repository -> reused, clone is never attempted."""
+        tenant_manager.register_repository(
+            "acme/widgets", "default-org", "widgets", full_name="acme/widgets",
+        )
+        monkeypatch.chdir(tmp_path)
+        self._real_git_repo_with_remote(
+            tmp_path / "workspace" / "default-org" / "widgets", "https://github.com/acme/widgets.git"
+        )
+        clone_spy = MagicMock(return_value=True)
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy)
+
+        AgentRunner()._ensure_workspace_provisioned(
+            project_id="widgets", repository_id="acme/widgets", organization_id="default-org",
+        )
+        clone_spy.assert_not_called()
+
+    def test_C_existing_non_git_directory_is_not_silently_reused(self, tmp_path, monkeypatch, fake_clone_creates_real_git_repo):
+        """C. Existing directory WITHOUT its own .git (exactly the
+        production incident: a stale/manually-created leftover, never
+        actually cloned) -> must NOT be silently treated as provisioned.
+        It reauthorizes and attempts a (re-)clone - the safe, existing
+        lifecycle behavior for a workspace that turns out to need
+        provisioning - rather than permanently skipping both steps."""
+        tenant_manager.register_repository(
+            "acme/widgets", "default-org", "widgets", full_name="acme/widgets",
+        )
+        monkeypatch.chdir(tmp_path)
+        project_path = tmp_path / "workspace" / "default-org" / "widgets"
+        project_path.mkdir(parents=True)
+        (project_path / "some_stale_file.txt").write_text("leftover, never git-cloned\n", encoding="utf-8")
+        clone_spy = MagicMock(side_effect=fake_clone_creates_real_git_repo)
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy)
+
+        AgentRunner()._ensure_workspace_provisioned(
+            project_id="widgets", repository_id="acme/widgets", organization_id="default-org",
+        )
+        # Falls through to reauthorize + attempt (re-)clone, exactly as if
+        # the directory had never existed - never a silent, permanent skip.
+        clone_spy.assert_called_once()
+
+    def test_C_existing_non_git_directory_fails_closed_when_clone_actually_runs(self, tmp_path, monkeypatch):
+        """C (end-to-end, real clone_repository - not mocked): a stale
+        non-git directory causes an explicit WORKSPACE_PROVISIONING_FAILED
+        error (git refuses to clone into a non-empty directory), never a
+        silent success with unverified stale content left in place."""
+        tenant_manager.register_repository(
+            "acme/widgets", "default-org", "widgets", full_name="acme/widgets",
+        )
+        monkeypatch.chdir(tmp_path)
+        project_path = tmp_path / "workspace" / "default-org" / "widgets"
+        project_path.mkdir(parents=True)
+        (project_path / "some_stale_file.txt").write_text("leftover, never git-cloned\n", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="WORKSPACE_PROVISIONING_FAILED"):
+            AgentRunner()._ensure_workspace_provisioned(
+                project_id="widgets", repository_id="acme/widgets", organization_id="default-org",
+            )
+        # The stale content must never be silently deleted or overwritten.
+        assert (project_path / "some_stale_file.txt").exists()
+        assert not (project_path / ".git").exists()
+
+    def test_D_same_tenant_different_repository_reauthorizes_not_silently_reused(self, tmp_path, monkeypatch, fake_clone_creates_real_git_repo):
+        """D. Same tenant, but the existing git workspace was cloned from a
+        DIFFERENT repository than repository_id now requests -> must
+        reauthorize (and attempt a fresh clone) rather than silently
+        continuing to serve the old repository's stale clone."""
+        tenant_manager.register_repository(
+            "acme/other-repo", "default-org", "widgets", full_name="acme/other-repo",
+        )
+        monkeypatch.chdir(tmp_path)
+        self._real_git_repo_with_remote(
+            tmp_path / "workspace" / "default-org" / "widgets",
+            "https://github.com/acme/widgets.git",  # the OLD, different repository
+        )
+        clone_spy = MagicMock(side_effect=fake_clone_creates_real_git_repo)
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy)
+
+        AgentRunner()._ensure_workspace_provisioned(
+            project_id="widgets", repository_id="acme/other-repo", organization_id="default-org",
+        )
+        # Reauthorized for the NEW repository and attempted a fresh clone -
+        # never silently kept serving the old repo's content.
+        clone_spy.assert_called_once()
+        clone_url = clone_spy.call_args[0][0]
+        assert clone_url == "https://github.com/acme/other-repo.git"
+
+    def test_E_cross_tenant_access_remains_rejected(self, tmp_path, monkeypatch):
+        """E. A repository registered for a DIFFERENT organization must
+        remain rejected for this tenant - unaffected by the validity-check
+        fix, and now fails closed (repository_id was explicitly supplied)
+        rather than silently proceeding without it."""
+        tenant_manager.create_organization("org-other-tenant", "Other Tenant")
+        tenant_manager.register_repository(
+            "acme/widgets", "org-other-tenant", "widgets", full_name="acme/widgets",
+        )
+        monkeypatch.chdir(tmp_path)
+        clone_spy = MagicMock(return_value=True)
+        monkeypatch.setattr("backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy)
+
+        with pytest.raises(RuntimeError, match="WORKSPACE_PROVISIONING_FAILED"):
+            AgentRunner()._ensure_workspace_provisioned(
+                project_id="widgets", repository_id="acme/widgets", organization_id="default-org",
+            )
+        clone_spy.assert_not_called()
+
+
+# ============================================================================
+# run_e40550efb53d investigation: a run whose routing decided
+# requires_knowledge=False still needs its repository_id workspace
+# provisioned before developer_node runs - provisioning must never be
+# coupled to whether knowledge_node happens to execute.
+# ============================================================================
+
+class TestProvisioningIndependentOfRequiresKnowledge:
+    def test_repository_id_provisions_even_when_requires_knowledge_is_false(
+        self, tmp_path, monkeypatch, fake_clone_creates_real_git_repo
+    ):
+        """A run whose router decision has requires_knowledge=False (so
+        knowledge_node never executes) must still have its repository_id
+        workspace cloned before developer_node runs - provisioning happens
+        unconditionally in start_run, never gated on the routing
+        decision. Confirms this remains true regardless of what routing
+        decides."""
+        monkeypatch.chdir(tmp_path)
+        tenant_manager.register_repository(
+            "acme/widgets", "default-org", "widgets", full_name="acme/widgets",
+        )
+        monkeypatch.setattr(
+            "backend.graph.nodes.route_task",
+            lambda msg: RoutingDecision(
+                task_type=TaskType.DOCUMENTATION,
+                confidence=0.9,
+                reasoning="test",
+                requires_planning=False,
+                requires_knowledge=False,
+            ),
+        )
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="test change", changes=[], requires_testing=True, notes=[]
+            ),
+        )
+        monkeypatch.setattr(
+            "backend.graph.nodes.review_code_changes",
+            lambda user_request, plan, developer_result: QAResult(
+                status="PASS", summary="stub"
+            ),
+        )
+        clone_spy = MagicMock(side_effect=fake_clone_creates_real_git_repo)
+        monkeypatch.setattr(
+            "backend.vcs.git_manager.GitWorkspaceManager.clone_repository", clone_spy
+        )
+
+        runner = AgentRunner()
+        app = create_app(runner=runner)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/api/v1/runs",
+            json={
+                "user_message": "Do something that needs no repository knowledge",
+                "project_id": "widgets",
+                "repository_id": "acme/widgets",
+            },
+        )
+        assert resp.status_code == 202
+
+        clone_spy.assert_called_once()
+        project_path = tmp_path / "workspace" / "default-org" / "widgets"
+        assert (project_path / ".git").is_dir()
+
+
+class TestNoFallthroughToAncestorGitRepository:
+    """The actual observed production failure: a workspace directory
+    nested inside another git repository (e.g. workspace/<org>/<project>
+    living inside the application's own checkout) must never let a git
+    command scoped to that workspace silently resolve against the
+    ancestor's .git when the workspace itself was never a valid clone."""
+
+    def test_unprovisioned_workspace_never_falls_through_to_ancestor_repo(
+        self, tmp_path, monkeypatch
+    ):
+        """No authorized repository -> _ensure_workspace_provisioned fails
+        closed BEFORE any directory is created at the workspace path, so
+        there is nothing for a later git command to run against at all -
+        eliminating the ancestor-.git-fallback risk structurally, not just
+        by chance."""
+        import subprocess
+
+        monkeypatch.chdir(tmp_path)
+        # A real git repository at the ANCESTOR of where the workspace
+        # would live - mirrors production's workspace/ directory nested
+        # inside the application's own repository checkout.
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://github.com/king-man1905/agentic-ai-software-engineer.git"],
+            cwd=str(tmp_path), capture_output=True, text=True, check=True,
+        )
+
+        runner = AgentRunner()
+        with pytest.raises(RuntimeError, match="WORKSPACE_PROVISIONING_FAILED"):
+            runner._ensure_workspace_provisioned(
+                project_id="e2e-test", repository_id="king-man1905/agentic-ai-test-repo",
+                organization_id="default-org",
+            )
+
+        workspace_dir = tmp_path / "workspace" / "default-org" / "e2e-test"
+        assert not workspace_dir.exists()
+        # Proves the ancestor .git is genuinely reachable via upward search
+        # from anywhere under tmp_path (i.e. a git command run from a
+        # workspace path that existed but lacked its own .git would have
+        # silently resolved here, exactly like production) - reinforcing
+        # that failing BEFORE any such directory is ever created is what
+        # actually prevents the fallthrough, not mere chance.
+        probe_dir = tmp_path / "workspace" / "default-org"
+        probe_dir.mkdir(parents=True)
+        remote = subprocess.run(
+            ["git", "-C", str(probe_dir), "remote", "get-url", "origin"],
+            capture_output=True, text=True,
+        )
+        assert "agentic-ai-software-engineer" in remote.stdout
+
+    def test_provisioned_workspace_has_its_own_git_shadowing_ancestor(
+        self, tmp_path, monkeypatch, fake_clone_creates_real_git_repo
+    ):
+        """When provisioning DOES succeed, the workspace's own .git
+        correctly shadows the ancestor's for any git command scoped to
+        that exact path - proving a successfully-provisioned workspace is
+        never at risk of the fallthrough, even nested inside another repo."""
+        import subprocess
+
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, text=True, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://github.com/king-man1905/agentic-ai-software-engineer.git"],
+            cwd=str(tmp_path), capture_output=True, text=True, check=True,
+        )
+        tenant_manager.register_repository(
+            "king-man1905/agentic-ai-test-repo", "default-org", "e2e-test",
+            full_name="king-man1905/agentic-ai-test-repo",
+        )
+        monkeypatch.setattr(
+            "backend.vcs.git_manager.GitWorkspaceManager.clone_repository",
+            MagicMock(side_effect=fake_clone_creates_real_git_repo),
+        )
+
+        runner = AgentRunner()
+        runner._ensure_workspace_provisioned(
+            project_id="e2e-test", repository_id="king-man1905/agentic-ai-test-repo",
+            organization_id="default-org",
+        )
+
+        project_path = tmp_path / "workspace" / "default-org" / "e2e-test"
+        remote = subprocess.run(
+            ["git", "-C", str(project_path), "remote", "get-url", "origin"],
+            capture_output=True, text=True, check=True,
+        )
+        assert remote.stdout.strip() == "https://github.com/king-man1905/agentic-ai-test-repo.git"
