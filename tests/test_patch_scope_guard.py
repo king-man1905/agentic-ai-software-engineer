@@ -22,7 +22,9 @@ Covers:
 
 from backend.developer.models import FilePatch
 from backend.developer.patch_scope import (
+    PatchWrapperArtifactError,
     compute_deletion_fraction,
+    detect_patch_wrapper_artifacts,
     detect_unsafe_additive_rewrite,
     is_additive_request,
     is_explicit_rewrite_request,
@@ -1118,3 +1120,238 @@ class TestRealE2EMultiCycleFabricationBug:
         assert by_name["patch_scope"].status == QualityCheckStatus.FAIL.value
         assert by_name["patch_scope"].category == FailureCategory.PATCH_APPLICATION_FAILURE.value
         assert by_name["patch_scope"].category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+
+
+# ============================================================================
+# run_7fb6d95b60d9 investigation: the model returned literal patch-editor
+# wrapper syntax ("*** Begin Patch" / "*** Update File: README.md" / "@@" /
+# "*** End Patch") as the generated file content itself, instead of real
+# content. Because this used the whole-file-replacement convention (empty
+# original_code_snippet), SafePatcher accepted it unconditionally and
+# developer_node wrote the wrapper text verbatim into README.md, replacing
+# the true original content ("# agentic-ai-test-repo").
+#
+# Fix: a new, unconditional deterministic detector
+# (detect_patch_wrapper_artifacts) rejects any candidate whose content
+# contains these markers - applied BEFORE developer_node/revision_node ever
+# write such content to disk (never just relying on QA to catch it after
+# the fact), and again in QualityPipeline.check_patch_scope as
+# defense-in-depth for the context-aware revision path (which validates a
+# candidate without ever writing it to disk itself).
+# ============================================================================
+
+PROD_WRAPPER_ARTIFACT_REQUEST = (
+    "Add a small E2E Test section to README.md with a short description. "
+    "Do not rewrite or replace the existing README content. "
+    "Make the smallest additive change possible."
+)
+
+PROD_WRAPPER_ARTIFACT_CONTENT = (
+    "*** Begin Patch\n"
+    "*** Update File: README.md\n"
+    "@@\n"
+    "-# agentic-ai-test-repo\n"
+    "+# agentic-ai-test-repo\n"
+    "+\n"
+    "+## E2E Test\n"
+    "+\n"
+    "+Short description.\n"
+    "*** End Patch\n"
+)
+
+
+class TestDetectPatchWrapperArtifacts:
+    def test_flags_begin_patch_marker(self):
+        reason = detect_patch_wrapper_artifacts(PROD_WRAPPER_ARTIFACT_CONTENT)
+        assert reason is not None
+        assert "Begin Patch" in reason
+
+    def test_flags_update_file_marker_alone(self):
+        assert detect_patch_wrapper_artifacts("*** Update File: README.md\nsome body\n") is not None
+
+    def test_flags_end_patch_marker_alone(self):
+        assert detect_patch_wrapper_artifacts("some body\n*** End Patch\n") is not None
+
+    def test_genuine_content_is_not_flagged(self):
+        assert detect_patch_wrapper_artifacts("# agentic-ai-test-repo\n\n## E2E Test\nShort description.\n") is None
+
+    def test_empty_content_is_not_flagged(self):
+        assert detect_patch_wrapper_artifacts("") is None
+        assert detect_patch_wrapper_artifacts(None) is None
+
+    def test_prose_mentioning_patches_is_not_flagged(self):
+        """A plain-English mention of patches/updates must not false-positive -
+        only the exact "*** " marker prefix format triggers."""
+        assert detect_patch_wrapper_artifacts(
+            "This document explains how to update a file and apply a patch.\n"
+        ) is None
+
+
+class TestPatchWrapperArtifactFailsDeterministically:
+    def test_check_patch_scope_fails_on_wrapper_content(self, tmp_path):
+        """The QA-layer defense-in-depth check: a candidate whose applied
+        content is a hallucinated patch-tool wrapper must FAIL
+        deterministically as PATCH_APPLICATION_FAILURE, even though the
+        deletion-fraction guard alone would have already caught this
+        specific example too - this check is unconditional and doesn't
+        depend on that heuristic."""
+        original = "# agentic-ai-test-repo"
+        (tmp_path / "README.md").write_text(original, encoding="utf-8")
+
+        wrapper_patch = FilePatch(
+            file_path="README.md", original_code_snippet="",
+            updated_code_snippet=PROD_WRAPPER_ARTIFACT_CONTENT,
+            explanation="Add E2E Test section",
+        )
+        check = QualityPipeline.check_patch_scope(
+            str(tmp_path), [wrapper_patch], user_request=PROD_WRAPPER_ARTIFACT_REQUEST,
+        )
+        assert check.status == QualityCheckStatus.FAIL.value
+        assert check.category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+        assert "patch-editor wrapper" in check.stderr_summary
+
+    def test_check_patch_scope_still_allows_genuine_minimal_additive_patch(self, tmp_path):
+        """Sanity check in the other direction under the exact same
+        production request: a genuinely minimal, content-preserving patch
+        must still be allowed."""
+        original = "# agentic-ai-test-repo"
+        (tmp_path / "README.md").write_text(original, encoding="utf-8")
+
+        safe_patch = FilePatch(
+            file_path="README.md", original_code_snippet="",
+            updated_code_snippet="# agentic-ai-test-repo\n\n## E2E Test\nShort description.\n",
+            explanation="Add E2E Test section",
+        )
+        check = QualityPipeline.check_patch_scope(
+            str(tmp_path), [safe_patch], user_request=PROD_WRAPPER_ARTIFACT_REQUEST,
+        )
+        assert check.status == QualityCheckStatus.PASS.value
+
+    def test_negated_rewrite_protection_still_holds_alongside_wrapper_check(self):
+        """PR #18 regression: the exact production request must still NOT
+        be classified as an explicit rewrite, independent of this new
+        wrapper-artifact check."""
+        assert is_explicit_rewrite_request(PROD_WRAPPER_ARTIFACT_REQUEST) is False
+
+
+class TestRealE2EDeveloperNodeRejectsWrapperArtifact:
+    """Full integration: the REAL developer_node, given the exact
+    production request and an LLM response containing a hallucinated
+    patch-tool wrapper, must never write it to disk, must classify it as a
+    recoverable PATCH_APPLICATION_FAILURE, and must route to revision -
+    never to qa with corrupted content, never a hard crash."""
+
+    def test_wrapper_artifact_never_written_and_routes_to_revision(self, tmp_path, monkeypatch):
+        from backend.graph.nodes import developer_node, route_after_developer
+        from backend.indexer.models import CodeChunk
+        from backend.schemas.developer import DeveloperResult
+
+        _real_git_workspace_with_readme(tmp_path, monkeypatch, "e2e-wrapper-repro", "# agentic-ai-test-repo")
+
+        class _WrapperPatchResult:
+            patches = [
+                FilePatch(
+                    file_path="README.md", original_code_snippet="",
+                    updated_code_snippet=PROD_WRAPPER_ARTIFACT_CONTENT,
+                    explanation="Add E2E Test section",
+                )
+            ]
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.generate_code_changes",
+            lambda user_request, plan, knowledge: DeveloperResult(
+                summary="stub", changes=[], requires_testing=True, notes=[]
+            ),
+        )
+        monkeypatch.setattr(
+            "backend.graph.nodes.invoke_structured",
+            lambda llm, schema_cls, prompt, *a, **k: _WrapperPatchResult(),
+        )
+
+        state = {
+            "user_message": PROD_WRAPPER_ARTIFACT_REQUEST,
+            "project_id": "e2e-wrapper-repro",
+            "repo_context": [
+                CodeChunk(
+                    file_path="README.md", content="# agentic-ai-test-repo",
+                    start_line=1, end_line=1, chunk_type="module",
+                )
+            ],
+        }
+        output = developer_node(state)
+
+        assert output["generated_patches"] == []
+        qa_result = output.get("qa_result")
+        assert qa_result is not None
+        assert qa_result.status == "FAIL"
+        assert qa_result.failure_category == FailureCategory.PATCH_APPLICATION_FAILURE.value
+        assert "patch-editor wrapper" in qa_result.summary.lower() or "wrapper" in qa_result.summary.lower()
+
+        readme_path = tmp_path / "workspace" / "default-org" / "e2e-wrapper-repro" / "README.md"
+        assert readme_path.read_text(encoding="utf-8") == "# agentic-ai-test-repo"
+
+        assert route_after_developer({**output, "revision_count": 0}) == "revision"
+
+
+class TestRealE2ERevisionNodeRejectsWrapperArtifact:
+    """Revision-cycle coverage (the original production bug involved
+    Developer -> QA -> Revision): revision_node's own blind-fallback
+    materialization path must also reject a hallucinated wrapper instead
+    of writing it, and must never crash the run - it should simply fail to
+    improve on the previous candidate this cycle, exactly as when
+    generate_revision_patches itself raises."""
+
+    def test_revision_node_blind_fallback_rejects_wrapper_without_writing_or_crashing(self, tmp_path, monkeypatch):
+        import os
+        import subprocess
+        from backend.graph.nodes import revision_node
+        from backend.schemas.developer import DeveloperResult, FileChange
+        from backend.schemas.qa import QAResult
+
+        project_id = "e2e-revision-wrapper-repro"
+        workspace_dir = tmp_path / "workspace" / "default-org" / project_id
+        workspace_dir.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(workspace_dir), capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(workspace_dir), capture_output=True, text=True)
+        (workspace_dir / "README.md").write_text("# agentic-ai-test-repo", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+        monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+
+        previous_rejected_patch = FilePatch(
+            file_path="README.md", original_code_snippet="",
+            updated_code_snippet="# some previously rejected fabrication\n",
+            explanation="previous attempt",
+        )
+
+        state = {
+            "user_message": PROD_WRAPPER_ARTIFACT_REQUEST,
+            "project_id": project_id,
+            "qa_result": QAResult(status="FAIL", summary="previous attempt rejected"),
+            "generated_patches": [previous_rejected_patch],
+            "developer_result": DeveloperResult(summary="stub", changes=[], requires_testing=True, notes=[]),
+            "repo_context": None,  # forces the blind-fallback materialization path
+            "revision_count": 1,
+            "pre_patch_snapshots": {"README.md": "# agentic-ai-test-repo"},
+            "true_original_snapshots": {"README.md": "# agentic-ai-test-repo"},
+        }
+
+        monkeypatch.setattr(
+            "backend.agents.developer.revise_code_changes",
+            lambda **k: DeveloperResult(
+                summary="revised",
+                changes=[FileChange(file_path="README.md", action="MODIFY", content=PROD_WRAPPER_ARTIFACT_CONTENT, reasoning="x")],
+                requires_testing=True, notes=[],
+            ),
+        )
+
+        output = revision_node(state)
+
+        # Never crashed, never wrote the wrapper - README on disk unchanged.
+        assert (workspace_dir / "README.md").read_text(encoding="utf-8") == "# agentic-ai-test-repo"
+        # True original survived, untouched.
+        assert output["true_original_snapshots"]["README.md"] == "# agentic-ai-test-repo"
+        # Falls back to the previous (already-rejected) candidate rather
+        # than silently producing an empty/no-op patch list.
+        assert output["generated_patches"] == [previous_rejected_patch]

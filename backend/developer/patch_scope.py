@@ -164,3 +164,57 @@ def detect_unsafe_additive_rewrite(
         f"threshold. Additive requests must preserve unrelated existing "
         f"content unless a rewrite is explicitly requested."
     )
+
+
+# Literal patch-editor/diff-tool wrapper syntax (the OpenAI "apply_patch"
+# tool format, and close variants) that an LLM can occasionally hallucinate
+# INSTEAD OF the actual file content it was asked to produce - confirmed in
+# production (run_7fb6d95b60d9): the model returned
+#     *** Begin Patch
+#     *** Update File: README.md
+#     @@
+#     ...
+#     *** End Patch
+# as updated_code_snippet, and this got written verbatim into README.md as
+# if it were the file's real content. Deliberately checked unconditionally
+# (unlike detect_unsafe_additive_rewrite above) - this is never legitimate
+# file content for ANY request, additive or an explicit rewrite alike, so
+# it must never be gated behind the additive/rewrite classification.
+_PATCH_WRAPPER_MARKERS_RE = re.compile(
+    r"^\*\*\* (Begin Patch|End Patch|(Update|Add|Delete) File:)",
+    re.MULTILINE,
+)
+
+
+def detect_patch_wrapper_artifacts(content: str) -> Optional[str]:
+    """
+    Returns a human-readable reason when `content` contains literal
+    patch-editor/diff-tool wrapper markers (e.g. "*** Begin Patch", "***
+    Update File: ...", "*** End Patch") instead of genuine file content.
+    Returns None when no such marker is found.
+    """
+    match = _PATCH_WRAPPER_MARKERS_RE.search(content or "")
+    if not match:
+        return None
+    return (
+        f"Generated content contains literal patch-editor wrapper syntax "
+        f"({match.group(0)!r}) instead of the file's actual content - this "
+        f"looks like a hallucinated patch-tool format, not real content."
+    )
+
+
+class PatchWrapperArtifactError(ValueError):
+    """
+    Raised when generated content that was about to be written to disk
+    contains literal patch-editor wrapper syntax (see
+    detect_patch_wrapper_artifacts) instead of real file content. Callers
+    (developer_node/_materialize_developer_changes) catch this specifically
+    to route the failure through the existing bounded revision loop -
+    exactly like a SafePatcher anchor mismatch - rather than writing the
+    wrapper text to disk or crashing the run.
+    """
+
+    def __init__(self, file_path: str, reason: str):
+        self.file_path = file_path
+        self.reason = reason
+        super().__init__(f"{file_path}: {reason}")

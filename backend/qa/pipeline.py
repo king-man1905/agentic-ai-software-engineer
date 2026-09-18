@@ -185,7 +185,7 @@ class QualityPipeline:
           patch when no true-original entry was ever recorded (e.g. a
           caller/test that never populated it).
         """
-        from backend.developer.patch_scope import detect_unsafe_additive_rewrite
+        from backend.developer.patch_scope import detect_patch_wrapper_artifacts, detect_unsafe_additive_rewrite
 
         start = time.time()
         if not patches or not user_request:
@@ -222,6 +222,19 @@ class QualityPipeline:
             if not result.is_valid or result.applied_content is None:
                 # Already reported (or will be) by check_ast - not this
                 # check's concern.
+                continue
+
+            # Unconditional - unlike detect_unsafe_additive_rewrite below,
+            # never gated behind is_additive_request/is_explicit_rewrite_request:
+            # a hallucinated patch-editor wrapper (e.g. "*** Begin Patch")
+            # is never legitimate file content for ANY request, additive or
+            # an explicit rewrite alike. Catches the case where a
+            # context-aware revision candidate (which never writes to disk
+            # itself - see revision_node) contains this artifact and would
+            # otherwise only be caught once it's actually written, later.
+            wrapper_reason = detect_patch_wrapper_artifacts(result.applied_content)
+            if wrapper_reason:
+                violations.append(f"{patch.file_path}: {wrapper_reason}")
                 continue
 
             has_true_original = (
