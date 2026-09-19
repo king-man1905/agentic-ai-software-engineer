@@ -16,18 +16,32 @@ from backend.vcs.models import GitDiffSummary, ApprovalDecision
 
 def _init_git_workspace(tmp_path, monkeypatch, project_id: str):
     """
-    Creates a real, git-initialized workspace/<project_id> under tmp_path
-    and points nodes.py's os.getcwd()-based fallback path resolution at it,
-    so developer_node's fallback write + git_prepare_node's diff
-    computation exercise a genuine git baseline (as every real, cloned
+    Creates a real, git-initialized workspace/default-org/<project_id>
+    under tmp_path and points nodes.py's os.getcwd()-based fallback path
+    resolution at it, so developer_node's fallback write + git_prepare_node's
+    diff computation exercise a genuine git baseline (as every real, cloned
     workspace has - see _ensure_workspace_provisioned/clone_repository)
     instead of the ambient, non-git workspace/test_project used when no
     project_id is given. Without real git history, _read_head_content()
     has no prior baseline to diff a freshly-written file against.
+
+    run_cfba0530500b investigation: this used to create the repo at
+    workspace/<project_id>, missing the "default-org" tenant-namespace
+    segment that resolve_workspace_path() actually resolves to (every
+    caller in this file relies on the dev-mode default organization,
+    never an explicit organization_id). That mismatch meant
+    git_prepare_node/git_commit_node silently operated against a
+    different, freshly auto-created, non-git directory - approval and
+    "COMPLETED" still appeared to work only because status derivation
+    never checked whether an approved diff was actually committed
+    (git_commit_node's real GitWorkspaceManager.stage_and_commit fails
+    closed via _is_own_git_repo on a non-git directory). Now that status
+    derivation checks this, the workspace must genuinely exist where the
+    code actually looks for it.
     """
     from pathlib import Path
 
-    workspace_dir = tmp_path / "workspace" / project_id
+    workspace_dir = tmp_path / "workspace" / "default-org" / project_id
     workspace_dir.mkdir(parents=True)
     subprocess.run(["git", "init"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(workspace_dir), capture_output=True, text=True)
@@ -36,7 +50,7 @@ def _init_git_workspace(tmp_path, monkeypatch, project_id: str):
     subprocess.run(["git", "add", "."], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
     subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
 
-    assert not (Path("workspace") / project_id).exists()
+    assert not (Path("workspace") / "default-org" / project_id).exists()
     monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
     return workspace_dir
 

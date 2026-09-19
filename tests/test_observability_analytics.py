@@ -474,6 +474,15 @@ def test_18_failure_category_normalized_correctly(temp_store, isolated_collector
         ("Pytest subprocess failed with exit code 1", FailureCategory.TEST_FAILURE),
         ("Unauthorized GitHub API token", FailureCategory.AUTHENTICATION_FAILURE),
         ("Something completely unexpected happened", FailureCategory.INTERNAL_ERROR),
+        # run_9b020a9fc436: a real production failure - Gemini's own quota
+        # exhausted mid-fallback - must be classified as an LLM rate limit,
+        # never mistaken for a GitHub API rate limit.
+        (
+            "[GEMINI] LLM rate limit reached: Error calling model 'gemini-3.6-flash' "
+            "(RESOURCE_EXHAUSTED): 429 RESOURCE_EXHAUSTED.",
+            FailureCategory.LLM_RATE_LIMIT,
+        ),
+        ("GitHub API rate limit exceeded, please retry later", FailureCategory.GITHUB_RATE_LIMIT),
     ]
 
     for err_msg, expected_cat in test_cases:

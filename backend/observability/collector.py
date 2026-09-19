@@ -814,6 +814,16 @@ class TelemetryCollector:
             return FailureCategory.LLM_TRANSIENT_FAILURE
         if "llmpermanenterror" in m or "llmerror" in m:
             return FailureCategory.LLM_PERMANENT_FAILURE
+        if "llmratelimiterror" in m or ("llm" in m and "rate limit" in m):
+            # run_9b020a9fc436 investigation: an LLM provider's own rate
+            # limit (e.g. Gemini's free-tier quota) previously fell through
+            # to the generic "rate limit" in m check below and was
+            # misclassified as GITHUB_RATE_LIMIT - actively misleading in
+            # telemetry/analytics, since it points investigation at GitHub
+            # instead of the actual exhausted LLM provider quota. Checked
+            # ahead of the generic GitHub check; a genuine GitHub rate-limit
+            # message never contains "llm", so that check is unaffected.
+            return FailureCategory.LLM_RATE_LIMIT
         if "auth" in m or "unauthorized" in m:
             return FailureCategory.AUTHENTICATION_FAILURE
         if "tenant" in m or "cross-tenant" in m:

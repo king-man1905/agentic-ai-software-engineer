@@ -32,6 +32,54 @@ from backend.vcs.workspace_lock import (
 from backend.security.auth import AuthMode
 from backend.security.tenant import tenant_manager
 
+# Captured at import time, before mock_agent_nodes (autouse) ever
+# monkeypatches these staticmethods - real references any test can
+# restore to prove genuine git behavior instead of a mock's canned
+# return value (run_cfba0530500b investigation).
+_real_verify_workspace_drift = GitWorkspaceManager.verify_workspace_drift
+_real_stage_and_commit = GitWorkspaceManager.stage_and_commit
+_real_create_feature_branch = GitWorkspaceManager.create_feature_branch
+
+
+def _restore_real_git_commit_ops(monkeypatch):
+    """Undoes mock_agent_nodes' mocking of the actual git-mutating
+    GitWorkspaceManager methods used by git_commit_node, so a test can
+    prove a real commit occurred (or genuinely didn't) via `git log`
+    rather than trusting a MagicMock's canned True."""
+    monkeypatch.setattr(GitWorkspaceManager, "verify_workspace_drift", _real_verify_workspace_drift)
+    monkeypatch.setattr(GitWorkspaceManager, "stage_and_commit", _real_stage_and_commit)
+    monkeypatch.setattr(GitWorkspaceManager, "create_feature_branch", _real_create_feature_branch)
+
+
+def _init_tenant_git_workspace(tmp_path, monkeypatch, organization_id: str, project_id: str) -> Path:
+    """
+    Like _init_git_workspace, but at the actual tenant-namespaced path
+    (workspace/<organization_id>/<project_id>) that resolve_workspace_path
+    resolves in production - _init_git_workspace itself creates its repo
+    at workspace/<project_id> (no organization_id segment), which every
+    *existing* test using it tolerates only because none of them restore
+    the real stage_and_commit/create_feature_branch (they never notice
+    developer_node/git_prepare_node silently operating against a
+    different, freshly auto-created, non-git directory at the real
+    resolved path). Tests here restore those real git operations, so they
+    need the git repo to genuinely exist at that same resolved path.
+    """
+    workspace_dir = tmp_path / "workspace" / organization_id / project_id
+    workspace_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(workspace_dir), capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(workspace_dir), capture_output=True, text=True)
+    (workspace_dir / "README.md").write_text("# Test Project\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(workspace_dir), capture_output=True, text=True, check=True)
+
+    assert not (Path("workspace") / organization_id / project_id).exists(), (
+        f"workspace/{organization_id}/{project_id} already exists at the real cwd - "
+        "pick a fresh project_id so the tmp_path fallback below isn't shadowed."
+    )
+    monkeypatch.setattr(os, "getcwd", lambda: str(tmp_path))
+    return workspace_dir
+
 
 def _init_git_workspace(tmp_path, monkeypatch, project_id: str):
     """
@@ -2256,6 +2304,14 @@ def test_patch_hash_integrity_with_concurrent_run_attempt(tmp_path, monkeypatch)
     must genuinely reach WAITING_APPROVAL with a real, non-empty diff
     before the drift simulation (step 2) and resume (step 3) can
     meaningfully exercise the integrity check this test is actually about.
+
+    run_cfba0530500b investigation: the overall run status used to be
+    asserted as COMPLETED here even though the approved diff was never
+    committed - the exact false-positive this investigation fixed.
+    approval_status "PATCH_HASH_MISMATCH" was always correct (the
+    fail-closed drift check itself never had a bug); only the top-level
+    status now correctly reports FAILED instead of masking a rejected
+    commit as a successful completion.
     """
     project_id = "drift-prevention-workspace"
     _init_git_workspace(tmp_path, monkeypatch, project_id)
@@ -2299,10 +2355,303 @@ def test_patch_hash_integrity_with_concurrent_run_attempt(tmp_path, monkeypatch)
         )
         resume_status = runner.resume_run(run_id, decision, organization_id=org_id)
 
-        # 4. Must fail pre-commit drift validation and reject commit
-        assert resume_status.status == "COMPLETED"
+        # 4. Must fail pre-commit drift validation and reject commit - and
+        # the run must be reported as FAILED, never COMPLETED, since the
+        # approved diff was never actually committed.
+        assert resume_status.status == "FAILED"
         values = runner.get_state_values(run_id, organization_id=org_id)
         assert values.get("approval_status") == "PATCH_HASH_MISMATCH"
+    finally:
+        runner.close()
+
+
+# ============================================================================
+# run_cfba0530500b investigation: HITL approval resume -> git_commit
+# regression. Production sequence was APPROVAL_REQUESTED -> APPROVAL_GRANTED
+# -> RUN_COMPLETED with NO COMMIT_COMPLETED and no actual commit/branch on
+# disk - test_recovered_run_can_resume (above) could never have caught this
+# because it mocks stage_and_commit/create_feature_branch/
+# verify_workspace_drift to always succeed, so its "COMPLETED" assertion is
+# true regardless of whether git_commit_node's real git operations would
+# have worked. Every test below uses _restore_real_git_commit_ops so a
+# regression that silently skips or fails the real commit shows up as a
+# missing commit in `git log`, not a green test built on a mock's canned
+# True.
+# ============================================================================
+
+
+def test_A_approved_resume_actually_commits_with_telemetry_ordering(tmp_path, monkeypatch):
+    """
+    A. An approved HITL resume with the exact patch_hash must route
+    through git_commit_node, produce a REAL git commit on the feature
+    branch, emit COMMIT_COMPLETED telemetry before RUN_COMPLETED, and
+    report the run as COMPLETED.
+    """
+    project_id = "hitl-real-commit-a"
+    org_id = "org-real-commit-a"
+    workspace_dir = _init_tenant_git_workspace(tmp_path, monkeypatch, org_id, project_id)
+    _mock_offline_graph_dependencies(monkeypatch)
+    monkeypatch.setattr("backend.graph.nodes.git_prepare_node", _real_git_prepare_node)
+    _restore_real_git_commit_ops(monkeypatch)
+
+    recorded_events = []
+    original_record_event = telemetry_collector.record_event
+
+    def spy_record_event(*args, **kwargs):
+        recorded_events.append(kwargs)
+        return original_record_event(*args, **kwargs)
+
+    monkeypatch.setattr(telemetry_collector, "record_event", spy_record_event)
+
+    db_path = str(tmp_path / "checkpoints.db")
+    runner = AgentRunner(checkpoint_db_path=db_path)
+    run_id = "run-real-commit-a"
+    try:
+        status = runner.start_run(
+            run_id=run_id, user_message="Add a note", project_id=project_id, organization_id=org_id,
+        )
+        assert status.status == "WAITING_APPROVAL"
+        assert status.git_diff is not None
+        assert not status.git_diff.is_no_op
+
+        decision = ApprovalDecision(approved=True, reviewer="lead", patch_hash=status.git_diff.patch_hash)
+        resumed = runner.resume_run(run_id=run_id, approval_decision=decision, organization_id=org_id)
+
+        assert resumed.status == "COMPLETED"
+        values = runner.get_state_values(run_id, organization_id=org_id)
+        assert values.get("approval_status") == "COMMITTED"
+
+        # Real git evidence, not mock-derived.
+        log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(workspace_dir), capture_output=True, text=True, check=True,
+        )
+        commits = log.stdout.strip().splitlines()
+        assert len(commits) == 2, f"expected initial + one agent commit, got: {commits}"
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=str(workspace_dir), capture_output=True, text=True, check=True,
+        )
+        assert branch.stdout.strip() == status.git_diff.branch_name
+
+        event_types = [kw.get("event_type") for kw in recorded_events]
+        assert TelemetryEventType.COMMIT_COMPLETED in event_types
+        assert TelemetryEventType.RUN_COMPLETED in event_types
+        assert event_types.index(TelemetryEventType.COMMIT_COMPLETED) < event_types.index(TelemetryEventType.RUN_COMPLETED)
+        commit_event = next(kw for kw in recorded_events if kw.get("event_type") == TelemetryEventType.COMMIT_COMPLETED)
+        assert commit_event["metadata"]["status"] == "COMMITTED"
+    finally:
+        runner.close()
+
+
+def test_B_rejected_resume_never_commits(tmp_path, monkeypatch):
+    """
+    B. A rejected HITL resume must route to cleanup_node, never
+    git_commit_node - proven via real `git log` (no new commit).
+    """
+    project_id = "hitl-rejected-no-commit-b"
+    org_id = "org-rejected-b"
+    workspace_dir = _init_tenant_git_workspace(tmp_path, monkeypatch, org_id, project_id)
+    _mock_offline_graph_dependencies(monkeypatch)
+    monkeypatch.setattr("backend.graph.nodes.git_prepare_node", _real_git_prepare_node)
+    _restore_real_git_commit_ops(monkeypatch)
+
+    db_path = str(tmp_path / "checkpoints.db")
+    runner = AgentRunner(checkpoint_db_path=db_path)
+    run_id = "run-rejected-b"
+    try:
+        status = runner.start_run(
+            run_id=run_id, user_message="Add a note", project_id=project_id, organization_id=org_id,
+        )
+        assert status.status == "WAITING_APPROVAL"
+
+        decision = ApprovalDecision(
+            approved=False, reviewer="lead", rejection_reason="not needed",
+            patch_hash=status.git_diff.patch_hash,
+        )
+        resumed = runner.resume_run(run_id=run_id, approval_decision=decision, organization_id=org_id)
+
+        assert resumed.status == "COMPLETED"
+        values = runner.get_state_values(run_id, organization_id=org_id)
+        assert values.get("approval_status", "").startswith("REJECTED_AND_CLEANED")
+
+        log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(workspace_dir), capture_output=True, text=True, check=True,
+        )
+        assert len(log.stdout.strip().splitlines()) == 1, "rejection must never produce a real commit"
+    finally:
+        runner.close()
+
+
+def test_C_wrong_patch_hash_at_approval_never_commits(tmp_path, monkeypatch):
+    """
+    C. Reviewer submits approved=True but with a patch_hash that does not
+    match the staged diff - approval_node's own cryptographic integrity
+    check must reject it before git_commit_node ever runs, with no real
+    commit produced.
+    """
+    project_id = "hitl-hash-mismatch-c"
+    org_id = "org-hash-mismatch-c"
+    workspace_dir = _init_tenant_git_workspace(tmp_path, monkeypatch, org_id, project_id)
+    _mock_offline_graph_dependencies(monkeypatch)
+    monkeypatch.setattr("backend.graph.nodes.git_prepare_node", _real_git_prepare_node)
+    _restore_real_git_commit_ops(monkeypatch)
+
+    db_path = str(tmp_path / "checkpoints.db")
+    runner = AgentRunner(checkpoint_db_path=db_path)
+    run_id = "run-hash-mismatch-c"
+    try:
+        status = runner.start_run(
+            run_id=run_id, user_message="Add a note", project_id=project_id, organization_id=org_id,
+        )
+        assert status.status == "WAITING_APPROVAL"
+
+        decision = ApprovalDecision(approved=True, reviewer="lead", patch_hash="0" * 64)
+        resumed = runner.resume_run(run_id=run_id, approval_decision=decision, organization_id=org_id)
+
+        # approval_node's own integrity check forces approval.approved to
+        # False, so this routes to cleanup_node (which overwrites
+        # approval_status to REJECTED_AND_CLEANED with the original
+        # PATCH_HASH_MISMATCH reason folded in) - a rejected approval
+        # (COMPLETED), never a broken committed one (FAILED).
+        assert resumed.status == "COMPLETED"
+        values = runner.get_state_values(run_id, organization_id=org_id)
+        approval_status = values.get("approval_status", "")
+        assert approval_status.startswith("REJECTED_AND_CLEANED")
+        assert "PATCH_HASH_MISMATCH" in approval_status
+        assert values.get("approval").approved is False
+
+        log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(workspace_dir), capture_output=True, text=True, check=True,
+        )
+        assert len(log.stdout.strip().splitlines()) == 1
+    finally:
+        runner.close()
+
+
+def test_D_policy_block_never_commits(tmp_path, monkeypatch):
+    """
+    D. A policy BLOCK decision routes straight to cleanup_node without
+    ever reaching approval_node or git_commit_node - proven via real
+    `git log` (no commit).
+    """
+    project_id = "policy-block-no-commit-d"
+    org_id = "org-policy-block-d"
+    workspace_dir = _init_tenant_git_workspace(tmp_path, monkeypatch, org_id, project_id)
+    _mock_offline_graph_dependencies(monkeypatch)
+    monkeypatch.setattr("backend.graph.nodes.git_prepare_node", _real_git_prepare_node)
+    _restore_real_git_commit_ops(monkeypatch)
+
+    from backend.policy.evaluator import PolicyEvaluator
+    from backend.schemas.policy import PolicyEvaluationResult, PolicyDecision
+    monkeypatch.setattr(
+        PolicyEvaluator, "evaluate",
+        classmethod(lambda cls, **kwargs: PolicyEvaluationResult(
+            decision=PolicyDecision.BLOCK, violations=[], warnings=[],
+            checks={}, requires_human_approval=False,
+            evaluated_at="2026-01-01T00:00:00+00:00",
+        )),
+    )
+
+    db_path = str(tmp_path / "checkpoints.db")
+    runner = AgentRunner(checkpoint_db_path=db_path)
+    run_id = "run-policy-block-d"
+    try:
+        status = runner.start_run(
+            run_id=run_id, user_message="Add a note", project_id=project_id, organization_id=org_id,
+        )
+
+        assert status.status == "COMPLETED"
+        values = runner.get_state_values(run_id, organization_id=org_id)
+        assert values.get("approval_status", "").startswith("REJECTED_AND_CLEANED")
+        assert values.get("approval") is None
+
+        log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(workspace_dir), capture_output=True, text=True, check=True,
+        )
+        assert len(log.stdout.strip().splitlines()) == 1
+    finally:
+        runner.close()
+
+
+def test_E_recovered_runner_actually_commits(tmp_path, monkeypatch):
+    """
+    E. run_cfba0530500b's real production shape: start_run on one
+    AgentRunner instance, close it, resume on a freshly constructed
+    second instance sharing the same durable checkpoint DB - the approved
+    change must still produce a REAL git commit.
+    """
+    project_id = "hitl-recovered-commit-e"
+    org_id = "org-recovered-e"
+    workspace_dir = _init_tenant_git_workspace(tmp_path, monkeypatch, org_id, project_id)
+    _mock_offline_graph_dependencies(monkeypatch)
+    monkeypatch.setattr("backend.graph.nodes.git_prepare_node", _real_git_prepare_node)
+    _restore_real_git_commit_ops(monkeypatch)
+
+    db_path = str(tmp_path / "checkpoints.db")
+    run_id = "run-recovered-e"
+
+    runner1 = AgentRunner(checkpoint_db_path=db_path)
+    status = runner1.start_run(
+        run_id=run_id, user_message="Add a note", project_id=project_id, organization_id=org_id,
+    )
+    runner1.close()
+
+    assert status.status == "WAITING_APPROVAL"
+    assert status.git_diff is not None
+
+    runner2 = AgentRunner(checkpoint_db_path=db_path)
+    try:
+        decision = ApprovalDecision(approved=True, reviewer="lead", patch_hash=status.git_diff.patch_hash)
+        resumed = runner2.resume_run(run_id=run_id, approval_decision=decision, organization_id=org_id)
+
+        assert resumed.status == "COMPLETED"
+        values = runner2.get_state_values(run_id, organization_id=org_id)
+        assert values.get("approval_status") == "COMMITTED"
+
+        log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(workspace_dir), capture_output=True, text=True, check=True,
+        )
+        assert len(log.stdout.strip().splitlines()) == 2
+    finally:
+        runner2.close()
+
+
+def test_F_idempotent_resume_cannot_double_commit(tmp_path, monkeypatch):
+    """
+    F. Once a run has reached a terminal status (COMPLETED after a real
+    commit), resuming it again must be rejected outright - never produce
+    a second commit.
+    """
+    project_id = "hitl-idempotent-resume-f"
+    org_id = "org-idempotent-f"
+    workspace_dir = _init_tenant_git_workspace(tmp_path, monkeypatch, org_id, project_id)
+    _mock_offline_graph_dependencies(monkeypatch)
+    monkeypatch.setattr("backend.graph.nodes.git_prepare_node", _real_git_prepare_node)
+    _restore_real_git_commit_ops(monkeypatch)
+
+    db_path = str(tmp_path / "checkpoints.db")
+    runner = AgentRunner(checkpoint_db_path=db_path)
+    run_id = "run-idempotent-f"
+    try:
+        status = runner.start_run(
+            run_id=run_id, user_message="Add a note", project_id=project_id, organization_id=org_id,
+        )
+        decision = ApprovalDecision(approved=True, reviewer="lead", patch_hash=status.git_diff.patch_hash)
+        first = runner.resume_run(run_id=run_id, approval_decision=decision, organization_id=org_id)
+        assert first.status == "COMPLETED"
+
+        log_before = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(workspace_dir), capture_output=True, text=True, check=True,
+        )
+        commit_count_before = len(log_before.stdout.strip().splitlines())
+
+        with pytest.raises(ValueError, match="terminal state"):
+            runner.resume_run(run_id=run_id, approval_decision=decision, organization_id=org_id)
+
+        log_after = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(workspace_dir), capture_output=True, text=True, check=True,
+        )
+        commit_count_after = len(log_after.stdout.strip().splitlines())
+        assert commit_count_after == commit_count_before, "a rejected second resume must never add a commit"
     finally:
         runner.close()
 

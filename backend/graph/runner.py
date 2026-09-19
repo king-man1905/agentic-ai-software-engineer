@@ -311,6 +311,29 @@ class AgentRunner:
         if qa_result is not None and qa_result.status != "PASS" and approval_status != "COMMITTED":
             return "FAILED"
 
+        # run_cfba0530500b investigation: a human reviewer APPROVED a real,
+        # non-no-op diff (route_after_approval sends this to git_commit_node),
+        # but git_commit_node's own fail-closed checks (workspace drift,
+        # cancellation) or the commit itself can still end the run without
+        # ever reaching approval_status "COMMITTED" - previously reported
+        # as an indistinguishable COMPLETED, identical to a genuine
+        # committed success, with no signal that the approved change was
+        # never actually applied. A rejected/blocked approval (approved
+        # False, or policy BLOCK) legitimately reaches END the same way
+        # via cleanup_node with no commit - that is NOT a failure and must
+        # keep reporting COMPLETED, which is why this only fires when the
+        # approval itself was granted.
+        approval = (values or {}).get("approval")
+        git_diff = self._extract_git_diff(state_snapshot)
+        if (
+            approval is not None
+            and getattr(approval, "approved", False)
+            and git_diff is not None
+            and not git_diff.is_no_op
+            and approval_status != "COMMITTED"
+        ):
+            return "FAILED"
+
         return "COMPLETED"
 
     def _extract_current_node(self, state_snapshot) -> Optional[str]:
