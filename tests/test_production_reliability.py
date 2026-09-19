@@ -1049,6 +1049,118 @@ def test_existing_provider_routing_remains_compatible(monkeypatch):
     assert getattr(client_oai, "_provider", None) == "openai"
 
 
+# ============================================================================
+# run_80c82e8263d3 investigation: LLM_MODEL_NAME is a single, provider-
+# agnostic override. Production runs LLM_PROVIDER=nvidia with
+# LLM_MODEL_NAME=openai/gpt-oss-20b (pinning NVIDIA past a wave of model
+# deprecations) - but get_llm() applied that override unconditionally, so
+# the explicit fallback call in backend/observability/telemetry.py
+# (get_llm(provider=fallback_provider)) reused the NVIDIA-only model name
+# against Gemini's API, which has no such model: a real 404 Not Found that
+# made the entire safe-fallback mechanism non-functional whenever
+# LLM_MODEL_NAME happens to be set (as it currently is in production).
+# ============================================================================
+
+class TestLlmModelNameScopedToPrimaryProvider:
+    def test_fallback_to_gemini_does_not_inherit_nvidia_model_name(self, monkeypatch):
+        """1. The exact reported production scenario: primary NVIDIA with
+        LLM_MODEL_NAME pinned to the NVIDIA-only model - a fallback
+        get_llm(provider="gemini") call must resolve Gemini's own default
+        model, never the NVIDIA name."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+        monkeypatch.setenv("LLM_PROVIDER", "nvidia")
+        monkeypatch.setenv("LLM_MODEL_NAME", "openai/gpt-oss-20b")
+
+        from backend.services.llm import get_llm, _DEFAULT_MODELS
+
+        fallback_client = get_llm(provider="gemini")
+        assert fallback_client.model == _DEFAULT_MODELS["gemini"]
+        assert fallback_client.model != "openai/gpt-oss-20b"
+
+    def test_primary_nvidia_still_honors_explicit_model_name(self, monkeypatch):
+        """2. The primary provider's own explicit LLM_MODEL_NAME override
+        must remain unaffected - both with no provider argument (the
+        normal call shape every agent uses) and with the provider passed
+        explicitly."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+        monkeypatch.setenv("LLM_PROVIDER", "nvidia")
+        monkeypatch.setenv("LLM_MODEL_NAME", "openai/gpt-oss-20b")
+
+        from backend.services.llm import get_llm
+
+        assert get_llm().model == "openai/gpt-oss-20b"
+        assert get_llm(provider="nvidia").model == "openai/gpt-oss-20b"
+
+    def test_reverse_pairing_gemini_primary_falling_back_to_nvidia(self, monkeypatch):
+        """3. The same bug in the other direction: primary Gemini pinned
+        to a Gemini-specific model name, falling back to NVIDIA - NVIDIA
+        must get its own default, never the Gemini name."""
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+        monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+        monkeypatch.setenv("LLM_PROVIDER", "gemini")
+        monkeypatch.setenv("LLM_MODEL_NAME", "gemini-1.5-pro")
+
+        from backend.services.llm import get_llm, _DEFAULT_MODELS
+
+        fallback_client = get_llm(provider="nvidia")
+        assert fallback_client.model == _DEFAULT_MODELS["nvidia"]
+        assert fallback_client.model != "gemini-1.5-pro"
+
+    def test_no_llm_model_name_set_defaults_unchanged(self, monkeypatch):
+        """4. With LLM_MODEL_NAME entirely unset, every provider still
+        falls back to its own _DEFAULT_MODELS entry - completely
+        unaffected by this fix."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+        monkeypatch.delenv("LLM_MODEL_NAME", raising=False)
+        monkeypatch.setenv("LLM_PROVIDER", "nvidia")
+
+        from backend.services.llm import get_llm, _DEFAULT_MODELS
+
+        assert get_llm().model == _DEFAULT_MODELS["nvidia"]
+        assert get_llm(provider="gemini").model == _DEFAULT_MODELS["gemini"]
+        assert get_llm(provider="openai").model == _DEFAULT_MODELS["openai"]
+
+    def test_real_fallback_construction_path_uses_correctly_scoped_model(self, monkeypatch):
+        """5. End-to-end through the REAL invoke_structured/get_llm path
+        (not a mocked get_llm, unlike test_timeout_triggers_fallback above,
+        which still passes unchanged and continues to cover the
+        retry/trigger mechanics) - only the actual network call
+        (_invoke_single_provider) is stubbed, so get_fallback_provider and
+        get_llm run for real and the fallback client actually constructed
+        for the call is inspected directly."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+        monkeypatch.setenv("LLM_PROVIDER", "nvidia")
+        monkeypatch.setenv("LLM_MODEL_NAME", "openai/gpt-oss-20b")
+        monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "gemini")
+
+        decision = RoutingDecision(
+            task_type=TaskType.DOCUMENTATION, requires_planning=False,
+            requires_knowledge=False, reasoning="fallback succeeded",
+        )
+        primary = FakeProviderLLM(provider="nvidia", failure=TimeoutError("Read timed out"))
+        constructed_fallback_models = []
+
+        import backend.observability.telemetry as telemetry_module
+        real_invoke_single_provider = telemetry_module._invoke_single_provider
+
+        def spy_invoke_single_provider(llm, schema, prompt):
+            if llm is primary:
+                return real_invoke_single_provider(llm, schema, prompt)
+            constructed_fallback_models.append(getattr(llm, "model", None))
+            return decision
+
+        monkeypatch.setattr(telemetry_module, "_invoke_single_provider", spy_invoke_single_provider)
+
+        result = invoke_structured(primary, RoutingDecision, "prompt")
+
+        assert result == decision
+        assert constructed_fallback_models == ["gemini-2.0-flash"]
+
+
 # 14. test_llm_timeout_does_not_hang_graph
 def test_llm_timeout_does_not_hang_graph(monkeypatch, tmp_path):
     """

@@ -32,7 +32,24 @@ def get_llm(provider: Optional[str] = None, timeout: Optional[float] = None):
     default_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", str(LLM_REQUEST_TIMEOUT_SECONDS)))
     eff_timeout = float(timeout) if timeout is not None else default_timeout
     validate_config(eff_provider)
-    model = os.getenv("LLM_MODEL_NAME") or LLM_MODEL_NAME or _DEFAULT_MODELS.get(eff_provider)
+
+    # LLM_MODEL_NAME is a single, provider-agnostic override with no
+    # provider of its own attached to it - it exists to pin the
+    # CONFIGURED PRIMARY provider to a specific model (e.g. NVIDIA to
+    # openai/gpt-oss-20b after a wave of upstream model deprecations), not
+    # to name a model for whichever provider happens to be requested.
+    # Applying it unconditionally meant a safe provider fallback (e.g.
+    # NVIDIA -> Gemini, backend/observability/telemetry.py's explicit
+    # get_llm(provider=fallback_provider) call) reused the PRIMARY
+    # provider's model name against the FALLBACK provider's API, which has
+    # no such model - confirmed in production as a Gemini 404 for the
+    # NVIDIA-only model name "openai/gpt-oss-20b". Every other call site in
+    # this codebase calls get_llm() with no explicit provider at all, so
+    # eff_provider is always the configured primary there already - this
+    # guard changes nothing for them.
+    configured_primary = os.getenv("LLM_PROVIDER", LLM_PROVIDER).strip().lower()
+    explicit_model = os.getenv("LLM_MODEL_NAME") or LLM_MODEL_NAME
+    model = (explicit_model if eff_provider == configured_primary else None) or _DEFAULT_MODELS.get(eff_provider)
 
     nvidia_key = os.getenv("NVIDIA_API_KEY", NVIDIA_API_KEY)
     google_key = os.getenv("GOOGLE_API_KEY", GOOGLE_API_KEY)
