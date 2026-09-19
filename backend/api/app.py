@@ -349,11 +349,14 @@ def create_app(
         # Tenant isolation: the repository is always registered under the
         # caller's own organization (never a caller-supplied org id), and a
         # repo already registered to a *different* organization is never
-        # silently reassigned - TenantManager's repository registry is
-        # keyed globally by full_name, so without this check one tenant
-        # could hijack another tenant's authorized repository by
-        # re-registering the same name.
-        existing = tenant_manager.get_repository(repo_full_name)
+        # silently reassigned. TenantManager's repository registry is
+        # tenant-scoped by (organization_id, full_name) - this check
+        # deliberately uses the one method that still looks across all
+        # tenants (find_registration_any_organization) purely to detect
+        # this conflict; it is never used to grant access, and registering
+        # under the caller's own org_id below always creates/updates only
+        # that org's own independent, isolated entry.
+        existing = tenant_manager.find_registration_any_organization(repo_full_name)
         if existing and existing.organization_id != tenant_ctx.organization_id:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

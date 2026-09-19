@@ -96,7 +96,10 @@ class TestRegisterRepositoryEndpoint:
         )
 
         assert resp.status_code == 403
-        assert tenant_manager.get_repository("acme/widgets") is None
+        # find_registration_any_organization (not get_repository, which is
+        # tenant-scoped and would return None here regardless) proves the
+        # rejected attempt left no registration at all, for any tenant.
+        assert tenant_manager.find_registration_any_organization("acme/widgets") is None
 
     def test_cannot_hijack_another_orgs_registered_repository(self, client):
         org_a = tenant_manager.create_organization("org-a", "Org A")
