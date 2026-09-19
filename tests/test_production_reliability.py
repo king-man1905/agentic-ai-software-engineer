@@ -1157,8 +1157,23 @@ class TestLlmModelNameScopedToPrimaryProvider:
 
         result = invoke_structured(primary, RoutingDecision, "prompt")
 
+        from backend.services.llm import _DEFAULT_MODELS
+
         assert result == decision
-        assert constructed_fallback_models == ["gemini-2.0-flash"]
+        assert constructed_fallback_models == [_DEFAULT_MODELS["gemini"]]
+
+    def test_gemini_default_model_is_not_the_decommissioned_identifier(self, monkeypatch):
+        """6. run_120607d608c7 investigation: gemini-2.0-flash was
+        decommissioned by Google (404 NOT_FOUND, "no longer available"),
+        which broke the fallback path itself even though the model-name
+        scoping fix above (PR #21) was resolving correctly. Confirmed via
+        the account's live ListModels API that gemini-3.6-flash is the
+        currently supported replacement (matching Google's own 404
+        guidance) before pinning it here."""
+        from backend.services.llm import _DEFAULT_MODELS
+
+        assert _DEFAULT_MODELS["gemini"] == "gemini-3.6-flash"
+        assert _DEFAULT_MODELS["gemini"] != "gemini-2.0-flash"
 
 
 # 14. test_llm_timeout_does_not_hang_graph

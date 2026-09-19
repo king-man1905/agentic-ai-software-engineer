@@ -16,9 +16,15 @@ from backend.core.config import (
 # (2026-09-03) after a wave of Llama 3.1/3.3 model deprecations on that
 # endpoint - if it goes end-of-life too, set LLM_MODEL_NAME in .env rather
 # than editing this file.
+# gemini-3.6-flash replaces gemini-2.0-flash (run_120607d608c7, 2026-09-19):
+# Google decommissioned gemini-2.0-flash (404 NOT_FOUND, "no longer
+# available"), which broke the NVIDIA->Gemini fallback path itself - the
+# fallback-model-scoping fix (PR #21) was working correctly, Gemini's own
+# default was just stale. Confirmed via the account's live ListModels API
+# (generateContent supported) before pinning.
 _DEFAULT_MODELS = {
     "nvidia": "openai/gpt-oss-20b",
-    "gemini": "gemini-2.0-flash",
+    "gemini": "gemini-3.6-flash",
     "openai": "gpt-4o",
 }
 
