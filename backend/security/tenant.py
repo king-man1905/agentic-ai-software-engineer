@@ -21,6 +21,7 @@ from backend.security.auth import (
     auth_manager,
 )
 from backend.security.rbac import get_permissions
+from backend.security.repository_store import RepositoryStore
 
 
 class TenantManager:
@@ -28,17 +29,37 @@ class TenantManager:
     In-memory registry managing multi-tenant entities:
     Organizations, Users, Memberships, and Repositories.
     Enforces strict server-side context resolution and credential hashing.
+
+    Repository registrations are additionally persisted (non-secret
+    metadata only - see RepositoryStore) so they survive a process
+    restart; self._repositories remains the actual runtime lookup
+    structure used by every existing method below, now hydrated from
+    that persistent store at startup instead of always starting empty.
+
+    Repository identity is tenant-scoped: self._repositories is keyed by
+    (organization_id, id-or-full_name) tuples, never by id/full_name
+    alone - two different organizations registering the same repository
+    id/full_name (e.g. both legitimately registering the same public
+    repo) get independent entries, never overwriting each other. The only
+    place that intentionally searches across all tenants is
+    find_registration_any_organization, used solely to detect/report a
+    registration conflict or to distinguish "not registered" from
+    "registered to a different tenant" in an error message - never to
+    grant access.
     """
 
     def __init__(
         self,
         auth_mode: Optional[AuthMode] = None,
         dev_auth_fallback: Optional[bool] = None,
+        repository_store: Optional[RepositoryStore] = None,
     ) -> None:
         self._organizations: Dict[str, Organization] = {}
         self._users: Dict[str, User] = {}
         self._memberships: Dict[Tuple[str, str], Membership] = {}
-        self._repositories: Dict[str, Repository] = {}
+        # Keyed by (organization_id, id-or-full_name) - see class docstring.
+        self._repositories: Dict[Tuple[str, str], Repository] = {}
+        self._repository_store: RepositoryStore = repository_store or RepositoryStore()
         self.auth_manager: AuthManager = auth_manager
 
         env_mode = os.getenv("AUTH_MODE", "development").strip().lower()
@@ -57,6 +78,7 @@ class TenantManager:
 
         # Initialize default sandbox tenant for backward-compatibility
         self._init_defaults()
+        self._hydrate_repositories_from_store()
 
     def set_mode(self, mode: AuthMode | str, fallback: Optional[bool] = None) -> None:
         """Dynamically configure production vs development authentication mode."""
@@ -83,12 +105,33 @@ class TenantManager:
         )
         self.add_membership(default_org.id, default_user.id, Role.OWNER)
 
+    def _hydrate_repositories_from_store(self) -> None:
+        """
+        Repopulates the in-memory registry from persistent storage at
+        startup - this is what makes a registration survive a process
+        restart. Writes directly into self._repositories rather than
+        going through register_repository(): this is restoring
+        previously-validated data (organization_id was already checked
+        valid at the time of the original registration), not creating a
+        new registration, so it must not be rejected just because a
+        non-default organization created purely in memory (organizations
+        are out of scope for this persistence fix) hasn't been recreated
+        yet in this process - authorize_repository_access's own tenant
+        checks and resolve_context's organization-membership checks still
+        apply as normal for every actual request regardless.
+        """
+        for repo in self._repository_store.list_all():
+            self._repositories[(repo.organization_id, repo.id)] = repo
+            if repo.full_name and repo.full_name != repo.id:
+                self._repositories[(repo.organization_id, repo.full_name)] = repo
+
     def reset(self) -> None:
         """Clear all registered entities and restore default sandbox tenant."""
         self._organizations.clear()
         self._users.clear()
         self._memberships.clear()
         self._repositories.clear()
+        self._repository_store.reset()
         self.auth_manager.clear()
         self._init_defaults()
 
@@ -199,19 +242,52 @@ class TenantManager:
             is_authorized=is_authorized,
             github_token=github_token,
         )
-        self._repositories[repo_id] = repo
-        if full_name:
-            self._repositories[full_name] = repo
+        # Keyed by (org_id, ...) - a second organization registering the
+        # same repo_id/full_name gets its own independent entry here,
+        # never overwriting this one (see class docstring).
+        self._repositories[(org_id, repo_id)] = repo
+        if full_name and full_name != repo_id:
+            self._repositories[(org_id, full_name)] = repo
+        # Non-secret metadata only - RepositoryStore.upsert never reads
+        # repo.github_token, so a raw token can never reach persistent
+        # storage through this call.
+        self._repository_store.upsert(repo)
         return repo
 
-    def get_repository(self, repo_id: str) -> Optional[Repository]:
-        return self._repositories.get(repo_id)
+    def get_repository(self, repo_id: str, organization_id: Optional[str] = None) -> Optional[Repository]:
+        """
+        Tenant-scoped lookup: returns the repository registered under
+        repo_id (or its full_name) for THIS organization_id only. Fails
+        closed (returns None) when organization_id is missing or falsy -
+        never falls back to an unscoped, cross-tenant lookup. For the one
+        legitimate cross-tenant need (registration-conflict detection),
+        use find_registration_any_organization explicitly instead.
+        """
+        if not organization_id:
+            return None
+        return self._repositories.get((organization_id, repo_id))
+
+    def find_registration_any_organization(self, repo_id: str) -> Optional[Repository]:
+        """
+        Searches across ALL tenants for a repository already registered
+        under this id/full_name - deliberately NOT tenant-scoped. Used
+        only to detect/report a registration conflict (a different
+        organization already owns this repo_id) or to produce a precise
+        "not registered" vs "registered to a different tenant" error
+        message - NEVER to grant access. Every access-control decision
+        must go through get_repository(repo_id, organization_id) or
+        authorize_repository_access, both strictly tenant-scoped.
+        """
+        for (_org_id, key), repo in self._repositories.items():
+            if key == repo_id:
+                return repo
+        return None
 
     def list_org_repositories(self, org_id: str) -> List[Repository]:
         seen = set()
         repos = []
-        for r in self._repositories.values():
-            if r.organization_id == org_id and r.id not in seen:
+        for (oid, _key), r in self._repositories.items():
+            if oid == org_id and r.id not in seen:
                 seen.add(r.id)
                 repos.append(r)
         return repos
@@ -224,20 +300,26 @@ class TenantManager:
     ) -> Repository:
         """
         Enforces repository authorization before any GitHub operation:
-        1. Repository must be registered.
-        2. Repository must belong to organization_id.
-        3. Repository must be authorized (is_authorized is True).
-        4. Target branch (if specified) must match allowed patterns.
+        1. Repository must be registered for organization_id specifically
+           (a tenant-scoped lookup - never a global one).
+        2. Repository must be authorized (is_authorized is True).
+        3. Target branch (if specified) must match allowed patterns.
         """
-        repo = self.get_repository(repo_full_name)
+        repo = self.get_repository(repo_full_name, organization_id)
         if not repo:
+            # The tenant-scoped lookup already found nothing for this
+            # organization - repo is never sourced from any other
+            # tenant's registration here. This second, explicitly
+            # cross-tenant lookup exists purely to choose the more
+            # informative of two DENIAL messages; it can never turn this
+            # into an allow.
+            other_tenant_hit = self.find_registration_any_organization(repo_full_name)
+            if other_tenant_hit:
+                raise TenantAccessDeniedError(
+                    f"Cross-tenant access violation: Repository '{repo_full_name}' belongs to "
+                    f"organization '{other_tenant_hit.organization_id}', not '{organization_id}'."
+                )
             raise RepositoryAccessDeniedError(f"Repository '{repo_full_name}' is not registered.")
-
-        if repo.organization_id != organization_id:
-            raise TenantAccessDeniedError(
-                f"Cross-tenant access violation: Repository '{repo_full_name}' belongs to "
-                f"organization '{repo.organization_id}', not '{organization_id}'."
-            )
 
         if not repo.is_authorized:
             raise RepositoryAccessDeniedError(f"Repository '{repo_full_name}' is not authorized for operations.")

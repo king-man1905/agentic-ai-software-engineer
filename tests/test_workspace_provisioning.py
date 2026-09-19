@@ -442,7 +442,9 @@ def test_repository_registration_endpoint_enables_fresh_workspace_provisioning(
     headers = {"X-Organization-ID": "org-fresh", "X-User-ID": "user-fresh"}
 
     # Nothing registered yet - the API is the only path exercised here.
-    assert tenant_manager.get_repository("acme/fresh-widgets") is None
+    # find_registration_any_organization (not get_repository, which is
+    # tenant-scoped) proves genuine non-existence, not just a missing org_id.
+    assert tenant_manager.find_registration_any_organization("acme/fresh-widgets") is None
     assert not (tmp_path / "workspace" / "org-fresh" / "fresh-widgets").exists()
 
     register_resp = client.post(
