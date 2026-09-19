@@ -27,6 +27,8 @@ from backend.schemas.routing import RoutingDecision, TaskType
 from backend.schemas.tenant import Role
 from backend.security.auth import AuthMode
 from backend.security.tenant import tenant_manager
+from backend.vcs.git_manager import GitWorkspaceManager
+from backend.vcs.workspace_paths import resolve_workspace_path
 
 
 @pytest.fixture(autouse=True)
@@ -692,6 +694,91 @@ class TestWorkspaceProvisioningGitValidityCheck:
                 project_id="widgets", repository_id="acme/widgets", organization_id="default-org",
             )
         clone_spy.assert_not_called()
+
+
+# ============================================================================
+# run_777a478d62df investigation: resolve_workspace_path() returned a bare
+# CWD-relative Path in its "already exists" branch. GitWorkspaceManager.
+# clone_repository() passed that relative destination straight through to
+# git as both the clone argument AND (via its parent) the subprocess cwd -
+# so git resolved the relative destination a SECOND time against its own
+# cwd, cloning into a doubled/nested path while still exiting 0. The
+# EXPECTED path was left without a .git, tripping the existing
+# "clone reported success but ... has no .git directory" fail-closed check
+# in AgentRunner._ensure_workspace_provisioned (working exactly as
+# designed - the bug was upstream of it, in path resolution).
+# ============================================================================
+
+
+class TestResolveWorkspacePathAlwaysAbsolute:
+    def test_already_existing_directory_branch_returns_absolute_path(self, tmp_path, monkeypatch):
+        """The exact branch that used to leak a bare relative Path."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "workspace" / "org-a" / "proj-x").mkdir(parents=True)
+
+        resolved = resolve_workspace_path("org-a", "proj-x")
+
+        assert resolved.is_absolute()
+        assert resolved == tmp_path / "workspace" / "org-a" / "proj-x"
+
+    def test_not_yet_existing_directory_also_returns_absolute_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        resolved = resolve_workspace_path("org-a", "proj-never-created")
+
+        assert resolved.is_absolute()
+
+
+class TestCloneRepositoryNeverDoublesRelativeDestination:
+    def _make_real_local_source_repo(self, path):
+        path.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=str(path), capture_output=True, text=True, check=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=str(path), check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=str(path), check=True)
+        (path / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(path), check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(path), check=True)
+
+    def test_relative_destination_clones_to_the_exact_intended_path(self, tmp_path, monkeypatch):
+        """
+        Reproduces run_777a478d62df directly against the real (unmocked)
+        clone_repository()/git subprocess: a CWD-relative destination
+        string - exactly what the buggy resolve_workspace_path() branch
+        used to hand out - must still land .git at the intended path, with
+        no doubled/nested clone created alongside it.
+        """
+        monkeypatch.chdir(tmp_path)
+        source = tmp_path / "source_repo"
+        self._make_real_local_source_repo(source)
+
+        relative_dest = "workspace/default-org/e2e-test"
+
+        ok = GitWorkspaceManager.clone_repository(str(source), relative_dest)
+
+        assert ok is True
+        expected = tmp_path / "workspace" / "default-org" / "e2e-test"
+        assert (expected / ".git").is_dir()
+        # The historical bug's exact signature: a doubled/nested clone.
+        doubled = expected / "workspace" / "default-org" / "e2e-test"
+        assert not doubled.exists()
+
+    def test_preexisting_empty_stale_directory_clones_to_intended_path(self, tmp_path, monkeypatch):
+        """The exact trigger condition in production: the destination
+        directory already exists (so resolve_workspace_path's "already
+        exists" branch fires) but is empty/non-git - git can legitimately
+        clone into it, and must do so at the intended path, not a doubled
+        one."""
+        monkeypatch.chdir(tmp_path)
+        source = tmp_path / "source_repo"
+        self._make_real_local_source_repo(source)
+        preexisting = tmp_path / "workspace" / "default-org" / "e2e-test"
+        preexisting.mkdir(parents=True)
+
+        ok = GitWorkspaceManager.clone_repository(str(source), str(preexisting))
+
+        assert ok is True
+        assert (preexisting / ".git").is_dir()
+        assert not (preexisting / "workspace").exists()
 
 
 # ============================================================================

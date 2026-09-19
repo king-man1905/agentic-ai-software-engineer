@@ -184,8 +184,17 @@ class GitWorkspaceManager:
         or `auth_header`, nor any subprocess stdout/stderr (which could
         otherwise echo a credential embedded in the URL back verbatim on
         failure) - callers must uphold the same rule with whatever they build.
+
+        `project_path` is always resolved to an absolute path before use
+        (run_777a478d62df): a relative `project_path` combined with the
+        relative subprocess `cwd` used below (`dest.parent`) let git
+        resolve the destination argument a SECOND time against its own
+        cwd, cloning into a doubled/nested directory while still exiting
+        0 - defense in depth against any caller (present or future)
+        passing a CWD-relative destination, on top of the fix in
+        resolve_workspace_path() itself.
         """
-        dest = Path(project_path)
+        dest = Path(project_path).resolve()
         if _is_own_git_repo(str(dest)):
             return True
         args = _with_auth_config(["clone", clone_url, str(dest)], auth_header)

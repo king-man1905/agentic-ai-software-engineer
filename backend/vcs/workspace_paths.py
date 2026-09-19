@@ -60,7 +60,19 @@ def resolve_workspace_path(organization_id: Optional[str], project_id: Optional[
     directory if it already exists there (as it does inside most test
     fixtures, which monkeypatch cwd rather than os.getcwd()); otherwise
     resolves explicitly via os.getcwd() (as production code, which
-    monkeypatches os.getcwd() in some tests, needs).
+    monkeypatches os.getcwd() in some tests, needs). Always returns an
+    ABSOLUTE path (run_777a478d62df): returning the bare relative Path in
+    the "already exists" branch let a caller pass a CWD-relative
+    destination string straight through to GitWorkspaceManager.
+    clone_repository()/_run_git(), which set the git subprocess's OWN cwd
+    to that same relative parent - so git resolved the relative
+    destination argument a SECOND time against its own cwd, cloning into a
+    doubled/nested path (e.g. workspace/org/proj/workspace/org/proj) while
+    still exiting 0. The intended path was left without a .git, tripping
+    the "clone reported success but ... has no .git directory" fail-closed
+    check in AgentRunner._ensure_workspace_provisioned. `.resolve()` here
+    is safe even though the directory may not exist yet (Python's default
+    non-strict resolution).
     """
     org = safe_path_component(organization_id)
     proj = safe_path_component(project_id)
@@ -69,5 +81,5 @@ def resolve_workspace_path(organization_id: Optional[str], project_id: Optional[
 
     relative = Path("workspace") / org / proj
     if relative.exists():
-        return relative
+        return relative.resolve()
     return Path(os.getcwd()) / "workspace" / org / proj
