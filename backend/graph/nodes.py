@@ -1558,19 +1558,42 @@ def git_commit_node(state: AgentState) -> dict:
     or junk commit is never pushed or turned into a PR.
 
     Cryptographically validates workspace drift prior to commit.
+
+    Every exit path (no-op, drift/hash mismatch, or an actual commit
+    attempt) emits COMMIT_COMPLETED telemetry with its resulting
+    approval_status - run_cfba0530500b investigation: the drift-mismatch
+    and no-op early returns previously left with NO telemetry at all, so a
+    legitimate fail-closed rejection at this node (e.g. the workspace
+    genuinely drifted between approval request and resume) was
+    indistinguishable in telemetry from git_commit_node never having run,
+    and the run still finished at COMPLETED (see _derive_status) with no
+    evidence of why nothing was committed.
     """
     check_cancelled(state)
     mark_activity(state, "git_commit")
     from backend.vcs.git_manager import GitWorkspaceManager
 
+    run_id = state.get("run_id")
+    organization_id = state.get("organization_id", "default-org")
+
+    def _emit_commit_telemetry(status_val: str, branch_name: Optional[str]) -> None:
+        if run_id:
+            telemetry_collector.record_event(
+                run_id=run_id,
+                organization_id=organization_id,
+                event_type=TelemetryEventType.COMMIT_COMPLETED,
+                metadata={"status": status_val, "branch": branch_name},
+            )
+
     git_diff = state.get("git_diff")
     if git_diff is None or git_diff.is_no_op:
+        _emit_commit_telemetry("NO_CHANGES_NEEDED", git_diff.branch_name if git_diff else None)
         return {
             "approval_status": "NO_CHANGES_NEEDED",
         }
 
     project_id = state.get("project_id", "test_project")
-    project_path = resolve_workspace_path(state.get("organization_id", "default-org"), project_id)
+    project_path = resolve_workspace_path(organization_id, project_id)
     if project_path is None:
         raise ValueError(
             f"Refusing to commit: organization_id/project_id did not "
@@ -1587,6 +1610,7 @@ def git_commit_node(state: AgentState) -> dict:
             files_changed=git_diff.files_changed,
         )
         if not is_valid:
+            _emit_commit_telemetry("PATCH_HASH_MISMATCH", git_diff.branch_name)
             return {
                 "approval_status": "PATCH_HASH_MISMATCH",
             }
@@ -1610,14 +1634,7 @@ def git_commit_node(state: AgentState) -> dict:
     )
 
     status_val = "COMMITTED" if success else "COMMIT_FAILED"
-    run_id = state.get("run_id")
-    if run_id:
-        telemetry_collector.record_event(
-            run_id=run_id,
-            organization_id=state.get("organization_id", "default-org"),
-            event_type=TelemetryEventType.COMMIT_COMPLETED,
-            metadata={"status": status_val, "branch": git_diff.branch_name},
-        )
+    _emit_commit_telemetry(status_val, git_diff.branch_name)
 
     return {
         "approval_status": status_val,
