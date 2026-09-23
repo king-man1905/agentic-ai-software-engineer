@@ -6,6 +6,7 @@ import {
   request,
   ApiClientError,
   getStorageType,
+  getApiBaseUrl,
 } from '../api/client';
 
 describe('API Client & Authentication', () => {
@@ -17,6 +18,38 @@ describe('API Client & Authentication', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  // Regression: "Unable to connect to the API Gateway" in local dev turned
+  // out to be uvicorn binding only the IPv4 wildcard while the browser/Node
+  // resolved "localhost" to the IPv6 loopback (confirmed unreachable) - a
+  // direct cross-origin fetch to an absolute "http://localhost:PORT" URL
+  // could hit that ambiguity even with correct CORS. Routing dev traffic
+  // through Vite's same-origin proxy (which targets 127.0.0.1 explicitly)
+  // sidesteps the ambiguity entirely.
+  it('routes through the dev-server proxy (same-origin) when VITE_API_BASE_URL points at localhost in dev mode', () => {
+    vi.stubEnv('DEV', true);
+    vi.stubEnv('VITE_API_BASE_URL', 'http://localhost:8000');
+    expect(getApiBaseUrl()).toBe('');
+  });
+
+  it('routes through the dev-server proxy when VITE_API_BASE_URL points at 127.0.0.1 in dev mode', () => {
+    vi.stubEnv('DEV', true);
+    vi.stubEnv('VITE_API_BASE_URL', 'http://127.0.0.1:8000');
+    expect(getApiBaseUrl()).toBe('');
+  });
+
+  it('uses the configured absolute URL directly outside dev mode (production build)', () => {
+    vi.stubEnv('DEV', false);
+    vi.stubEnv('VITE_API_BASE_URL', 'http://localhost:8000');
+    expect(getApiBaseUrl()).toBe('http://localhost:8000');
+  });
+
+  it('uses a non-local absolute URL directly even in dev mode', () => {
+    vi.stubEnv('DEV', true);
+    vi.stubEnv('VITE_API_BASE_URL', 'https://api.example.com/');
+    expect(getApiBaseUrl()).toBe('https://api.example.com');
   });
 
   it('manages API key in sessionStorage by default', () => {
