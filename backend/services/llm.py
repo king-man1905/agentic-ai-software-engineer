@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Iterable, Optional
 
 from backend.core.config import (
     LLM_PROVIDER,
@@ -56,6 +56,16 @@ def get_llm(provider: Optional[str] = None, timeout: Optional[float] = None):
     configured_primary = os.getenv("LLM_PROVIDER", LLM_PROVIDER).strip().lower()
     explicit_model = os.getenv("LLM_MODEL_NAME") or LLM_MODEL_NAME
     model = (explicit_model if eff_provider == configured_primary else None) or _DEFAULT_MODELS.get(eff_provider)
+    if not model:
+        # Fail closed with a clear, actionable error instead of silently
+        # constructing a provider client with model=None, which each SDK
+        # surfaces as its own confusing, provider-specific error deep
+        # inside the first request rather than at configuration time.
+        raise ValueError(
+            f"No model configured for LLM provider '{eff_provider}' - add it to "
+            f"_DEFAULT_MODELS in backend/services/llm.py or set LLM_MODEL_NAME "
+            f"(only applies when '{eff_provider}' is the configured primary provider)."
+        )
 
     nvidia_key = os.getenv("NVIDIA_API_KEY", NVIDIA_API_KEY)
     google_key = os.getenv("GOOGLE_API_KEY", GOOGLE_API_KEY)
@@ -144,7 +154,10 @@ _FALLBACK_ORDER = {
 }
 
 
-def get_fallback_provider(primary: Optional[str] = None) -> Optional[str]:
+def get_fallback_provider(
+    primary: Optional[str] = None,
+    exclude: Optional[Iterable[str]] = None,
+) -> Optional[str]:
     """
     Resolves the healthy, eligible fallback provider for bounded fallback.
     Returns None if fallback is disabled, or if no *credentialed*
@@ -153,29 +166,37 @@ def get_fallback_provider(primary: Optional[str] = None) -> Optional[str]:
     final branch of each preference ladder returned a hardcoded provider
     name unconditionally, so a completely uncredentialed provider could be
     selected and would only fail later, deep inside fallback initialization).
+
+    `exclude` additionally rules out providers already attempted earlier in
+    the SAME invocation (e.g. a fallback that just failed with a rate-limit
+    error) - callers use this to find the NEXT credentialed alternative
+    instead of re-selecting one already known to be exhausted. `primary` is
+    always excluded regardless of `exclude`.
     """
     if os.getenv("LLM_FALLBACK_ENABLED", "true").strip().lower() in ("0", "false", "no"):
         return None
 
     primary_clean = (primary or os.getenv("LLM_PROVIDER", LLM_PROVIDER)).strip().lower()
+    excluded = {primary_clean} | {(p or "").strip().lower() for p in (exclude or ())}
 
     explicit_fallback = os.getenv("LLM_FALLBACK_PROVIDER")
-    if explicit_fallback:
+    if explicit_fallback and not exclude:
+        # The explicit single-provider override only applies to the FIRST
+        # fallback selection - once that provider has already been tried
+        # and excluded, honoring it again would just re-select the same
+        # exhausted provider, so subsequent selections fall through to the
+        # normal credential-checked preference order below instead.
         candidate = explicit_fallback.strip().lower()
         if (
             candidate in ("nvidia", "gemini", "openai")
-            and candidate != primary_clean
+            and candidate not in excluded
             and _has_provider_credentials(candidate)
         ):
             return candidate
-        # An explicit override that's uncredentialed (or equal to the
-        # primary) is never selected - fall through to the normal,
-        # credential-checked preference order below instead of returning
-        # it or giving up outright.
 
     order = _FALLBACK_ORDER.get(primary_clean, ("gemini", "nvidia", "openai"))
     for candidate in order:
-        if candidate != primary_clean and _has_provider_credentials(candidate):
+        if candidate not in excluded and _has_provider_credentials(candidate):
             return candidate
 
     return None

@@ -893,7 +893,16 @@ def test_gemini_rate_limit_after_nvidia_timeout_raises_llm_rate_limit_error(monk
         ),
     )
 
-    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "gemini")
+    # No OTHER credentialed provider exists beyond "gemini" in this
+    # scenario - `exclude` is honored (matching the real function's
+    # semantics) so the second-fallback lookup correctly returns None
+    # instead of re-selecting the already-exhausted "gemini" again.
+    def fake_get_fallback_provider(*a, primary=None, exclude=None, **kw):
+        if exclude and "gemini" in {e.lower() for e in exclude}:
+            return None
+        return "gemini"
+
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", fake_get_fallback_provider)
     monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback)
 
     with pytest.raises(LLMRateLimitError) as exc_info:
@@ -902,12 +911,118 @@ def test_gemini_rate_limit_after_nvidia_timeout_raises_llm_rate_limit_error(monk
     assert isinstance(exc_info.value, LLMRateLimitError)
     assert exc_info.value.provider == "gemini"
     assert primary.invocations == 1
-    # _invoke_single_provider retries a "429" message up to 3 total attempts
-    # (bounded, with backoff) against the SAME provider instance before
-    # giving up - this is the existing, already-bounded transient-429 retry
-    # behavior (never infinite), distinct from the primary->fallback provider
-    # switch itself, which happens exactly once regardless.
-    assert fallback.invocations == 3
+    # A rate-limit/quota error is fast-failed immediately (never retried
+    # within the same provider call - see _invoke_single_provider), and no
+    # second fallback provider is available here, so gemini is invoked
+    # exactly once before the run fails closed.
+    assert fallback.invocations == 1
+
+
+# 8b-ii. test_second_fallback_provider_used_when_first_fallback_is_rate_limited
+def test_second_fallback_provider_used_when_first_fallback_is_rate_limited(monkeypatch):
+    """
+    NVIDIA times out -> Gemini fallback is rate-limited (429) -> a THIRD,
+    distinct, credentialed provider (openai) is available, so it is tried
+    exactly once and succeeds. Verifies the bounded second-fallback escape
+    hatch actually recovers the run instead of failing closed prematurely.
+    """
+    primary = FakeProviderLLM(provider="nvidia", failure=TimeoutError("Request timed out after 75.0 seconds"))
+    gemini = FakeProviderLLM(
+        provider="gemini",
+        failure=Exception("429 RESOURCE_EXHAUSTED: Quota exceeded"),
+    )
+    openai = FakeProviderLLM(
+        provider="openai",
+        result=RoutingDecision(
+            task_type=TaskType.BUG_FIX,
+            confidence=0.9,
+            requires_planning=False,
+            requires_knowledge=False,
+            reasoning="Second fallback succeeded",
+        ),
+    )
+
+    def fake_get_fallback_provider(*a, primary=None, exclude=None, **kw):
+        excluded = {e.lower() for e in (exclude or ())}
+        if "gemini" not in excluded:
+            return "gemini"
+        if "openai" not in excluded:
+            return "openai"
+        return None
+
+    def fake_get_llm(provider=None, **kw):
+        return {"gemini": gemini, "openai": openai}[provider]
+
+    recorded_events = []
+    original_on_fallback = telemetry_collector.on_provider_fallback
+
+    def mock_on_fallback(**kwargs):
+        recorded_events.append(kwargs)
+        original_on_fallback(**kwargs)
+
+    monkeypatch.setattr(telemetry_collector, "on_provider_fallback", mock_on_fallback)
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", fake_get_fallback_provider)
+    monkeypatch.setattr("backend.services.llm.get_llm", fake_get_llm)
+
+    result = invoke_structured(primary, RoutingDecision, "Prompt")
+
+    assert result.reasoning == "Second fallback succeeded"
+    assert primary.invocations == 1
+    assert gemini.invocations == 1, "rate-limited provider must be tried exactly once, never retried"
+    assert openai.invocations == 1
+
+    # Two PROVIDER_FALLBACK events: nvidia->gemini, then gemini->openai.
+    assert len(recorded_events) == 2
+    assert recorded_events[0]["primary_provider"] == "nvidia"
+    assert recorded_events[0]["fallback_provider"] == "gemini"
+    assert recorded_events[1]["primary_provider"] == "gemini"
+    assert recorded_events[1]["fallback_provider"] == "openai"
+    assert recorded_events[1]["failure_category"] == "LLM_RATE_LIMIT"
+    for event in recorded_events:
+        for value in event.values():
+            assert "api_key" not in str(value).lower()
+            assert "nvapi" not in str(value).lower()
+
+
+# 8b-iii. test_second_fallback_provider_also_rate_limited_fails_closed_bounded
+def test_second_fallback_provider_also_rate_limited_fails_closed_bounded(monkeypatch):
+    """
+    NVIDIA times out -> Gemini is rate-limited -> the second fallback
+    (openai) is ALSO rate-limited -> the run must fail closed with the
+    second fallback's own LLMRateLimitError, and no FOURTH provider attempt
+    may ever be made (strict bound of 3 total provider attempts).
+    """
+    primary = FakeProviderLLM(provider="nvidia", failure=TimeoutError("Request timed out"))
+    gemini = FakeProviderLLM(provider="gemini", failure=Exception("429 RESOURCE_EXHAUSTED"))
+    openai = FakeProviderLLM(provider="openai", failure=Exception("429 Too Many Requests"))
+
+    fallback_lookup_calls = []
+
+    def fake_get_fallback_provider(*a, primary=None, exclude=None, **kw):
+        excluded = {e.lower() for e in (exclude or ())}
+        fallback_lookup_calls.append(frozenset(excluded))
+        if "gemini" not in excluded:
+            return "gemini"
+        if "openai" not in excluded:
+            return "openai"
+        return None
+
+    def fake_get_llm(provider=None, **kw):
+        return {"gemini": gemini, "openai": openai}[provider]
+
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", fake_get_fallback_provider)
+    monkeypatch.setattr("backend.services.llm.get_llm", fake_get_llm)
+
+    with pytest.raises(LLMRateLimitError) as exc_info:
+        invoke_structured(primary, RoutingDecision, "Prompt")
+
+    assert exc_info.value.provider == "openai"
+    assert primary.invocations == 1
+    assert gemini.invocations == 1
+    assert openai.invocations == 1
+    # Exactly 2 fallback-provider lookups (first fallback, second fallback) -
+    # a third lookup would indicate an unbounded cascade.
+    assert len(fallback_lookup_calls) == 2
 
 
 # 8c. test_rate_limited_primary_triggers_fallback_with_llm_rate_limit_telemetry_category
@@ -1650,6 +1765,64 @@ def test_get_fallback_provider_no_credentials_returns_none(monkeypatch):
     _set_provider_credentials(monkeypatch, nvidia="nvapi-primary-key", gemini=None, openai=None)
 
     assert get_fallback_provider(primary="nvidia") is None
+
+
+# 23b. test_get_fallback_provider_exclude_finds_next_credentialed_alternative
+def test_get_fallback_provider_exclude_finds_next_credentialed_alternative(monkeypatch):
+    """
+    With BOTH gemini and openai credentialed, excluding gemini (the
+    already-tried, rate-limited provider) must select openai - the real
+    (unmocked) credential-checked selection logic that powers the bounded
+    second-fallback escape hatch in invoke_structured().
+    """
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-primary-key", gemini="google-key", openai="openai-key")
+
+    assert get_fallback_provider(primary="nvidia") == "gemini"
+    assert get_fallback_provider(primary="nvidia", exclude=["gemini"]) == "openai"
+
+
+# 23c. test_get_fallback_provider_exclude_never_selects_uncredentialed_provider
+def test_get_fallback_provider_exclude_never_selects_uncredentialed_provider(monkeypatch):
+    """
+    Excluding the only credentialed alternative must return None, never
+    fall through to selecting an uncredentialed provider as a last resort -
+    the same fail-closed guarantee the base (no-exclude) selection already
+    has, preserved for the exclude path.
+    """
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-primary-key", gemini="google-key", openai=None)
+
+    assert get_fallback_provider(primary="nvidia") == "gemini"
+    assert get_fallback_provider(primary="nvidia", exclude=["gemini"]) is None
+
+
+# 23d. test_get_llm_raises_clear_error_when_no_model_resolvable
+def test_get_llm_raises_clear_error_when_no_model_resolvable(monkeypatch):
+    """
+    If a provider has no resolvable model (a misconfigured _DEFAULT_MODELS
+    entry), get_llm() must fail closed with a clear, actionable ValueError
+    at construction time instead of silently building a client with
+    model=None, which each SDK would otherwise surface as its own
+    confusing, provider-specific error deep inside the first request.
+    """
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-primary-key", gemini=None, openai=None)
+    monkeypatch.setattr("backend.services.llm._DEFAULT_MODELS", {"gemini": "gemini-3.6-flash", "openai": "gpt-4o"})
+    # LLM_MODEL_NAME only ever fills in the model for the CONFIGURED PRIMARY
+    # provider (by design - see get_llm()'s own comment) - both the env var
+    # and the module-level constant captured from it at import time must be
+    # cleared so this test genuinely exercises the "no model resolvable at
+    # all" path instead of incidentally passing via this dev machine's own
+    # real .env configuration.
+    monkeypatch.delenv("LLM_MODEL_NAME", raising=False)
+    monkeypatch.setattr("backend.services.llm.LLM_MODEL_NAME", None)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setattr("backend.services.llm.LLM_PROVIDER", "nvidia")
+
+    with pytest.raises(ValueError, match="No model configured"):
+        get_llm(provider="nvidia")
 
 
 # 24. test_get_fallback_provider_selects_the_one_credentialed_alternative (Category B)

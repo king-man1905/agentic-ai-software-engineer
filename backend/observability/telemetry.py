@@ -202,6 +202,7 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
         LLMAuthenticationError,
         LLMInvalidRequestError,
         LLMMalformedResponseError,
+        LLMRateLimitError,
         LLMTimeoutError,
     )
 
@@ -348,13 +349,23 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
                     LLMInvalidRequestError,
                     LLMTimeoutError,
                     LLMMalformedResponseError,
+                    # A rate-limit/quota error is fast-failed immediately,
+                    # never retried within this same provider call: a 429
+                    # backed by a per-second rate limit won't clear in the
+                    # ~1-3s this loop could wait, and a 429 backed by a
+                    # daily/monthly quota (the real production case -
+                    # generativelanguage.googleapis.com's free-tier
+                    # GenerateRequestsPerDayPerProjectPerModel quota) won't
+                    # clear for hours - retrying either just spends bounded
+                    # request budget for no chance of success. The caller
+                    # (invoke_structured) is where retry-shaped recovery
+                    # belongs for a rate limit: switching to a DIFFERENT
+                    # credentialed provider, not re-asking the same one.
+                    LLMRateLimitError,
                 ),
             ):
                 raise classified
 
-            if ("429" in str(e) or "Too Many Requests" in str(e)) and attempt < 2:
-                time.sleep(1 * (attempt + 1))
-                continue
             if ("guided_json" in str(e) or "[400]" in str(e)) and attempt < 2:
                 try:
                     raw = llm.invoke(prompt)
@@ -377,7 +388,14 @@ def invoke_structured(
     Invokes `llm` for structured `schema` output with bounded request timeout,
     token telemetry recording, structured error classification, and bounded safe provider fallback.
 
-    Maximum provider attempts: 2 (Primary -> Fallback -> Structured Error).
+    Maximum provider attempts: 3 (Primary -> Fallback -> Structured Error), with
+    one bounded exception: if the Fallback provider itself fails specifically
+    with a rate-limit/quota error AND a third, distinct, credentialed provider
+    is configured, exactly one further attempt is made against that provider
+    before failing closed - a rate-limited provider is known-exhausted, so
+    re-raising immediately would give up on a real, already-available
+    alternative. No provider is ever attempted more than once, and no
+    provider is ever selected without a valid, present API key.
     Fallback is ONLY allowed for explicitly classified transient failures and timeouts.
     Authentication errors, invalid requests, and policy/schema failures NEVER trigger fallback.
     """
@@ -508,8 +526,63 @@ def invoke_structured(
             classified_fallback.elapsed_ms = fb_elapsed_ms
             print(
                 f"[LLM] Fallback provider '{fallback_provider}' also failed with "
-                f"{type(classified_fallback).__name__}. Maximum provider attempts (2) reached. "
-                f"Raising final structured error.",
+                f"{type(classified_fallback).__name__}.",
+                flush=True,
+            )
+
+            # Bounded escape hatch, rate-limit only: a rate-limited fallback
+            # is known-exhausted for this invocation (retrying IT would just
+            # repeat the same 429/quota error - see the fast-fail in
+            # _invoke_single_provider), but a completely different,
+            # untouched, credentialed provider might still work right now.
+            # Tried at most once - if it also fails, its own classified
+            # error is raised below with no further fallback attempted.
+            if isinstance(classified_fallback, LLMRateLimitError):
+                second_fallback_provider = get_fallback_provider(
+                    primary=primary_provider, exclude=[fallback_provider]
+                )
+                if second_fallback_provider:
+                    telemetry_collector.on_provider_fallback(
+                        run_id=effective_run_id,
+                        organization_id=effective_org_id,
+                        primary_provider=fallback_provider,
+                        fallback_provider=second_fallback_provider,
+                        failure_category="LLM_RATE_LIMIT",
+                        failure_type=type(classified_fallback).__name__,
+                        attempt_number=2,
+                        elapsed_ms=fb_elapsed_ms,
+                        model=getattr(fallback_llm, "model", None) or getattr(fallback_llm, "model_name", None),
+                    )
+                    print(
+                        f"[LLM] Fallback provider '{fallback_provider}' was rate-limited. "
+                        f"Trying second fallback provider '{second_fallback_provider}' "
+                        f"(final attempt, 3 of 3)...",
+                        flush=True,
+                    )
+                    try:
+                        second_fallback_llm = get_llm(provider=second_fallback_provider)
+                        t2 = time.time()
+                        result = _invoke_single_provider(second_fallback_llm, schema, prompt)
+                        print(
+                            f"[LLM] Second fallback provider '{second_fallback_provider}' "
+                            f"succeeded in {time.time()-t2:.2f}s.",
+                            flush=True,
+                        )
+                        return result
+                    except Exception as second_fallback_exc:
+                        classified_second_fallback = classify_llm_exception(
+                            second_fallback_exc, provider=second_fallback_provider
+                        )
+                        print(
+                            f"[LLM] Second fallback provider '{second_fallback_provider}' also failed "
+                            f"with {type(classified_second_fallback).__name__}. "
+                            f"Maximum provider attempts (3) reached. Raising final structured error.",
+                            flush=True,
+                        )
+                        raise classified_second_fallback from fallback_exc
+
+            print(
+                "[LLM] Maximum provider attempts reached. Raising final structured error.",
                 flush=True,
             )
             raise classified_fallback
