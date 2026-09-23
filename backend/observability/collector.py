@@ -810,6 +810,8 @@ class TelemetryCollector:
             return FailureCategory.WORKSPACE_LOCK_TIMEOUT
         if "llmtimeouterror" in m or ("llm" in m and ("timeout" in m or "timed out" in m)):
             return FailureCategory.LLM_TIMEOUT
+        if "llmratelimiterror" in m or "llm rate limit" in m or "resource_exhausted" in m or "resourceexhausted" in m:
+            return FailureCategory.LLM_RATE_LIMIT
         if "llmtransienterror" in m or ("llm" in m and "transient" in m):
             return FailureCategory.LLM_TRANSIENT_FAILURE
         if "llmpermanenterror" in m or "llmerror" in m:

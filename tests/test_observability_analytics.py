@@ -474,11 +474,27 @@ def test_18_failure_category_normalized_correctly(temp_store, isolated_collector
         ("Pytest subprocess failed with exit code 1", FailureCategory.TEST_FAILURE),
         ("Unauthorized GitHub API token", FailureCategory.AUTHENTICATION_FAILURE),
         ("Something completely unexpected happened", FailureCategory.INTERNAL_ERROR),
+        # Regression: a Gemini/LLM provider rate-limit or quota-exhaustion
+        # failure must classify as LLM_RATE_LIMIT, never GITHUB_RATE_LIMIT -
+        # this is the exact message format classify_llm_exception() +
+        # LLMRateLimitError.__str__() produce for a real Gemini 429.
+        (
+            "[GEMINI] LLM rate limit reached: Error calling model 'gemini-3.6-flash' "
+            "(RESOURCE_EXHAUSTED): 429 RESOURCE_EXHAUSTED. Quota exceeded for metric: "
+            "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+            FailureCategory.LLM_RATE_LIMIT,
+        ),
+        # A real GitHub API 429 must still classify as GITHUB_RATE_LIMIT -
+        # unchanged by the LLM_RATE_LIMIT fix above.
+        ("GitHub API rate limit exceeded.", FailureCategory.GITHUB_RATE_LIMIT),
+        # NVIDIA timeout must still classify as LLM_TIMEOUT, unaffected by
+        # the new rate-limit check inserted just above it.
+        ("[NVIDIA] LLM request timed out: read timeout after 75s", FailureCategory.LLM_TIMEOUT),
     ]
 
     for err_msg, expected_cat in test_cases:
         norm_cat = isolated_collector.classify_error(err_msg)
-        assert norm_cat == expected_cat
+        assert norm_cat == expected_cat, f"{err_msg!r} classified as {norm_cat}, expected {expected_cat}"
 
 
 # ---------------------------------------------------------------------------
