@@ -1,11 +1,11 @@
 """
 Regression tests for the NVIDIA openai/gpt-oss-20b router timeout fix.
 
-Round 1 root cause: gpt-oss-20b is a reasoning model that, by default,
-spends a large and variable amount of hidden "thinking" tokens before
-answering. The fix passed NVIDIA's `reasoning_effort="low"` request
-parameter (via ChatNVIDIA's model_kwargs passthrough) for gpt-oss models,
-and trimmed the router prompt.
+Round 1 root cause (superseded, see Round 3 below): gpt-oss-20b is a
+reasoning model that, by default, spends a large and variable amount of
+hidden "thinking" tokens before answering. The fix passed NVIDIA's
+`reasoning_effort="low"` request parameter (via ChatNVIDIA's model_kwargs
+passthrough) for gpt-oss models, and trimmed the router prompt.
 
 Round 2 root cause (this file's main coverage): even at reasoning_effort=
 "low", the model occasionally still returns an empty completion for a given
@@ -20,7 +20,24 @@ The fix adds `_invoke_nvidia_single_format_structured`, which binds the
 same primary response_format directly (via the public `.bind()` mechanism
 ChatNVIDIA's own with_structured_output uses internally) for a single
 round-trip, then reuses the existing empty/malformed classification
-unchanged - gated strictly to NVIDIA gpt-oss models.
+unchanged - gated strictly to NVIDIA gpt-oss models. Unaffected by Round 3.
+
+Round 3 root cause (2026-09-27, corrects Round 1): the router still timed
+out at 75s even with reasoning_effort="low" set. Investigation proved
+Round 1's premise wrong: the installed SDK's own static model registry
+marks "openai/gpt-oss-20b" as `supports_thinking=False` (not a recognized
+thinking-controllable model via ChatNVIDIA's first-class mechanism), so
+`reasoning_effort` was only ever an unmanaged pydantic "unknown field"
+passthrough into model_kwargs. Three direct HTTPS requests to NVIDIA's
+endpoint for this model - no reasoning_effort, reasoning_effort at the top
+level, and reasoning_effort nested under chat_template_kwargs - all timed
+out identically at ~90-92s with zero measurable difference: the parameter
+has no effect on this endpoint's latency in any shape NVIDIA's API
+recognizes. The fix removes the ineffective passthrough entirely rather
+than keep sending a parameter proven to do nothing. The actual bottleneck
+is NVIDIA's own hosted response time for this model, which is external and
+handled correctly already by the existing LLM_TIMEOUT classification and
+provider fallback - unchanged by this round.
 """
 
 from types import SimpleNamespace
@@ -114,17 +131,35 @@ class FakeNvidiaLLM:
 
 
 # ---------------------------------------------------------------------------
-# 1. gpt-oss reasoning_effort passthrough (llm.py) - unaffected by this round
+# 1. gpt-oss reasoning_effort passthrough (llm.py) - REMOVED in Round 3,
+#    empirically proven to have no effect on NVIDIA's hosted endpoint for
+#    this model. These tests now lock in its absence.
 # ---------------------------------------------------------------------------
 
 class TestNvidiaReasoningEffortConfiguration:
-    def test_gpt_oss_default_model_gets_low_reasoning_effort(self, monkeypatch):
+    def test_gpt_oss_default_model_does_not_get_reasoning_effort(self, monkeypatch):
         monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
         monkeypatch.delenv("LLM_MODEL_NAME", raising=False)
         from backend.services import llm as llm_module
 
         client = llm_module.get_llm(provider="nvidia")
-        assert client.model_kwargs.get("reasoning_effort") == "low"
+        assert "reasoning_effort" not in client.model_kwargs
+
+    def test_gpt_oss_client_construction_emits_no_unsupported_parameter_warning(self, monkeypatch):
+        """Passing an unrecognized constructor kwarg (the old
+        reasoning_effort passthrough) triggers a pydantic UserWarning on
+        every NVIDIA client construction - confirmed gone now that the
+        parameter is no longer sent at all."""
+        import warnings
+
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
+        monkeypatch.delenv("LLM_MODEL_NAME", raising=False)
+        from backend.services import llm as llm_module
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            llm_module.get_llm(provider="nvidia")
+        assert not any("reasoning_effort" in str(w.message) for w in caught)
 
     def test_non_gpt_oss_nvidia_model_is_not_given_reasoning_effort(self, monkeypatch):
         monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")

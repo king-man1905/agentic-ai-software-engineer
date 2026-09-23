@@ -63,20 +63,35 @@ def get_llm(provider: Optional[str] = None, timeout: Optional[float] = None):
 
     if eff_provider == "nvidia":
         from langchain_nvidia_ai_endpoints import ChatNVIDIA
-        extra_kwargs = {}
-        # openai/gpt-oss-* are reasoning models: by default they spend a
-        # large, variable amount of hidden "thinking" tokens before the
-        # final answer, which is what makes plain classification calls slow
-        # enough to threaten LLM_REQUEST_TIMEOUT_SECONDS. `reasoning_effort`
-        # is the NVIDIA-hosted, OpenAI-compatible request parameter these
-        # models accept to bound that thinking budget; ChatNVIDIA has no
-        # dedicated field for it, but its pydantic model passes unknown
-        # constructor kwargs through to `model_kwargs`, which is merged
-        # into the outbound request payload - the smallest mechanism this
-        # installed version supports, without inventing a new parameter.
-        if "gpt-oss" in model.lower():
-            extra_kwargs["reasoning_effort"] = "low"
-        client = ChatNVIDIA(model=model, api_key=nvidia_key, temperature=0, timeout=eff_timeout, **extra_kwargs)
+        # openai/gpt-oss-* previously received a `reasoning_effort="low"`
+        # constructor kwarg, on the theory that it bounds the model's hidden
+        # "thinking" budget. Removed (2026-09-27) after empirical
+        # verification proved it does nothing on NVIDIA's hosted endpoint
+        # for this model:
+        #   1. The installed langchain-nvidia-ai-endpoints==1.4.3 package's
+        #      own static model registry (_statics.py) marks
+        #      "openai/gpt-oss-20b" with the default `supports_thinking =
+        #      False` - it is not a recognized thinking-controllable model
+        #      via the SDK's own first-class mechanism
+        #      (thinking_param_enable/disable). Passing reasoning_effort as
+        #      a constructor kwarg is therefore an unmanaged pydantic
+        #      "unknown field" passthrough into `model_kwargs` (which
+        #      itself prints a UserWarning on every client construction),
+        #      not a supported control.
+        #   2. Three direct HTTPS requests to
+        #      integrate.api.nvidia.com/v1/chat/completions for this exact
+        #      model - with no reasoning_effort, with it at the top level
+        #      (what model_kwargs sends), and with it nested under
+        #      chat_template_kwargs (the vLLM/NIM convention some hosted
+        #      OSS models use) - all three timed out identically at ~90-92s
+        #      with zero measurable difference. The parameter has no effect
+        #      on this endpoint's latency in any shape.
+        # The real, current bottleneck is NVIDIA's own hosted response time
+        # for this model, which is external and not addressable by tuning a
+        # client-side request parameter - the existing LLM_TIMEOUT
+        # classification and provider fallback (to Gemini) are what
+        # actually handle this, unchanged.
+        client = ChatNVIDIA(model=model, api_key=nvidia_key, temperature=0, timeout=eff_timeout)
         setattr(client, "_provider", "nvidia")
         setattr(client, "_timeout", eff_timeout)
         return client
