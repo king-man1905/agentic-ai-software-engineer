@@ -223,6 +223,19 @@ def test_derive_status_completed_and_committed_terminal_statuses_unaffected():
     assert runner._derive_status(rejected) == "COMPLETED"
 
 
+def test_derive_status_commit_failed_is_failed():
+    """A run whose commit failed must be derived as FAILED, never COMPLETED."""
+    runner = AgentRunner()
+    commit_failed = _snapshot(
+        (),
+        {
+            "qa_result": QAResult(status="PASS", summary="All checks passed."),
+            "approval_status": "COMMIT_FAILED",
+        },
+    )
+    assert runner._derive_status(commit_failed) == "FAILED"
+
+
 # ---------------------------------------------------------------------------
 # D-F: full-graph integration tests
 # ---------------------------------------------------------------------------

@@ -45,11 +45,19 @@ CONFIG_EXTENSIONS = [
 
 
 def _git_env() -> Dict[str, str]:
-    """Ensures non-interactive Git operations without GUI or terminal prompts."""
+    """Ensures non-interactive Git operations without GUI or terminal prompts and provides deterministic author identity."""
+    author_name = os.environ.get("GIT_AUTHOR_NAME") or "Agentic AI"
+    author_email = os.environ.get("GIT_AUTHOR_EMAIL") or "agentic-ai@antigravity.dev"
+    committer_name = os.environ.get("GIT_COMMITTER_NAME") or author_name
+    committer_email = os.environ.get("GIT_COMMITTER_EMAIL") or author_email
     return {
         **os.environ,
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
+        "GIT_AUTHOR_NAME": author_name,
+        "GIT_AUTHOR_EMAIL": author_email,
+        "GIT_COMMITTER_NAME": committer_name,
+        "GIT_COMMITTER_EMAIL": committer_email,
     }
 
 
@@ -494,11 +502,22 @@ class GitWorkspaceManager:
         """
         if not _is_own_git_repo(repo_path):
             return False
+        author_name = os.environ.get("GIT_AUTHOR_NAME") or "Agentic AI"
+        author_email = os.environ.get("GIT_AUTHOR_EMAIL") or "agentic-ai@antigravity.dev"
         try:
             _run_git(["add", "."], repo_path)
-            _run_git(["commit", "-m", message], repo_path)
+            _run_git(
+                [
+                    "-c", f"user.name={author_name}",
+                    "-c", f"user.email={author_email}",
+                    "commit", "-m", message,
+                ],
+                repo_path,
+            )
             return True
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            if hasattr(e, "stderr") and e.stderr:
+                print(f"[!] Commit error: {e.stderr.strip()}")
             return False
 
     @staticmethod

@@ -98,6 +98,17 @@ def clean_security_state(tmp_path, monkeypatch):
             summary="QA verification successful.",
         ),
     )
+    # developer_node's own inline exact-snippet LLM call (reachable when a
+    # real, scannable workspace exists on disk for the request's project_id)
+    # is separate from the generate_code_changes mock above - without also
+    # stubbing it, a run dispatched through the real API makes a live
+    # network call to the configured LLM provider instead of staying
+    # hermetic. See tests/test_api.py's client_and_runner fixture for the
+    # same gap.
+    monkeypatch.setattr(
+        "backend.graph.nodes.invoke_structured",
+        lambda llm, schema_cls, prompt, *a, **k: schema_cls(patches=[]),
+    )
 
     yield
 

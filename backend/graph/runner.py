@@ -46,7 +46,7 @@ from backend.schemas.rag import RetrievalEvaluation, RAGTelemetry
 from backend.observability.collector import telemetry_collector
 from backend.observability.store import telemetry_store
 from backend.observability.telemetry import run_context
-from backend.schemas.telemetry import TelemetryEventType, TERMINAL_RUN_STATUSES
+from backend.schemas.telemetry import FailureCategory, TelemetryEventType, TERMINAL_RUN_STATUSES
 from backend.security.auth import AuthMode, RepositoryAccessDeniedError, TenantAccessDeniedError
 from backend.security.tenant import tenant_manager
 from backend.vcs.git_manager import GitWorkspaceManager, build_github_auth_header
@@ -308,6 +308,8 @@ class AgentRunner:
         qa_result = self._extract_qa_result(state_snapshot)
         values = state_snapshot.values if state_snapshot else {}
         approval_status = (values or {}).get("approval_status")
+        if approval_status == "COMMIT_FAILED":
+            return "FAILED"
         if qa_result is not None and qa_result.status != "PASS" and approval_status != "COMMITTED":
             return "FAILED"
 
@@ -843,6 +845,16 @@ class AgentRunner:
             )
 
         if state_snapshot is None or not state_snapshot.values:
+            if durable_status:
+                return self._build_status_response(
+                    run_id,
+                    durable_status.status,
+                    state_snapshot,
+                    error_summary=durable_status.safe_failure_message or error_msg,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    pr_status=pr_status,
+                )
             raise KeyError(f"Run not found: {run_id}")
 
         if is_active:
@@ -857,10 +869,18 @@ class AgentRunner:
             )
 
         status = self._derive_status(state_snapshot)
+        error_summary = error_msg
+        if status == "FAILED" and not error_summary:
+            values = state_snapshot.values if state_snapshot else {}
+            if (values or {}).get("approval_status") == "COMMIT_FAILED":
+                error_summary = "Git commit failed"
+            elif durable_status and durable_status.safe_failure_message:
+                error_summary = durable_status.safe_failure_message
         return self._build_status_response(
             run_id,
             status,
             state_snapshot,
+            error_summary=error_summary,
             pr_number=pr_number,
             pr_url=pr_url,
             pr_status=pr_status,
@@ -1001,6 +1021,24 @@ class AgentRunner:
                     state_values=vals,
                     duration_ms=duration_ms,
                 )
+                return self._build_status_response(run_id, status, state_snapshot)
+
+            if status == "FAILED":
+                vals = state_snapshot.values if state_snapshot else {}
+                fail_msg = "Git commit failed" if vals.get("approval_status") == "COMMIT_FAILED" else "Run failed"
+                telemetry_collector.on_run_failed(
+                    run_id=run_id,
+                    organization_id=effective_org,
+                    error_message=fail_msg,
+                    failure_category=FailureCategory.COMMIT_FAILURE if vals.get("approval_status") == "COMMIT_FAILED" else None,
+                    duration_ms=duration_ms,
+                )
+                if vals.get("approval_status") == "COMMIT_FAILED":
+                    rec = telemetry_store.get_run(run_id, effective_org)
+                    if rec:
+                        rec.commit_status = "COMMIT_FAILED"
+                        telemetry_store.create_or_update_run(rec)
+                return self._build_status_response(run_id, status, state_snapshot, error_summary=fail_msg)
 
             return self._build_status_response(run_id, status, state_snapshot)
         except RunCancelledException as ce:
