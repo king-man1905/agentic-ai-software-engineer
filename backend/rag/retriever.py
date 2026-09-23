@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import List, Tuple
 
 from langchain_community.vectorstores import FAISS
@@ -6,8 +5,6 @@ from langchain_core.documents import Document
 
 from backend.rag.indexer import get_embeddings, get_vector_store_path
 from backend.schemas.rag import RetrievedDocumentView
-
-VECTOR_STORE_ROOT = Path("vector_store")
 
 
 def load_project_index(project_id: str, organization_id: str):

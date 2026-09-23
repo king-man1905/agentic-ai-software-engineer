@@ -241,7 +241,18 @@ def knowledge_node(state: AgentState) -> dict:
     # raises before assignment, so answer_from_project can tell "retrieval
     # genuinely failed" apart from "retrieval succeeded with zero matches"
     # and fall back to its own retrieval/error-handling accordingly.
-    organization_id = state.get("organization_id", "default-org")
+    #
+    # organization_id is deliberately read with NO default here (unlike
+    # other nodes' workspace-path resolution): defaulting a missing value
+    # to "default-org" would silently query/read that tenant's own vector
+    # store for a run that never actually authenticated as it - defeating
+    # get_vector_store_path's fail-closed ValueError on a genuinely missing
+    # organization_id. A real None/missing value here correctly raises
+    # inside load_project_index/answer_from_project below, both of which
+    # are already wrapped in this function's own exception handling, so
+    # the graph degrades to "no context found" exactly as it does for a
+    # missing project_id - never a silent cross-tenant read.
+    organization_id = state.get("organization_id")
     docs = None
     dense_candidates = []
     try:

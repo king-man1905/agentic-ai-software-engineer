@@ -338,13 +338,18 @@ class TestTenantContextAndIsolation:
 class TestRAGTenantIsolation:
     def test_rag_vector_store_tenant_path(self):
         # Two different tenants on the same project_id resolve to disjoint,
-        # namespaced paths - never a flat, unnamespaced one.
+        # namespaced paths - never a flat, unnamespaced one. Exact form:
+        # vector_store/<organization_id>/<project_id>, not merely a
+        # substring match.
+        from pathlib import Path
+
         path_org_a = get_vector_store_path("project-xyz", organization_id="tenant-123")
-        assert "tenant-123" in str(path_org_a)
-        assert "project-xyz" in str(path_org_a)
+        assert path_org_a == Path("vector_store") / "tenant-123" / "project-xyz"
 
         path_org_b = get_vector_store_path("project-xyz", organization_id="tenant-456")
-        assert "tenant-456" in str(path_org_b)
+        assert path_org_b == Path("vector_store") / "tenant-456" / "project-xyz"
+
+        # Same project_id, different tenants - must never collide.
         assert path_org_a != path_org_b
 
     def test_rag_vector_store_missing_organization_id_fails_closed(self):
@@ -401,6 +406,43 @@ class TestRAGTenantIsolation:
 
         assert captured["organization_id"] == "tenant-real"
         assert captured["answer_from_project_org"] == "tenant-real"
+
+    def test_knowledge_node_fails_closed_when_organization_id_missing(self, monkeypatch):
+        """The actual vulnerability this hardening closes: knowledge_node
+        used to substitute a real, valid-looking "default-org" whenever a
+        run's state had no organization_id at all - silently querying/
+        reading THAT tenant's vector store instead of failing closed like
+        get_vector_store_path's own contract requires. A run with no
+        organization_id must never resolve to any real tenant's data."""
+        from backend.graph import nodes as nodes_module
+
+        captured = {}
+
+        def fake_load_project_index(project_id, organization_id=None):
+            captured["organization_id"] = organization_id
+            raise FileNotFoundError("no index for this test")
+
+        monkeypatch.setattr(
+            "backend.rag.retriever.load_project_index", fake_load_project_index
+        )
+
+        def fake_answer_from_project(project_id, question, k=4, documents=None, organization_id=None):
+            captured["answer_from_project_org"] = organization_id
+            return nodes_module.KnowledgeAnswer(answer="x", sources=[], sufficient_context=False)
+
+        monkeypatch.setattr(nodes_module, "answer_from_project", fake_answer_from_project)
+
+        state = {
+            "project_id": "proj-1",
+            # organization_id deliberately absent from state.
+            "user_message": "what does this do?",
+        }
+        nodes_module.knowledge_node(state)
+
+        assert captured["organization_id"] != "default-org"
+        assert captured["organization_id"] is None
+        assert captured["answer_from_project_org"] != "default-org"
+        assert captured["answer_from_project_org"] is None
 
 
 # =============================================================================
