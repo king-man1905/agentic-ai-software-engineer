@@ -1,134 +1,273 @@
-# Autonomous AI Software Engineer (LangGraph + HITL)
+# Autonomous AI Software Engineer
 
-Deterministic, stateful multi-agent pipeline with AST pre-flight checks, isolated pytest execution proofs, and Human-in-the-Loop governance.
+An agentic software-engineering control plane: given a natural-language task and a target repository, it plans the work, retrieves relevant repository context, generates a code change, verifies it in an isolated sandbox, evaluates it against organizational policy, pauses for human approval, and — only after that approval — commits, pushes, and opens a GitHub Pull Request.
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![LangGraph](https://img.shields.io/badge/orchestration-LangGraph-1c1c1c)
 ![FastAPI](https://img.shields.io/badge/api-FastAPI-009688)
-![Tests](https://img.shields.io/badge/tests-165%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-768%20passed-brightgreen)
 [![License](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 
-## Why this exists
+This is not "generate a diff and stop." The pipeline is a durable, resumable state machine: every run persists to a SQLite-backed checkpointer, so a run paused at the human-approval gate survives a server restart and resumes exactly where it left off. Nothing reaches GitHub without an explicit, hash-bound human decision.
 
-Most "AI coding agent" demos stop at generation: a model produces a diff and the demo ends there. Nothing verifies the diff runs, nothing scores its risk, and nothing stops it from being applied. That gap — generation without verification or governance — is where these systems fail in practice, not at the code-generation step itself.
+## Key Capabilities
 
-This project treats generation as the easy 20%. The other 80% is: does the fix actually pass the project's own tests in isolation, is the change risky enough to need a second look, and does a human get to see the diff before anything leaves the local machine.
+- **Task understanding & routing** — classifies the incoming request (bug fix, documentation, code generation, review, knowledge search, etc.) and decides whether planning or repository knowledge is actually needed.
+- **Planning** — produces an execution plan for tasks that require multiple engineering steps.
+- **Repository-aware knowledge retrieval (RAG)** — hybrid BM25 (sparse) + FAISS (dense, tenant-namespaced vector store) retrieval with retrieval-quality evaluation and bounded query rewriting.
+- **Code generation** — AST-aware patch generation against the real repository context.
+- **Quality assurance** — AST pre-flight validation, isolated sandbox test execution, static security scanning, and patch-scope safety checks before anything is trusted.
+- **Self-correction (revision loop)** — a failing QA result routes back through a bounded revision cycle (re-diagnose → re-patch → re-evaluate) rather than giving up or silently shipping a broken change.
+- **Policy evaluation** — deterministic organizational policy checks (protected branches/paths, patch size limits, risk scoring) before any human is even asked to look at the diff.
+- **Human-in-the-loop approval** — a genuine `interrupt()`-based pause; nothing is committed until a reviewer explicitly approves the *exact* diff, bound by cryptographic hash.
+- **Git commit & push** — only after approval, and only if the workspace hasn't drifted from what was approved.
+- **GitHub Pull Request creation** — a real PR against the target repository, publishable only after a committed, approved run.
 
-| | Generic LLM Wrapper | Agentic AI Software Engineer |
-|---|---|---|
-| **Execution state** | Stateless — one prompt, one completion | Durable LangGraph state machine; a paused run persists across a checkpointer and resumes exactly where it stopped |
-| **Verification** | None — the model's claim is the only evidence | Real sandboxed `pytest` execution in an isolated subprocess; pass/fail is measured, not asserted |
-| **Self-correction** | None — a bad output is the final output | Failing tests route to a revision loop: re-diagnose → re-patch → re-test, up to a bounded retry count |
-| **Delivery** | Text in a chat window | Real git branch, real commit, real GitHub Draft PR with a structured, evidence-backed body |
-| **Governance** | None | Heuristic risk scoring + a mandatory Human-in-the-Loop gate before any external action |
+## Architecture
 
-## Core architecture & pipeline
+The pipeline is a single [LangGraph](https://langchain-ai.github.io/langgraph/) `StateGraph` over one typed `AgentState`, compiled once with a durable SQLite checkpointer. Every node below exists in `backend/graph/runner.py` / `backend/graph/nodes.py` — this diagram is not aspirational.
+
+Full-system diagram (frontend, backend, LangGraph core, RAG, LLM provider layer, QA, policy/security, HITL, Git/GitHub, production deployment):
+
+![Architecture diagram](docs/architecture.svg)
 
 ```mermaid
-flowchart LR
-    A[Issue Ingestion] --> B[Router]
-    B --> C[Planner]
-    C --> D["Knowledge<br/>AST + BM25 + FAISS dense RAG"]
-    D --> E["Developer<br/>AST pre-flight patcher"]
-    E --> F["Sandbox Pytest<br/>isolated subprocess"]
-    F -->|fail| G["Revision Loop<br/>self-correction"]
-    G --> E
-    F -->|pass| H["Git VCS &<br/>Risk Scoring"]
-    H --> I{"HITL Gate<br/>interrupt()"}
-    I -->|approved| J[Draft PR]
-    I -->|rejected| K[Branch Cleanup]
+flowchart TD
+    Start([User Task]) --> Router
+    Router -->|routing decision| Planner
+    Router --> Knowledge
+    Router --> Developer
+    Planner --> Knowledge
+    Planner --> Developer
+    Knowledge --> Developer
+    Developer --> QA
+    QA -->|fail, retries left| Revision
+    Revision --> QA
+    QA -->|pass| GitPrepare[Git Prepare<br/>diff + patch hash]
+    QA -->|max revisions exceeded| End([End])
+    GitPrepare --> Policy
+    Policy -->|BLOCK| Cleanup
+    Policy -->|ALLOW / REVIEW| Approval{HITL Approval<br/>interrupt}
+    Approval -->|rejected| Cleanup
+    Approval -->|approved, hash verified| GitCommit[Git Commit]
+    GitCommit --> End
+    Cleanup --> End
 ```
 
-Every node is a typed function over a single `AgentState` object; the graph is compiled once with a checkpointer, so `interrupt()` at the HITL gate is a genuine pause — not a poll loop — and resumes via `Command(resume=...)` against the same thread.
+`Router → Planner → Knowledge/RAG → Developer → QA → (Revision loop, bounded) → Git Prepare → Policy → HITL Approval → Git Commit → GitHub PR` is the intended path for a real code change; planning and knowledge retrieval are conditionally skipped when the router determines they aren't needed. A GitHub Pull Request is published via a separate, explicit `publish-pr` call after a run reaches `COMPLETED` with a committed, approved change — it is never created automatically.
 
-## Safety & governance deep-dive
+## LLM Provider Architecture
 
-- **AST pre-flight validation** — every proposed patch is parsed into a syntax tree and validated *before* it is written to disk. A syntactically broken patch is rejected at that step, never committed.
-- **Sandbox isolation** — the QA stage runs tests via `subprocess.run(..., shell=False)` against a command/flag allowlist (`pytest`, `python -m pytest`, `ruff`, `flake8` only), with the workspace's own virtualenv `Scripts`/`bin` prepended to `PATH`. No arbitrary shell execution.
-- **Risk assessment heuristics** — after a fix passes tests, the diff is scored `LOW` / `MEDIUM` / `HIGH` based on file sensitivity (`.env`, migrations, CI config, lockfiles), deletion ratio, and number of files touched. High-risk changes get flagged, not silently approved.
-- **No-op guard** — if the developer agent finds nothing to change, or patch validation fails, the pipeline aborts before any push or PR is created. No misleading "fix" PR with an empty diff.
-- **HITL gate & control panel** — `POST /api/v1/runs` dispatches a run asynchronously (`202 Accepted` via `BackgroundTasks`) and returns immediately; a single-page control panel served at `/dashboard/` polls run status, renders the diff/risk/test proof at the approval gate, and submits the reviewer's decision back to `/api/v1/runs/{id}/resume`.
+- **Primary provider: NVIDIA** (`openai/gpt-oss-20b`, via NVIDIA's hosted OpenAI-compatible endpoint), with a bounded request timeout (75s by default, configurable).
+- **Automatic, credential-aware fallback** to Gemini (or OpenAI) when the primary provider times out or returns a transient/malformed response. Fallback provider selection only ever considers a provider whose API key is actually present — an uncredentialed provider is never selected, not even as a last resort.
+- **Structured-output validation is never bypassed by fallback.** Every provider, primary or fallback, must return a schema-validated Pydantic object (e.g. `RoutingDecision`); a malformed response is classified and retried, not silently accepted.
+- **Timeout and malformed-response classification** are explicit, typed exception categories (`LLMTimeoutError`, `LLMMalformedResponseError`, etc.), each independently eligible or ineligible for fallback — an authentication or invalid-request error, for example, is never retried through a fallback provider.
+- **Verified in production:** a live run demonstrated the exact failure/recovery path — NVIDIA's primary request timed out at the configured bound, the run automatically fell back to Gemini, and the pipeline continued to a validated `RoutingDecision` and, ultimately, a completed run. This was NVIDIA timing out and Gemini recovering it — not NVIDIA succeeding directly.
+- Fallback configuration is **optional and visible, never silent**: `GET /health/ready` reports the current primary provider, whether it's credentialed, and whether a fallback provider is configured, so a deployment running without a fallback credential is never mistaken for one that has a safety net.
 
-## Verified proof of work
+## QA and Safety
 
-A live run was executed end-to-end against a public repository, not a mocked fixture:
+| Control | What it actually does |
+|---|---|
+| **AST pre-flight validation** | Every proposed patch is parsed into a syntax tree and rejected before being written to disk if it isn't valid Python. |
+| **Sandboxed test execution** | Tests run via `subprocess.run(..., shell=False)` against a strict command/flag allowlist (`pytest`, `python -m pytest`, `ruff`, `flake8`), with sensitive environment variables stripped from the child process. This is **process-level isolation**, not a container or VM boundary — it prevents arbitrary shell invocation and secret exposure to the executed code, but does not claim OS-level sandboxing. |
+| **Static security scan** | A dedicated QA check flags unsafe patterns before a patch is trusted. |
+| **Patch-scope guard** | Detects and rejects unsafe additive/destructive rewrites and hallucinated patch-wrapper artifacts before they ever reach disk. |
+| **Bounded revision loop** | A failing QA result triggers at most a fixed number of re-diagnose/re-patch/re-test cycles (`MAX_REVISIONS = 3`), never an unbounded retry. |
+| **Policy engine** | Deterministic checks: protected branches (`main`, `master`, `release/*`, `production`, `staging`), protected paths (`.env*`, `secrets/**`, `.github/workflows/**`, `auth/**`, `security/**`, `database/migrations/**`), patch size limits, and risk scoring — evaluated before a human is ever asked to approve. |
+| **Tenant isolation** | Every workspace, vector store, and repository registration is namespaced by `(organization_id, project_id)`. Missing tenant identity fails closed rather than falling back to a shared/default namespace. |
+| **Approval hash binding** | An approval decision is bound to the exact SHA-256 hash of the diff it approved; if the workspace drifts after approval but before commit, the commit is rejected. |
+| **HITL approval gate** | A genuine LangGraph `interrupt()` — the run durably pauses, not polls, until a reviewer submits a decision. |
+| **Fail-closed defaults** | Missing credentials, missing tenant identity, an unauthorized repository, or a workspace that isn't a genuine, correctly-scoped clone all stop the pipeline rather than guessing or degrading silently. |
 
-- **Issue:** [king-man1905/sandbox-ai-demo#3](https://github.com/king-man1905/sandbox-ai-demo/issues/3) — a genuinely failing test (`ZeroDivisionError`) on `main`, confirmed before the run.
-- **Result:** [Draft PR #4](https://github.com/king-man1905/sandbox-ai-demo/pull/4) — a real, verified 2-line fix, risk-scored `LOW`, sandbox pytest `2 passed / 0 failed`.
-- **Test suite:** **165 unit tests passing, 0 failures** (`pytest -v --tb=short`), covering routing, patching, sandboxing, VCS operations, revision/self-correction, telemetry, and the API layer.
+## Human-in-the-Loop Workflow
 
-Token/cost telemetry is captured where the provider reports it, and renders `N/A` — not a misleading `$0.0000` — when it doesn't (a real, documented limitation of some LLM providers' structured-output path, not a bug being hidden).
+```
+Developer proposes a patch
+        │
+        ▼
+   QA (AST, sandbox tests, security scan, patch-scope)
+        │  pass
+        ▼
+   Policy evaluation (ALLOW / REVIEW / BLOCK)
+        │  not blocked
+        ▼
+   Approval gate — run pauses (interrupt), diff + risk + patch hash surfaced
+        │  reviewer approves, submitting the exact patch hash
+        ▼
+   Hash re-verified against the current workspace diff
+        │  match
+        ▼
+   Git commit  →  push  →  GitHub Pull Request (publish-pr, separate explicit call)
+```
 
-## Quickstart
+No external GitHub mutation — commit, push, or PR — is reachable without a human approval decision that is cryptographically bound to the specific diff being approved. A rejected or policy-blocked run is cleaned up (feature branch removed, workspace restored) instead of left half-applied.
 
-**Prerequisites:** Python 3.11+, Git.
+## Production Deployment
+
+- **API:** FastAPI, served by Uvicorn (`backend.api.app:app`).
+- **Orchestration:** LangGraph `StateGraph`, checkpointed to SQLite (durable across restarts — a paused approval is not lost).
+- **Frontend:** a React + TypeScript + Vite single-page control plane (`frontend/`) — Overview, New Run, Runs, Run Detail, Approval, Analytics, Audit, and Settings pages — talking to the API via a typed client with a dev-mode proxy to avoid local CORS/loopback ambiguity. A lightweight, self-contained static dashboard is also served at `/dashboard`.
+- **Deployment target:** an AWS EC2 instance running the API as a `systemd` service, with the working repository updated via `git pull --ff-only` and restarted on deploy.
+- **Health/readiness:** `GET /health` (liveness) and `GET /health/ready` (granular readiness — checkpointer, telemetry store, workspace lock directory, `git` availability, and LLM provider/fallback configuration).
+- **GitHub integration:** repository cloning and push authenticate via a process-scoped HTTP `Authorization` header — never a token embedded in the clone URL or written to `.git/config`.
+
+## Production Validation
+
+The following results are from a completed, real production verification run — not a mocked or simulated test:
+
+| Check | Result |
+|---|---|
+| Backend test suite | **768 passed, 2 skipped, 0 failed** |
+| EC2 deployment | Successful; service active |
+| `GET /health` | `healthy` |
+| `GET /health/ready` | `ready`, all checks passing |
+| LLM fallback configuration | Visible and confirmed configured on the production instance |
+| Provider fallback | Real NVIDIA timeout → automatic Gemini fallback → valid structured result, confirmed via production telemetry |
+| QA result | `PASS` |
+| Policy result | `ALLOW` |
+| Human approval | Granted, bound to the exact patch hash |
+| Commit | Confirmed committed (verified via telemetry, not status alone) |
+| GitHub Pull Request | Created via the standard commit → push → PR pipeline, left open for review (never auto-merged) |
+| Credential-leak scan | 0 matches across workspace files, telemetry databases, and `.git/config` |
+
+## Security
+
+- Secrets (`NVIDIA_API_KEY`, `GOOGLE_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`) are read from environment variables only — `.env` is git-ignored and has never been committed.
+- GitHub tokens are never embedded in a clone/remote URL, never written to `.git/config`, and never passed into the sandboxed test-execution environment or an LLM prompt.
+- Telemetry, audit logs, and readiness diagnostics are checked to ensure they never contain credential values — verified with dedicated tests and repeated production credential-leak scans (0 matches).
+- Role-Based Access Control: `OWNER`, `ADMIN`, `ENGINEER`, `REVIEWER`, `SECURITY_REVIEWER`, `VIEWER`, enforced per organization.
+- Tamper-evident, hash-chained audit logging for tenant-sensitive actions.
+- Production `AUTH_MODE` fails closed: a missing authenticated identity is rejected, never silently defaulted to a real tenant.
+
+No credential value, token, or key appears anywhere in this repository, its documentation, or its logs.
+
+## Tech Stack
+
+**Backend:** Python 3.11+, FastAPI, Uvicorn, LangGraph (`langgraph`, `langgraph-checkpoint-sqlite`), LangChain (`langchain`, `langchain-community`, `langchain-text-splitters`, `langchain-nvidia-ai-endpoints`, `langchain-google-genai`, `langchain-openai`), FAISS (`faiss-cpu`), Pydantic, `python-dotenv`, `pytest`.
+
+**Frontend:** React 18, TypeScript, Vite, Vitest + Testing Library.
+
+**Infrastructure:** AWS EC2, `systemd`, SQLite (checkpoints, telemetry, repository registry, idempotency store).
+
+## Project Structure
+
+```
+backend/
+├── agents/          # router, knowledge/QA agent logic
+├── api/              # FastAPI app, routes, lifecycle/readiness
+├── core/              # configuration loading
+├── developer/         # patch generation and safe application
+├── graph/              # LangGraph nodes, edges, AgentState, runner
+├── indexer/             # repository scanning, AST chunking
+├── integrations/         # GitHub client, CLI runner
+├── observability/         # telemetry, analytics, evaluation
+├── policy/                 # policy engine, path filtering
+├── qa/                      # quality pipeline (AST/sandbox/security/lint)
+├── rag/                      # embeddings, retriever, vector-store paths
+├── revision/                   # self-correction / revision loop
+├── sandbox/                     # isolated test-execution runner
+├── schemas/                      # Pydantic models (routing, QA, policy, tenant...)
+├── security/                      # tenant manager, RBAC, audit, auth
+├── services/                       # LLM provider construction
+├── static/                          # built-in dashboard (served at /dashboard)
+└── vcs/                              # git operations, workspace paths, locks
+
+frontend/
+└── src/
+    ├── api/        # typed API client (runs, repositories, auth, analytics, audit)
+    ├── components/  # HITL, runs, layout, common UI
+    ├── hooks/        # auth, run polling, analytics
+    ├── pages/         # Overview, NewRun, Runs, RunDetail, Approval, Analytics, Audit, Settings
+    └── types/          # API/telemetry/policy/QA/tenant type definitions
+
+tests/    # backend regression suite (pytest)
+```
+
+## Local Setup
+
+**Prerequisites:** Python 3.11+, Node.js, Git.
 
 ```bash
-git clone https://github.com/king-man1905/agentic-ai-software-engineer.git
-cd agentic-ai-software-engineer
+git clone <this repository>
+cd "Agentic AI Software Engineer"
 
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 # source .venv/bin/activate   # macOS/Linux
 
 pip install -r requirements.txt
-cp .env.example .env          # set NVIDIA_API_KEY (or GOOGLE_API_KEY + LLM_PROVIDER=gemini) and GITHUB_TOKEN
+cp .env.example .env
 ```
 
-Run the test suite:
+Edit `.env` and set at minimum `NVIDIA_API_KEY` (the primary provider). `GOOGLE_API_KEY`/`OPENAI_API_KEY` are optional but enable automatic fallback — see `.env.example` for the full, documented list of variables. **Never put a real credential in this README or commit `.env`.**
 
 ```bash
-pytest -v --tb=short          # 165 passed
-```
-
-Launch the API and dashboard:
-
-```bash
+pytest tests/ -q
 uvicorn backend.api.app:app --reload
-# open http://127.0.0.1:8000/dashboard/
 ```
 
-### Control Plane Local Development
-
-The React control plane (`frontend/`) is a separate dev server from the FastAPI backend; run both side by side in two terminals:
+Frontend (separate terminal):
 
 ```bash
-# Terminal 1 - backend, from the project's .venv (see Quickstart above)
-uvicorn backend.api.app:app --reload
-
-# Terminal 2 - frontend, from the frontend directory
 cd frontend
 npm install
 npm run dev
 ```
 
-- Backend: http://127.0.0.1:8000
-- Frontend: http://localhost:5173 (proxies `/api` and `/health` to the backend)
+- Backend: `http://127.0.0.1:8000`
+- Frontend: `http://localhost:5173` (proxies `/api` and `/health` to the backend in dev mode)
 
-Resolve a real GitHub issue from the CLI:
+## API / Health Endpoints
 
-```bash
-python -m backend.integrations.run_github_bot --repo <owner>/<repo> --issue <N>
-# pauses for human approval by default; add --auto-approve for unattended runs
-```
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness probe |
+| GET | `/health/ready` | Readiness — checkpointer, telemetry store, workspace lock, `git`, LLM provider/fallback configuration |
+| GET | `/api/v1/tenant/context` | Authenticated tenant/role context |
+| POST | `/api/v1/repositories` | Register and authorize a repository for the caller's organization |
+| POST | `/api/v1/runs` | Create and dispatch a new engineering run |
+| GET | `/api/v1/runs` | List runs for the caller's organization |
+| GET | `/api/v1/runs/{run_id}` | Get current run status |
+| GET | `/api/v1/runs/{run_id}/events` | Chronological telemetry events for a run |
+| POST | `/api/v1/runs/{run_id}/resume` | Submit a HITL approval/rejection decision |
+| POST | `/api/v1/runs/{run_id}/cancel` | Request cancellation of a run |
+| POST | `/api/v1/runs/{run_id}/publish-pr` | Publish an approved, committed run as a GitHub PR |
+| GET | `/api/v1/audit/events` | Tamper-evident audit log |
+| POST/DELETE | `/api/v1/auth/keys...` | API key lifecycle |
+| GET | `/api/v1/analytics/*` | Run, quality, model, and failure analytics |
+| POST/GET | `/api/v1/evaluation/*` | Deterministic benchmark evaluation |
 
-## Production roadmap & architectural limits
+## Example Workflow
 
-Honest disclosure — this runs correctly today at the scale of one operator working one repo at a time. Running it as a shared service needs the following, none of which are done yet:
+1. A caller registers `owner/repo` and submits a task: *"Add an 'E2E Test' section to README.md explaining the pipeline."*
+2. **Router** classifies it as documentation, requiring no planning or extra knowledge.
+3. **Developer** generates a patch adding the requested section, using the actual current content of `README.md` as context.
+4. **QA** parses the patch (AST), runs the repository's own test suite in the sandbox, scans for unsafe patterns, and confirms the patch is scoped safely.
+5. **Policy** evaluates the diff — a documentation change to a non-protected path passes cleanly.
+6. The run pauses at **Approval**, surfacing the diff, risk assessment, and a SHA-256 patch hash.
+7. A reviewer approves, submitting that exact hash.
+8. The workspace is re-verified against the hash, then **committed** on a fresh feature branch and **pushed**.
+9. The run's owner calls **publish-pr**, which opens a real GitHub Pull Request against the target repository — left open for human review, never auto-merged.
 
-| Current | Production requirement |
-|---|---|
-| `MemorySaver` — in-process, RAM-only checkpointer | PostgreSQL/Redis-backed checkpointer, so a paused approval survives a restart and works across multiple API instances |
-| Subprocess allowlist for sandboxing | Containerized isolation (Docker / gVisor / Firecracker) — an allowlisted command can still execute arbitrary code the agent itself wrote |
-| `BackgroundTasks` (in-process) | Celery/RQ + Redis (or a durable workflow engine) for distributed workers, retries, and rate limiting independent of the API process |
-| 2-second dashboard polling | WebSockets/SSE for real-time node-by-node progress and log streaming |
-| Single-file, exact-snippet patching | Unified-diff/`git apply`-based, transactional multi-file patch sets |
-| Manual CLI trigger against a static PAT | A GitHub App with signature-verified webhooks and installation-scoped tokens |
-| No API authentication, open CORS (`*`) | API keys/OAuth, per-tenant workspace isolation, rate limiting |
-| Two overlapping FastAPI entrypoints (`main.py`, `api/app.py`) | One entrypoint |
-| `.env` file secrets | A secrets manager (Vault / AWS Secrets Manager / equivalent) |
+## Limitations / Operational Notes
+
+- **External LLM provider latency is real and out of this project's control.** NVIDIA's hosted endpoint for the configured model can legitimately exceed the bounded timeout; this is handled by classification and fallback, not by disguising it.
+- **A fallback credential is optional, not guaranteed.** Without `GOOGLE_API_KEY`/`OPENAI_API_KEY` configured, a primary-provider timeout intentionally fails the run closed rather than silently retrying nowhere — this is visible via `GET /health/ready`, never silent.
+- **Human approval is mandatory** for any run that would mutate a real repository or open a Pull Request; there is no unattended/auto-approve mode in the production API path.
+- **Sandbox isolation is process-level**, not container/VM-level — it enforces a strict command allowlist and strips sensitive environment variables, but is not a substitute for OS-level sandboxing in a fully untrusted multi-tenant context.
+- **SQLite-backed persistence** (checkpoints, telemetry, repository registry) is durable across restarts but is single-instance; it is not designed for multi-instance horizontal scaling without further work.
+
+## Roadmap
+
+Sensible, honest future directions — not implemented today:
+
+- Containerized (Docker) sandbox execution for stronger isolation than the current process-level allowlist.
+- A distributed, multi-instance-safe checkpoint/queue backend (e.g. PostgreSQL/Redis) for horizontal scaling.
+- WebSocket/SSE-based real-time run progress instead of polling.
+- A GitHub App (installation tokens, signed webhooks) in place of a single long-lived personal access token.
+- A managed secrets store (e.g. a cloud secrets manager) in place of a `.env` file for production deployments.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE) &copy; 2026 king-man1905.
-
+This project is licensed under the [MIT License](LICENSE).

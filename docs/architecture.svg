@@ -1,0 +1,217 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 1969" font-family="Helvetica, Arial, sans-serif">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+  </marker>
+</defs>
+<rect x="0" y="0" width="1500" height="1969" fill="#ffffff"/>
+<text x="750.0" y="42" font-family="Helvetica, Arial, sans-serif" font-size="26" font-weight="bold" text-anchor="middle" fill="#0f1226">Autonomous AI Software Engineer — Production Architecture</text>
+<text x="750.0" y="64" font-family="Helvetica, Arial, sans-serif" font-size="13" text-anchor="middle" fill="#555">Solid border = internal runtime component   •   Dashed border = external service   •   All GitHub-mutating actions require prior HITL approval</text>
+<rect x="60" y="90" width="1380" height="130" rx="14" fill="#eef3fb" stroke="#7c98c9" stroke-width="2"/>
+<text x="78" y="116" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">1. USER / FRONTEND</text>
+<rect x="100" y="132" width="420" height="70" rx="8" fill="#ffffff" stroke="#7c98c9" stroke-width="1.5"/>
+<text x="310.0" y="154" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">React + TypeScript + Vite SPA</text>
+<text x="310.0" y="172.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">Pages: Overview, NewRun, Runs, RunDetail,</text>
+<text x="310.0" y="186.5" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">Approval, Analytics, Audit, Settings</text>
+<rect x="560" y="132" width="380" height="70" rx="8" fill="#ffffff" stroke="#7c98c9" stroke-width="1.5"/>
+<text x="750.0" y="154" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Vite Dev Proxy</text>
+<text x="750.0" y="172.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">/api/*  and  /health  →  backend</text>
+<text x="750.0" y="186.5" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">(local dev only)</text>
+<rect x="980" y="132" width="400" height="70" rx="8" fill="#ffffff" stroke="#7c98c9" stroke-width="1.5"/>
+<text x="1180.0" y="154" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Static Dashboard (/dashboard)</text>
+<text x="1180.0" y="172.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">backend/static/index.html</text>
+<text x="1180.0" y="186.5" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">self-contained legacy view</text>
+<line x1="310" y1="202" x2="310" y2="240" stroke="#7c98c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="60" y="240" width="1380" height="150" rx="14" fill="#eafaf1" stroke="#4caa7d" stroke-width="2"/>
+<text x="78" y="266" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">2. BACKEND — FastAPI (backend/api/app.py)</text>
+<rect x="100" y="282" width="380" height="90" rx="8" fill="#ffffff" stroke="#4caa7d" stroke-width="1.5"/>
+<text x="290.0" y="304" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Auth / Tenant Context</text>
+<text x="290.0" y="322.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">AuthMode (backend/security/auth.py)</text>
+<text x="290.0" y="336.5" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">get_tenant_context(request)</text>
+<text x="290.0" y="351.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">fail-closed: missing identity → rejected</text>
+<rect x="510" y="282" width="460" height="90" rx="8" fill="#ffffff" stroke="#4caa7d" stroke-width="1.5"/>
+<text x="740.0" y="304" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">REST API Layer</text>
+<text x="740.0" y="322.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">/api/v1/runs  /repositories  /audit/events</text>
+<text x="740.0" y="336.5" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">/api/v1/analytics/*  /evaluation/*  /auth/keys</text>
+<text x="740.0" y="351.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">/health   /health/ready</text>
+<rect x="1000" y="282" width="380" height="90" rx="8" fill="#ffffff" stroke="#4caa7d" stroke-width="1.5"/>
+<text x="1190.0" y="304" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">AgentRunner</text>
+<text x="1190.0" y="322.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">backend/graph/runner.py</text>
+<text x="1190.0" y="336.5" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">dispatches run, streams status,</text>
+<text x="1190.0" y="351.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">handles resume(decision)</text>
+<line x1="1190" y1="372" x2="1190" y2="410" stroke="#4caa7d" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="60" y="412" width="1380" height="430" rx="14" fill="#f2eefb" stroke="#8a63c9" stroke-width="2"/>
+<text x="78" y="438" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">3. LANGGRAPH AGENTIC CORE — single StateGraph, SqliteSaver checkpoint (backend/graph/runner.py)</text>
+<rect x="100" y="462" width="130" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="165.0" y="484" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">router</text>
+<rect x="280" y="462" width="130" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="345.0" y="484" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">planner</text>
+<rect x="460" y="462" width="150" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="535.0" y="484" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">knowledge</text>
+<text x="535.0" y="502.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">RAG</text>
+<rect x="660" y="462" width="150" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="735.0" y="484" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">developer</text>
+<rect x="860" y="462" width="130" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="925.0" y="484" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">qa</text>
+<rect x="1040" y="462" width="150" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="1115.0" y="484" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">git_prepare</text>
+<text x="1115.0" y="502.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">diff + hash</text>
+<rect x="1240" y="462" width="130" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="1305.0" y="484" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">policy</text>
+<line x1="230" y1="485" x2="280" y2="485" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<line x1="410" y1="485" x2="460" y2="485" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<text x="443.0" y="481.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="bold" fill="#8a63c9" text-anchor="middle">route</text>
+<line x1="610" y1="485" x2="660" y2="485" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<line x1="810" y1="485" x2="860" y2="485" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<line x1="990" y1="485" x2="1040" y2="485" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<text x="1023.0" y="481.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="bold" fill="#8a63c9" text-anchor="middle">pass</text>
+<line x1="1190" y1="485" x2="1240" y2="485" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<line x1="165" y1="462" x2="165" y2="454" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)" stroke-dasharray="3,3"/>
+<path d="M 165 454 C 400 442, 700 442, 725 462" fill="none" stroke="#8a63c9" stroke-width="1.6" stroke-dasharray="3,3" marker-end="url(#arrow)"/>
+<path d="M 345 462 C 400 448, 500 448, 535 462" fill="none" stroke="#8a63c9" stroke-width="1.6" stroke-dasharray="3,3" marker-end="url(#arrow)"/>
+<rect x="660" y="568" width="150" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="735.0" y="590" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">revision</text>
+<text x="735.0" y="608.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">bounded, MAX_REVISIONS=3</text>
+<rect x="1240" y="568" width="130" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="1305.0" y="590" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">approval</text>
+<text x="1305.0" y="608.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">interrupt()</text>
+<rect x="1240" y="664" width="130" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="1305.0" y="686" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">git_commit</text>
+<rect x="1040" y="664" width="150" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="1115.0" y="686" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">cleanup</text>
+<rect x="660" y="664" width="150" height="46" rx="8" fill="#ffffff" stroke="#8a63c9" stroke-width="1.5"/>
+<text x="735.0" y="686" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#0f1226" text-anchor="middle">END</text>
+<path d="M 895 508 C 895 591, 810 591, 810 568" fill="none" stroke="#c0392b" stroke-width="1.6" marker-end="url(#arrow)"/>
+<text x="940" y="562" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="bold" fill="#c0392b" text-anchor="middle">fail</text>
+<path d="M 810 614 C 810 644, 895 644, 895 538" fill="none" stroke="#c0392b" stroke-width="1.6" marker-end="url(#arrow)"/>
+<text x="970" y="636" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#c0392b" text-anchor="middle">retry qa</text>
+<path d="M 860 485 C 700 582, 700 618, 735 684" fill="none" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="3,3" marker-end="url(#arrow)"/>
+<text x="690" y="658" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#c0392b" text-anchor="middle">max_retries</text>
+<line x1="1305" y1="508" x2="1305" y2="568" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<text x="1313.0" y="534.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="bold" fill="#8a63c9" text-anchor="middle">ALLOW/REVIEW</text>
+<path d="M 1240 508 C 1150 548, 1120 608, 1115 618" fill="none" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="3,3" marker-end="url(#arrow)"/>
+<text x="1130" y="538" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#c0392b" text-anchor="middle">BLOCK</text>
+<line x1="1305" y1="614" x2="1305" y2="664" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<text x="1313.0" y="635.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="bold" fill="#8a63c9" text-anchor="middle">approved</text>
+<path d="M 1240 639 C 1180 654, 1160 664, 1115 679" fill="none" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="3,3" marker-end="url(#arrow)"/>
+<text x="1160" y="644" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#c0392b" text-anchor="middle">rejected</text>
+<line x1="1240" y1="735" x2="815" y2="687" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<line x1="1040" y1="735" x2="815" y2="687" stroke="#8a63c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="60" y="864" width="660" height="190" rx="14" fill="#eef6fb" stroke="#4a90c9" stroke-width="2"/>
+<text x="78" y="890" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">4. KNOWLEDGE / RAG</text>
+<rect x="100" y="906" width="560" height="60" rx="8" fill="#ffffff" stroke="#4a90c9" stroke-width="1.5"/>
+<text x="380.0" y="928" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Hybrid Retriever</text>
+<text x="380.0" y="946.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">BM25 (sparse) + FAISS (dense) — backend/rag/retriever.py</text>
+<rect x="100" y="976" width="560" height="60" rx="8" fill="#ffffff" stroke="#4a90c9" stroke-width="1.5"/>
+<text x="380.0" y="998" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Tenant-Namespaced Vector Store</text>
+<text x="380.0" y="1016.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">vector_store/&lt;organization_id&gt;/&lt;project_id&gt;  (fail-closed path resolution)</text>
+<rect x="760" y="864" width="680" height="190" rx="14" fill="#fff3e6" stroke="#d98a2b" stroke-width="2"/>
+<text x="778" y="890" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">5. LLM PROVIDER LAYER  (external services)</text>
+<rect x="800" y="906" width="280" height="130" rx="8" fill="#fff8ef" stroke="#d98a2b" stroke-width="1.5" stroke-dasharray="5,3"/>
+<text x="940.0" y="928" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">NVIDIA (primary)</text>
+<text x="940.0" y="946.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">openai/gpt-oss-20b</text>
+<text x="940.0" y="960.5" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">langchain-nvidia-ai-endpoints</text>
+<text x="940.0" y="975.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">bounded timeout (75s default)</text>
+<rect x="1140" y="906" width="260" height="60" rx="8" fill="#fff8ef" stroke="#d98a2b" stroke-width="1.5" stroke-dasharray="5,3"/>
+<text x="1270.0" y="928" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Gemini (fallback)</text>
+<text x="1270.0" y="946.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">langchain-google-genai</text>
+<rect x="1140" y="976" width="260" height="60" rx="8" fill="#fff8ef" stroke="#d98a2b" stroke-width="1.5" stroke-dasharray="5,3"/>
+<text x="1270.0" y="998" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">OpenAI (optional fallback)</text>
+<text x="1270.0" y="1016.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">used only if credentialed</text>
+<line x1="1080" y1="936" x2="1140" y2="936" stroke="#c0392b" stroke-width="1.8" marker-end="url(#arrow)"/>
+<text x="1118.0" y="932.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="bold" fill="#c0392b" text-anchor="middle">timeout /</text>
+<text x="1110" y="960" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="bold" fill="#c0392b" text-anchor="middle">malformed →</text>
+<text x="880" y="1049" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#8a5a1e" text-anchor="middle">Fallback only ever selects a credentialed provider; structured-output validation is never bypassed</text>
+<line x1="390" y1="842" x2="390" y2="864" stroke="#4a90c9" stroke-width="1.8" marker-end="url(#arrow)"/>
+<line x1="900" y1="842" x2="900" y2="864" stroke="#d98a2b" stroke-width="1.8" marker-end="url(#arrow)"/>
+<text x="908.0" y="849.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="bold" fill="#d98a2b" text-anchor="middle">get_llm() / invoke_structured()</text>
+<rect x="60" y="1074" width="1380" height="190" rx="14" fill="#eafaf1" stroke="#2f9e6b" stroke-width="2"/>
+<text x="78" y="1100" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">6. DEVELOPER / QA — quality pipeline (backend/qa/pipeline.py)</text>
+<rect x="100" y="1118" width="210" height="66" rx="8" fill="#ffffff" stroke="#2f9e6b" stroke-width="1.5"/>
+<text x="205.0" y="1140" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#0f1226" text-anchor="middle">check_ast</text>
+<text x="205.0" y="1158.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">AST pre-flight</text>
+<rect x="320" y="1118" width="210" height="66" rx="8" fill="#ffffff" stroke="#2f9e6b" stroke-width="1.5"/>
+<text x="425.0" y="1140" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#0f1226" text-anchor="middle">check_patch_scope</text>
+<text x="425.0" y="1158.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">unsafe-rewrite guard</text>
+<rect x="540" y="1118" width="210" height="66" rx="8" fill="#ffffff" stroke="#2f9e6b" stroke-width="1.5"/>
+<text x="645.0" y="1140" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#0f1226" text-anchor="middle">check_pytest</text>
+<text x="645.0" y="1158.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">sandboxed subprocess</text>
+<rect x="760" y="1118" width="210" height="66" rx="8" fill="#ffffff" stroke="#2f9e6b" stroke-width="1.5"/>
+<text x="865.0" y="1140" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#0f1226" text-anchor="middle">check_lint</text>
+<text x="865.0" y="1158.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">ruff/flake8 if present</text>
+<rect x="980" y="1118" width="210" height="66" rx="8" fill="#ffffff" stroke="#2f9e6b" stroke-width="1.5"/>
+<text x="1085.0" y="1140" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#0f1226" text-anchor="middle">check_typecheck</text>
+<text x="1085.0" y="1158.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">mypy if present</text>
+<rect x="1200" y="1118" width="210" height="66" rx="8" fill="#ffffff" stroke="#2f9e6b" stroke-width="1.5"/>
+<text x="1305.0" y="1140" font-family="Helvetica, Arial, sans-serif" font-size="12.5" font-weight="bold" fill="#0f1226" text-anchor="middle">check_security</text>
+<text x="1305.0" y="1158.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">static scan</text>
+<text x="790.0" y="1214" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#1c6b48" text-anchor="middle">Bounded self-correction: a QA failure routes to revision, which re-diagnoses and re-patches, then returns to qa (max 3 cycles)</text>
+<text x="790.0" y="1234" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#1c6b48" text-anchor="middle">Sandbox = process-level isolation: allowlisted commands, no shell=True, sensitive env vars stripped (not container/VM isolation)</text>
+<rect x="60" y="1284" width="1380" height="175" rx="14" fill="#fdeeee" stroke="#c0392b" stroke-width="2"/>
+<text x="78" y="1310" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">7. POLICY / SECURITY</text>
+<rect x="100" y="1326" width="330" height="110" rx="8" fill="#ffffff" stroke="#c0392b" stroke-width="1.5"/>
+<text x="265.0" y="1348" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Policy Engine</text>
+<text x="265.0" y="1366.0" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">backend/schemas/policy.py</text>
+<text x="265.0" y="1380.5" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">protected branches: main, master,</text>
+<text x="265.0" y="1395.0" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">release/*, production, staging</text>
+<text x="265.0" y="1409.5" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">protected paths: .env*, secrets/**,</text>
+<text x="265.0" y="1424.0" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">.github/workflows/**, auth/**, ...</text>
+<text x="265.0" y="1438.5" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">patch-size limits + risk scoring</text>
+<rect x="460" y="1326" width="300" height="110" rx="8" fill="#ffffff" stroke="#c0392b" stroke-width="1.5"/>
+<text x="610.0" y="1348" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Tenant Isolation</text>
+<text x="610.0" y="1366.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">organization_id + project_id namespacing</text>
+<text x="610.0" y="1380.5" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">workspace/ and vector_store/ both</text>
+<text x="610.0" y="1395.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">fail-closed on missing tenant identity</text>
+<rect x="790" y="1326" width="300" height="110" rx="8" fill="#ffffff" stroke="#c0392b" stroke-width="1.5"/>
+<text x="940.0" y="1348" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">RBAC</text>
+<text x="940.0" y="1366.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">backend/schemas/tenant.py::Role</text>
+<text x="940.0" y="1380.5" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">OWNER, ADMIN, ENGINEER, REVIEWER,</text>
+<text x="940.0" y="1395.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">SECURITY_REVIEWER, VIEWER</text>
+<rect x="1120" y="1326" width="260" height="110" rx="8" fill="#ffffff" stroke="#c0392b" stroke-width="1.5"/>
+<text x="1250.0" y="1348" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Fail-Closed Defaults</text>
+<text x="1250.0" y="1366.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">missing creds / tenant / unauthorized</text>
+<text x="1250.0" y="1380.5" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">repo / drifted workspace → stop,</text>
+<text x="1250.0" y="1395.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">never degrade silently</text>
+<rect x="60" y="1479" width="1380" height="130" rx="14" fill="#fff9e0" stroke="#c9a227" stroke-width="2"/>
+<text x="78" y="1505" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">8. HUMAN-IN-THE-LOOP</text>
+<rect x="100" y="1521" width="460" height="66" rx="8" fill="#ffffff" stroke="#c9a227" stroke-width="1.5"/>
+<text x="330.0" y="1543" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Approval Gate</text>
+<text x="330.0" y="1561.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">LangGraph interrupt() — durable pause, not polling</text>
+<rect x="620" y="1521" width="460" height="66" rx="8" fill="#ffffff" stroke="#c9a227" stroke-width="1.5"/>
+<text x="850.0" y="1543" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Patch Hash Binding</text>
+<text x="850.0" y="1561.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">SHA-256 diff hash re-verified before commit; drift → rejected</text>
+<text x="1340" y="1557" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#7a5c00" text-anchor="middle">Reviewer</text>
+<text x="1340" y="1572" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#7a5c00" text-anchor="middle">(human)</text>
+<circle cx="1340" cy="1529" r="18" fill="#fff3c4" stroke="#c9a227" stroke-width="2"/>
+<line x1="1322" y1="1529" x2="1080" y2="1554" stroke="#c9a227" stroke-width="1.8" marker-end="url(#arrow)"/>
+<text x="1209.0" y="1537.5" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="bold" fill="#c9a227" text-anchor="middle">decision</text>
+<rect x="60" y="1629" width="1380" height="130" rx="14" fill="#eef1f5" stroke="#5a5a6e" stroke-width="2"/>
+<text x="78" y="1655" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">9. GIT / GITHUB</text>
+<rect x="100" y="1671" width="300" height="66" rx="8" fill="#ffffff" stroke="#5a5a6e" stroke-width="1.5"/>
+<text x="250.0" y="1693" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Git Commit</text>
+<text x="250.0" y="1711.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">local, feature branch</text>
+<rect x="440" y="1671" width="300" height="66" rx="8" fill="#ffffff" stroke="#5a5a6e" stroke-width="1.5"/>
+<text x="590.0" y="1693" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Push</text>
+<text x="590.0" y="1711.0" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">process-scoped auth header,</text>
+<text x="590.0" y="1725.5" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">never embedded in .git/config</text>
+<rect x="780" y="1671" width="400" height="66" rx="8" fill="#f4f4f8" stroke="#5a5a6e" stroke-width="1.5" stroke-dasharray="5,3"/>
+<text x="980.0" y="1693" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">GitHub Pull Request (external)</text>
+<text x="980.0" y="1711.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">publish-pr — explicit call, never auto-merged</text>
+<line x1="400" y1="1704" x2="440" y2="1704" stroke="#5a5a6e" stroke-width="1.8" marker-end="url(#arrow)"/>
+<line x1="740" y1="1704" x2="780" y2="1704" stroke="#5a5a6e" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="60" y="1779" width="1380" height="150" rx="14" fill="#eef3fb" stroke="#2f4d7a" stroke-width="2"/>
+<text x="78" y="1805" font-family="Helvetica, Arial, sans-serif" font-size="15.5" font-weight="bold" fill="#0f1226" text-anchor="start">10. PRODUCTION DEPLOYMENT</text>
+<rect x="100" y="1821" width="300" height="90" rx="8" fill="#ffffff" stroke="#2f4d7a" stroke-width="1.5"/>
+<text x="250.0" y="1843" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">AWS EC2</text>
+<text x="250.0" y="1861.0" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">systemd service</text>
+<text x="250.0" y="1875.5" font-family="Helvetica, Arial, sans-serif" font-size="11.5" font-weight="normal" fill="#33334d" text-anchor="middle">Uvicorn + FastAPI app</text>
+<rect x="440" y="1821" width="320" height="90" rx="8" fill="#ffffff" stroke="#2f4d7a" stroke-width="1.5"/>
+<text x="600.0" y="1843" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">Health / Readiness</text>
+<text x="600.0" y="1861.0" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">GET /health  (liveness)</text>
+<text x="600.0" y="1875.5" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">GET /health/ready  (checkpointer,</text>
+<text x="600.0" y="1890.0" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="normal" fill="#33334d" text-anchor="middle">telemetry, workspace lock, git, LLM)</text>
+<rect x="800" y="1821" width="380" height="90" rx="8" fill="#ffffff" stroke="#2f4d7a" stroke-width="1.5"/>
+<text x="990.0" y="1843" font-family="Helvetica, Arial, sans-serif" font-size="13.5" font-weight="bold" fill="#0f1226" text-anchor="middle">SQLite State Stores</text>
+<text x="990.0" y="1861.0" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">checkpoints (LangGraph)</text>
+<text x="990.0" y="1875.5" font-family="Helvetica, Arial, sans-serif" font-size="10.5" font-weight="normal" fill="#33334d" text-anchor="middle">telemetry / audit / repository registry</text>
+</svg>
