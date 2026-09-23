@@ -874,6 +874,89 @@ def test_all_providers_failure_returns_structured_error(monkeypatch):
     assert exc_info.value.provider == "gemini"
 
 
+# 8b. test_gemini_rate_limit_after_nvidia_timeout_raises_llm_rate_limit_error
+def test_gemini_rate_limit_after_nvidia_timeout_raises_llm_rate_limit_error(monkeypatch):
+    """
+    Reproduces the exact production sequence (run_24a226561db4): NVIDIA
+    primary times out, safe fallback switches to Gemini, and Gemini itself
+    returns HTTP 429 RESOURCE_EXHAUSTED (free-tier quota exhausted). The
+    final structured error raised to the caller must be LLMRateLimitError
+    (not LLMTimeoutError or a generic LLMTransientError) so downstream
+    RUN_FAILED telemetry classifies this correctly.
+    """
+    primary = FakeProviderLLM(provider="nvidia", failure=TimeoutError("Request timed out after 75.0 seconds"))
+    fallback = FakeProviderLLM(
+        provider="gemini",
+        failure=Exception(
+            "Error calling model 'gemini-3.6-flash' (RESOURCE_EXHAUSTED): 429 RESOURCE_EXHAUSTED. "
+            "Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests"
+        ),
+    )
+
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "gemini")
+    monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback)
+
+    with pytest.raises(LLMRateLimitError) as exc_info:
+        invoke_structured(primary, RoutingDecision, "Prompt")
+
+    assert isinstance(exc_info.value, LLMRateLimitError)
+    assert exc_info.value.provider == "gemini"
+    assert primary.invocations == 1
+    # _invoke_single_provider retries a "429" message up to 3 total attempts
+    # (bounded, with backoff) against the SAME provider instance before
+    # giving up - this is the existing, already-bounded transient-429 retry
+    # behavior (never infinite), distinct from the primary->fallback provider
+    # switch itself, which happens exactly once regardless.
+    assert fallback.invocations == 3
+
+
+# 8c. test_rate_limited_primary_triggers_fallback_with_llm_rate_limit_telemetry_category
+def test_rate_limited_primary_triggers_fallback_with_llm_rate_limit_telemetry_category(monkeypatch):
+    """
+    Verifies a rate-limited PRIMARY provider is fallback-eligible and that
+    the PROVIDER_FALLBACK telemetry event records failure_category
+    'LLM_RATE_LIMIT' (not 'LLM_TIMEOUT'/'LLM_TRANSIENT_FAILURE'), and that
+    the fallback provider succeeds.
+    """
+    primary = FakeProviderLLM(
+        provider="nvidia",
+        failure=Exception("429 Too Many Requests: rate limit exceeded"),
+    )
+    fallback = FakeProviderLLM(
+        provider="gemini",
+        result=RoutingDecision(
+            task_type=TaskType.BUG_FIX,
+            confidence=0.9,
+            requires_planning=False,
+            requires_knowledge=False,
+            reasoning="Fallback succeeded after primary rate limit",
+        ),
+    )
+
+    recorded_events = []
+    original_on_fallback = telemetry_collector.on_provider_fallback
+
+    def mock_on_fallback(**kwargs):
+        recorded_events.append(kwargs)
+        original_on_fallback(**kwargs)
+
+    monkeypatch.setattr(telemetry_collector, "on_provider_fallback", mock_on_fallback)
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "gemini")
+    monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback)
+
+    result = invoke_structured(primary, RoutingDecision, "Prompt")
+
+    assert result.task_type == TaskType.BUG_FIX
+    assert len(recorded_events) == 1
+    event = recorded_events[0]
+    assert event["failure_category"] == "LLM_RATE_LIMIT"
+    assert event["failure_type"] == "LLMRateLimitError"
+    # No raw exception text or credential-shaped content in telemetry metadata.
+    for value in event.values():
+        assert "api_key" not in str(value).lower()
+        assert "nvapi" not in str(value).lower()
+
+
 # 9. test_provider_fallback_emits_telemetry
 def test_provider_fallback_emits_telemetry(monkeypatch):
     """
