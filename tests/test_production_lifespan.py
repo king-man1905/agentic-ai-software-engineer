@@ -424,6 +424,52 @@ class TestReadinessEndpoint:
             assert report["checks"]["workspace_lock"]["ready"] is False
         runner.close()
 
+    def test_readiness_reports_fallback_configured_when_credential_present(self, temp_workspace, monkeypatch):
+        """The new llm_provider diagnostic must make a configured fallback
+        visible - and must never gate overall readiness on it, since a
+        fallback credential is always optional by design."""
+        monkeypatch.setenv("LLM_PROVIDER", "nvidia")
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
+        monkeypatch.setenv("GOOGLE_API_KEY", "google-test-key")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        runner = AgentRunner(checkpoint_db_path=temp_workspace["checkpoints_db"])
+        app = create_app(runner=runner)
+        client = TestClient(app)
+
+        resp = client.get("/health/ready")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["is_ready"] is True
+        llm_check = data["checks"]["llm_provider"]
+        assert llm_check["primary"] == "nvidia"
+        assert llm_check["primary_credentialed"] is True
+        assert llm_check["fallback_configured"] is True
+        assert llm_check["fallback_provider"] == "gemini"
+        runner.close()
+
+    def test_readiness_reports_no_fallback_without_weakening_readiness(self, temp_workspace, monkeypatch):
+        """Missing GOOGLE_API_KEY/OPENAI_API_KEY must be visible in the
+        readiness report - the application must never silently pretend it
+        has a fallback - but must NOT flip is_ready/status: an
+        unconfigured, optional fallback is not a service outage."""
+        monkeypatch.setenv("LLM_PROVIDER", "nvidia")
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        runner = AgentRunner(checkpoint_db_path=temp_workspace["checkpoints_db"])
+        app = create_app(runner=runner)
+        client = TestClient(app)
+
+        resp = client.get("/health/ready")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["is_ready"] is True
+        assert data["status"] == "ready"
+        llm_check = data["checks"]["llm_provider"]
+        assert llm_check["fallback_configured"] is False
+        assert llm_check["fallback_provider"] is None
+        runner.close()
+
     def test_readiness_never_exposes_secrets(self, temp_workspace):
         runner = AgentRunner(checkpoint_db_path=temp_workspace["checkpoints_db"])
         app = create_app(runner=runner)
@@ -437,6 +483,23 @@ class TestReadinessEndpoint:
         assert "token" not in content
         assert "password" not in content
         assert "secret" not in content
+        runner.close()
+
+    def test_readiness_llm_provider_check_never_leaks_actual_credential_values(
+        self, temp_workspace, monkeypatch
+    ):
+        """The new llm_provider diagnostic reports booleans and provider
+        NAMES only - a real (fake, test-only) credential VALUE set in the
+        environment must never appear verbatim in the readiness response."""
+        monkeypatch.setenv("LLM_PROVIDER", "nvidia")
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-SENTINEL-DO-NOT-LEAK-abc123")
+        monkeypatch.setenv("GOOGLE_API_KEY", "google-SENTINEL-DO-NOT-LEAK-xyz789")
+        runner = AgentRunner(checkpoint_db_path=temp_workspace["checkpoints_db"])
+        app = create_app(runner=runner)
+        client = TestClient(app)
+
+        resp = client.get("/health/ready")
+        assert "SENTINEL-DO-NOT-LEAK" not in resp.text
         runner.close()
 
     def test_liveness_remains_200_during_draining(self, temp_workspace):

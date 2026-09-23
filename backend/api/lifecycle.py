@@ -149,6 +149,26 @@ class LifecycleManager:
         if not git_ready:
             all_ok = False
 
+        # 6. LLM provider fallback configuration visibility - never a
+        # blocking readiness condition (a fallback credential is always
+        # optional by design; the primary provider alone is a fully
+        # supported configuration), but the deployment must never silently
+        # pretend a fallback exists when it doesn't. Purely additive to
+        # the existing checks dict, so this cannot change is_ready/status
+        # for any consumer that only looked at the pre-existing checks.
+        import os
+        from backend.core.config import LLM_PROVIDER
+        from backend.services.llm import get_fallback_provider, _has_provider_credentials
+
+        primary_provider = os.getenv("LLM_PROVIDER", LLM_PROVIDER).strip().lower()
+        fallback_provider = get_fallback_provider(primary=primary_provider)
+        checks["llm_provider"] = {
+            "primary": primary_provider,
+            "primary_credentialed": _has_provider_credentials(primary_provider),
+            "fallback_configured": fallback_provider is not None,
+            "fallback_provider": fallback_provider,
+        }
+
         uptime_seconds = (
             round(time.time() - self.startup_time, 2)
             if self.startup_time is not None
