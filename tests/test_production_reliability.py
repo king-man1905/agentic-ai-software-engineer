@@ -1313,6 +1313,13 @@ class TestLlmModelNameScopedToPrimaryProvider:
         monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
         monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
         monkeypatch.delenv("LLM_MODEL_NAME", raising=False)
+        # This dev machine's own .env sets LLM_MODEL_NAME - delenv only
+        # clears the live os.environ value; backend.services.llm's own
+        # module-level LLM_MODEL_NAME name was already bound to that .env
+        # value at import time (previously masked because it happened to
+        # equal the old NVIDIA default too), so it must be monkeypatched
+        # directly to genuinely test the no-override path.
+        monkeypatch.setattr("backend.services.llm.LLM_MODEL_NAME", None)
         monkeypatch.setenv("LLM_PROVIDER", "nvidia")
 
         from backend.services.llm import get_llm, _DEFAULT_MODELS

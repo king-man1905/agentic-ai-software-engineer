@@ -12,10 +12,14 @@ from backend.core.config import (
 )
 
 # Fallback model per provider, used only when LLM_MODEL_NAME isn't set.
-# openai/gpt-oss-20b is the last NVIDIA-hosted model confirmed working
-# (2026-09-03) after a wave of Llama 3.1/3.3 model deprecations on that
-# endpoint - if it goes end-of-life too, set LLM_MODEL_NAME in .env rather
-# than editing this file.
+# nvidia/nemotron-3-nano-omni-30b-a3b-reasoning replaces openai/gpt-oss-20b
+# (2026-09-24): a read-only investigation with raw minimal HTTPS requests
+# against the exact same NVIDIA endpoint and credentials confirmed
+# openai/gpt-oss-20b itself was stalled (95+s hangs), while other NVIDIA
+# models on the identical endpoint/credentials responded in ~1-7s - not a
+# prompt-length, reasoning_effort, retry-loop, or multi-request application
+# bug. If this model goes end-of-life too, set LLM_MODEL_NAME in .env
+# rather than editing this file.
 # gemini-3.6-flash replaces gemini-2.0-flash (run_120607d608c7, 2026-09-19):
 # Google decommissioned gemini-2.0-flash (404 NOT_FOUND, "no longer
 # available"), which broke the NVIDIA->Gemini fallback path itself - the
@@ -23,7 +27,7 @@ from backend.core.config import (
 # default was just stale. Confirmed via the account's live ListModels API
 # (generateContent supported) before pinning.
 _DEFAULT_MODELS = {
-    "nvidia": "openai/gpt-oss-20b",
+    "nvidia": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
     "gemini": "gemini-3.6-flash",
     "openai": "gpt-4o",
 }
@@ -41,18 +45,18 @@ def get_llm(provider: Optional[str] = None, timeout: Optional[float] = None):
 
     # LLM_MODEL_NAME is a single, provider-agnostic override with no
     # provider of its own attached to it - it exists to pin the
-    # CONFIGURED PRIMARY provider to a specific model (e.g. NVIDIA to
-    # openai/gpt-oss-20b after a wave of upstream model deprecations), not
+    # CONFIGURED PRIMARY provider to a specific model (e.g. NVIDIA to a
+    # specific hosted model after an upstream deprecation or stall), not
     # to name a model for whichever provider happens to be requested.
     # Applying it unconditionally meant a safe provider fallback (e.g.
     # NVIDIA -> Gemini, backend/observability/telemetry.py's explicit
     # get_llm(provider=fallback_provider) call) reused the PRIMARY
     # provider's model name against the FALLBACK provider's API, which has
-    # no such model - confirmed in production as a Gemini 404 for the
-    # NVIDIA-only model name "openai/gpt-oss-20b". Every other call site in
-    # this codebase calls get_llm() with no explicit provider at all, so
-    # eff_provider is always the configured primary there already - this
-    # guard changes nothing for them.
+    # no such model - confirmed in production as a Gemini 404 for a
+    # NVIDIA-only model name. Every other call site in this codebase calls
+    # get_llm() with no explicit provider at all, so eff_provider is always
+    # the configured primary there already - this guard changes nothing
+    # for them.
     configured_primary = os.getenv("LLM_PROVIDER", LLM_PROVIDER).strip().lower()
     explicit_model = os.getenv("LLM_MODEL_NAME") or LLM_MODEL_NAME
     model = (explicit_model if eff_provider == configured_primary else None) or _DEFAULT_MODELS.get(eff_provider)
@@ -73,11 +77,12 @@ def get_llm(provider: Optional[str] = None, timeout: Optional[float] = None):
 
     if eff_provider == "nvidia":
         from langchain_nvidia_ai_endpoints import ChatNVIDIA
-        # openai/gpt-oss-* previously received a `reasoning_effort="low"`
-        # constructor kwarg, on the theory that it bounds the model's hidden
-        # "thinking" budget. Removed (2026-09-27) after empirical
-        # verification proved it does nothing on NVIDIA's hosted endpoint
-        # for this model:
+        # Historical note (model since migrated away from, 2026-09-24 - see
+        # _DEFAULT_MODELS above): openai/gpt-oss-* previously received a
+        # `reasoning_effort="low"` constructor kwarg, on the theory that it
+        # bounds the model's hidden "thinking" budget. Removed (2026-09-27)
+        # after empirical verification proved it does nothing on NVIDIA's
+        # hosted endpoint for that model:
         #   1. The installed langchain-nvidia-ai-endpoints==1.4.3 package's
         #      own static model registry (_statics.py) marks
         #      "openai/gpt-oss-20b" with the default `supports_thinking =

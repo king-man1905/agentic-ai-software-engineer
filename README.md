@@ -58,7 +58,7 @@ flowchart TD
 
 ## LLM Provider Architecture
 
-- **Primary provider: NVIDIA** (`openai/gpt-oss-20b`, via NVIDIA's hosted OpenAI-compatible endpoint), with a bounded request timeout (75s by default, configurable).
+- **Primary provider: NVIDIA** (`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`, via NVIDIA's hosted endpoint), with a bounded request timeout (30s by default, configurable).
 - **Automatic, credential-aware fallback** to Gemini (or OpenAI) when the primary provider times out or returns a transient/malformed response. Fallback provider selection only ever considers a provider whose API key is actually present — an uncredentialed provider is never selected, not even as a last resort.
 - **Structured-output validation is never bypassed by fallback.** Every provider, primary or fallback, must return a schema-validated Pydantic object (e.g. `RoutingDecision`); a malformed response is classified and retried, not silently accepted.
 - **Timeout and malformed-response classification** are explicit, typed exception categories (`LLMTimeoutError`, `LLMMalformedResponseError`, etc.), each independently eligible or ineligible for fallback — an authentication or invalid-request error, for example, is never retried through a fallback provider.

@@ -150,35 +150,50 @@ def _infer_provider(llm: Any) -> str:
 
 def _invoke_nvidia_single_format_structured(llm: Any, schema: Any, prompt: str) -> Any:
     """
-    Single-round-trip structured-output attempt for NVIDIA gpt-oss models.
+    Single-round-trip structured-output attempt for NVIDIA-hosted models.
 
-    Binds the OpenAI-compatible `response_format` json_schema parameter -
-    the exact same request field ChatNVIDIA.with_structured_output() uses
-    as its primary format for hosted endpoints internally, via the same
-    public `.bind()` mechanism Runnable already exposes - then parses the
-    JSON from the response using this module's own extraction/validation.
-    Returns None (never raises) on an empty or unparseable completion, so
-    the caller's existing empty-completion / malformed-JSON handling in
+    Binds the direct, NIM-native `guided_json` top-level parameter - the
+    same field ChatNVIDIA.with_structured_output()'s own "direct format"
+    uses internally (see the installed langchain-nvidia-ai-endpoints
+    source: `nvext_param = {"guided_json": json_schema}` passed via
+    `super().bind(**nvext_param, ...)`) - via the same public `.bind()`
+    mechanism Runnable already exposes, then parses the JSON from the
+    response using this module's own extraction/validation. Returns None
+    (never raises) on an empty or unparseable completion, so the caller's
+    existing empty-completion / malformed-JSON handling in
     `_invoke_single_provider` applies exactly as it does for any other
     provider, without duplicating that classification logic here.
+
+    NOT the OpenAI-compatible `response_format={"type": "json_schema", ...}`
+    parameter this used before 2026-09-24: six bounded, single-attempt raw
+    HTTPS requests directly against NVIDIA's API (bypassing this SDK
+    entirely) proved `response_format` requests intermittently receive
+    "503 ResourceExhausted: Worker local total request limit reached
+    (16/16)" - reproduced with a minimal 1-field schema and the real
+    RoutingDecision schema alike, while a same-schema request using direct
+    `guided_json` succeeded - confirming NVIDIA routes `response_format`
+    requests through a small, separately-pooled, contended set of workers
+    on the hosted endpoint, unrelated to schema size/content or anything
+    this application controls.
+
+    Deliberately NOT `nvext={"guided_json": ...}` (the SDK's other
+    supported format): the same investigation proved that for this model,
+    nvext.guided_json returns HTTP 200 while silently ignoring the schema
+    entirely (a plain-text completion, not JSON) - worse than a
+    classifiable failure, since it would look like success and then fail
+    Pydantic validation non-deterministically depending on what the model
+    happened to say.
     """
     import re
 
-    response_format = {
-        "type": "json_schema",
-        "json_schema": {
-            "name": getattr(schema, "__name__", "response"),
-            "schema": schema.model_json_schema(),
-            "strict": True,
-        },
-    }
+    guided_schema = schema.model_json_schema()
     # Only the network call itself is left free to raise: a timeout, 5xx, or
     # rate limit here is a real failure the caller needs to see immediately
     # (see the caller's comment on why it isn't swallowed). A response that
     # arrives but is empty or fails schema validation is this function's own
     # "didn't work" outcome, not the caller's problem to classify - it's
     # reported back as None, same as any other unusable completion.
-    raw = llm.bind(response_format=response_format).invoke(prompt)
+    raw = llm.bind(guided_json=guided_schema).invoke(prompt)
     if not raw.content or not raw.content.strip():
         return None
     match = re.search(r"\{.*\}", raw.content, re.DOTALL)
@@ -214,20 +229,27 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
     # format's parser can't build the schema object - see the installed
     # langchain-nvidia-ai-endpoints==1.4.3 source, whose own docstring
     # calls formats 2-3 "mostly defensive" since format 1 is "expected to
-    # succeed" for hosted models. For openai/gpt-oss-* specifically, an
+    # succeed" for hosted models. For a NVIDIA-hosted model that returns an
     # empty completion (the model itself produced nothing, not a
-    # format-compatibility problem) makes all 3 formats fail identically,
-    # so the caller pays for 3 full round-trips - confirmed on real
-    # hardware to take up to ~130s - before this function's own raw-invoke
-    # fallback further below even runs. Binding the same primary
-    # response_format directly (via the standard, public `.bind()`
-    # mechanism the library itself uses internally) gets the identical
-    # "expected to succeed" attempt in a single call, so an empty
-    # completion is discovered - and classified as LLMMalformedResponseError
-    # by the unchanged logic below - without the other two redundant
-    # attempts. Gated strictly to NVIDIA gpt-oss models; every other
-    # provider/model keeps the original with_structured_output() path.
-    is_nvidia_gpt_oss = _infer_provider(llm) == "nvidia" and "gpt-oss" in str(model_name).lower()
+    # format-compatibility problem), all 3 formats fail identically, so the
+    # caller pays for 3 full round-trips - confirmed on real hardware (with
+    # the then-current openai/gpt-oss-20b) to take up to ~130s - before
+    # this function's own raw-invoke fallback further below even runs.
+    # Binding the request directly via `_invoke_nvidia_single_format_structured`
+    # (using direct guided_json - see that function's own docstring for why
+    # response_format and nvext.guided_json are both deliberately avoided)
+    # gets the identical "expected to succeed" attempt in a single call, so
+    # an empty completion is discovered - and classified as
+    # LLMMalformedResponseError by the unchanged logic below - without the
+    # other two redundant attempts. Generalized to every NVIDIA-hosted
+    # model (2026-09-24, alongside the openai/gpt-oss-20b -> nemotron
+    # migration): the underlying with_structured_output() 3-format-cascade
+    # behavior this works around is a property of ChatNVIDIA's hosted-model
+    # path in general, not specific to any one model family - gating it to
+    # a "gpt-oss" substring match would have silently stopped applying this
+    # optimization the moment the configured NVIDIA model changed. Every
+    # other provider keeps the original with_structured_output() path.
+    is_nvidia_hosted_model = _infer_provider(llm) == "nvidia"
     print(f"[LLM] Requesting structured output for {schema_name} from {model_name}...", flush=True)
     t0 = time.time()
 
@@ -241,7 +263,7 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
                 if "guided_json" in str(inner_exc) or "[400]" in str(inner_exc):
                     pass
                 elif isinstance(inner_exc, NotImplementedError):
-                    if is_nvidia_gpt_oss:
+                    if is_nvidia_hosted_model:
                         # Deliberately NOT wrapped in a swallowing
                         # try/except like the branch below: a genuine
                         # network failure (timeout, 5xx, rate limit) here

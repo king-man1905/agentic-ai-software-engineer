@@ -38,6 +38,24 @@ than keep sending a parameter proven to do nothing. The actual bottleneck
 is NVIDIA's own hosted response time for this model, which is external and
 handled correctly already by the existing LLM_TIMEOUT classification and
 provider fallback - unchanged by this round.
+
+Round 4 (2026-09-24): a read-only investigation with raw minimal HTTPS
+requests against the exact same NVIDIA endpoint and credentials confirmed
+openai/gpt-oss-20b itself was stalled (95+s hangs) while other NVIDIA
+models on the identical endpoint/credentials responded in ~1-7s - not a
+prompt-length, reasoning_effort, retry-loop, or multi-request application
+bug. NVIDIA's default model was migrated to
+nvidia/nemotron-3-nano-omni-30b-a3b-reasoning (see _DEFAULT_MODELS in
+backend/services/llm.py) and LLM_REQUEST_TIMEOUT_SECONDS's default reduced
+from 75.0 to 30.0 (see backend/core/config.py) to match normal NVIDIA
+latency instead of the stalled model's. Round 2's single-request
+`_invoke_nvidia_single_format_structured` fast path - previously gated to
+model names containing "gpt-oss" - is generalized to every NVIDIA-hosted
+model, since the with_structured_output() 3-format-cascade behavior it
+works around is a property of ChatNVIDIA's hosted-model path in general,
+not specific to any one model family; gating it by model-name substring
+would have silently stopped applying the moment the configured model
+changed.
 """
 
 from types import SimpleNamespace
@@ -51,6 +69,7 @@ from backend.observability.telemetry import (
 from backend.services.errors import (
     LLMMalformedResponseError,
     LLMTimeoutError,
+    LLMTransientError,
     classify_llm_exception,
     is_fallback_eligible,
 )
@@ -64,7 +83,8 @@ from backend.schemas.routing import RoutingDecision, TaskType
 class FakeNvidiaStructuredRunnable:
     """Stands in for the Runnable ChatNVIDIA.with_structured_output(schema)
     (no include_raw) returns - the multi-format cascade path, used only for
-    non-gpt-oss NVIDIA models after this fix."""
+    non-NVIDIA providers after this fix (Round 4: generalized to every
+    NVIDIA-hosted model)."""
 
     def __init__(self, parsed):
         self._parsed = parsed
@@ -75,7 +95,8 @@ class FakeNvidiaStructuredRunnable:
 
 class FakeNvidiaBoundRunnable:
     """Stands in for the Runnable ChatNVIDIA.bind(response_format=...)
-    returns - the single-round-trip fast path this fix adds for gpt-oss."""
+    returns - the single-round-trip fast path this fix adds for every
+    NVIDIA-hosted model."""
 
     def __init__(self, content):
         self._content = content
@@ -89,15 +110,17 @@ class FakeNvidiaLLM:
     - include_raw=True raises NotImplementedError unconditionally, before
       any network call.
     - with_structured_output(schema) (no include_raw) is the "expensive"
-      multi-format cascade - used for non-gpt-oss models only now.
-    - bind(response_format=...) is the new single-call fast path used for
-      gpt-oss models.
+      multi-format cascade - used only when the provider isn't NVIDIA now
+      (see Round 4: generalized to every NVIDIA-hosted model regardless of
+      model name).
+    - bind(response_format=...) is the single-call fast path used for every
+      NVIDIA-hosted model.
     - invoke(prompt) is the plain direct-fallback call.
     """
 
     def __init__(
         self,
-        model="openai/gpt-oss-20b",
+        model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
         plain_result=None,
         bind_content=None,
         direct_content=None,
@@ -120,8 +143,11 @@ class FakeNvidiaLLM:
         return FakeNvidiaStructuredRunnable(self._plain_result)
 
     def bind(self, **kwargs):
-        assert "response_format" in kwargs
-        assert kwargs["response_format"]["json_schema"]["name"] == "RoutingDecision"
+        assert "guided_json" in kwargs, "must use direct guided_json, not response_format (503-prone) or nvext (schema-ignoring)"
+        assert "response_format" not in kwargs
+        assert "nvext" not in kwargs
+        assert kwargs["guided_json"].get("title") == "RoutingDecision"
+        assert "properties" in kwargs["guided_json"], "must pass the real JSON schema dict, not a response_format envelope"
         self.bind_calls += 1
         return FakeNvidiaBoundRunnable(self._bind_content)
 
@@ -137,7 +163,7 @@ class FakeNvidiaLLM:
 # ---------------------------------------------------------------------------
 
 class TestNvidiaReasoningEffortConfiguration:
-    def test_gpt_oss_default_model_does_not_get_reasoning_effort(self, monkeypatch):
+    def test_nvidia_default_model_does_not_get_reasoning_effort(self, monkeypatch):
         monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
         monkeypatch.delenv("LLM_MODEL_NAME", raising=False)
         from backend.services import llm as llm_module
@@ -145,7 +171,7 @@ class TestNvidiaReasoningEffortConfiguration:
         client = llm_module.get_llm(provider="nvidia")
         assert "reasoning_effort" not in client.model_kwargs
 
-    def test_gpt_oss_client_construction_emits_no_unsupported_parameter_warning(self, monkeypatch):
+    def test_nvidia_client_construction_emits_no_unsupported_parameter_warning(self, monkeypatch):
         """Passing an unrecognized constructor kwarg (the old
         reasoning_effort passthrough) triggers a pydantic UserWarning on
         every NVIDIA client construction - confirmed gone now that the
@@ -230,10 +256,10 @@ class TestNvidiaIncludeRawUnsupportedFallback:
         with pytest.raises(NotImplementedError):
             llm.with_structured_output(RoutingDecision, include_raw=True)
 
-    def test_gpt_oss_falls_back_to_single_bind_call_not_the_cascade(self):
-        """The core fix: for gpt-oss, the expensive with_structured_output(
-        schema) multi-format cascade must never be invoked - only the
-        single bind() call."""
+    def test_nvidia_model_falls_back_to_single_bind_call_not_the_cascade(self):
+        """The core fix: for any NVIDIA-hosted model, the expensive
+        with_structured_output(schema) multi-format cascade must never be
+        invoked - only the single bind() call."""
         decision = RoutingDecision(
             task_type=TaskType.BUG_FIX, requires_planning=True,
             requires_knowledge=True, reasoning="Login bug after password reset.",
@@ -250,16 +276,44 @@ class TestNvidiaIncludeRawUnsupportedFallback:
 
 
 # ---------------------------------------------------------------------------
-# 6. No regression for non-gpt-oss NVIDIA models
+# 6. Generalization: gate is provider-based, not model-name-based (Round 4)
 # ---------------------------------------------------------------------------
 
-class TestNoRegressionForNonGptOssNvidia:
-    def test_non_gpt_oss_model_still_uses_the_original_cascade_path(self):
+class TestSingleFormatPathGeneralizedToEveryNvidiaModel:
+    def test_nvidia_model_without_gpt_oss_in_its_name_still_uses_the_fast_path(self):
+        """
+        The single-request bind() fast path is no longer gated to model
+        names containing "gpt-oss" - any NVIDIA-hosted model (identified by
+        provider, not name) takes it, including the new default
+        nvidia/nemotron-3-nano-omni-30b-a3b-reasoning and any other NVIDIA
+        model name.
+        """
         decision = RoutingDecision(
             task_type=TaskType.CODE_REVIEW, requires_planning=False,
             requires_knowledge=True, reasoning="Reviewing existing code.",
         )
-        llm = FakeNvidiaLLM(model="meta/llama-3.1-8b-instruct", plain_result=decision)
+        llm = FakeNvidiaLLM(model="meta/llama-3.1-8b-instruct", bind_content=decision.model_dump_json())
+
+        result = invoke_structured(llm, RoutingDecision, "prompt")
+
+        assert result == decision
+        assert llm.include_raw_calls == 1
+        assert llm.bind_calls == 1
+        assert llm.plain_calls == 0
+
+    def test_non_nvidia_provider_still_uses_the_original_cascade_path(self):
+        """
+        The real remaining boundary: a non-NVIDIA provider (identified via
+        _infer_provider, e.g. "gemini") is unaffected by this fix and keeps
+        using the original with_structured_output(schema) multi-format
+        cascade, never the NVIDIA-specific bind() fast path.
+        """
+        decision = RoutingDecision(
+            task_type=TaskType.CODE_REVIEW, requires_planning=False,
+            requires_knowledge=True, reasoning="Reviewing existing code.",
+        )
+        llm = FakeNvidiaLLM(plain_result=decision)
+        llm._provider = "gemini"
 
         result = invoke_structured(llm, RoutingDecision, "prompt")
 
@@ -267,6 +321,198 @@ class TestNoRegressionForNonGptOssNvidia:
         assert llm.include_raw_calls == 1
         assert llm.plain_calls == 1
         assert llm.bind_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# 7. NVIDIA model migration (Round 4): default model + single-request path
+# ---------------------------------------------------------------------------
+
+class TestNvidiaModelMigration:
+    def test_new_default_model_is_configured(self, monkeypatch):
+        """get_llm(provider="nvidia") with no explicit override resolves to
+        the current default model, not the retired openai/gpt-oss-20b."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
+        monkeypatch.delenv("LLM_MODEL_NAME", raising=False)
+        # This dev machine's own .env sets LLM_MODEL_NAME=openai/gpt-oss-20b
+        # (a pin predating this migration) - delenv only clears the live
+        # os.environ value; backend.services.llm's own module-level
+        # LLM_MODEL_NAME name was already bound to that .env value at
+        # import time and isn't affected by delenv, so it must be
+        # monkeypatched directly to genuinely test the no-override path.
+        monkeypatch.setattr("backend.services.llm.LLM_MODEL_NAME", None)
+        from backend.services.llm import get_llm, _DEFAULT_MODELS
+
+        assert _DEFAULT_MODELS["nvidia"] == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+        client = get_llm(provider="nvidia")
+        assert client.model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+
+    def test_new_default_model_uses_single_request_structured_path(self):
+        """End-to-end: a FakeNvidiaLLM carrying the real new default model
+        name goes through exactly one bind() call (the single-request
+        response_format path), never the multi-format cascade, and never
+        more than one underlying structured-output attempt."""
+        decision = RoutingDecision(
+            task_type=TaskType.BUG_FIX, requires_planning=False,
+            requires_knowledge=False, reasoning="New default model smoke check.",
+        )
+        llm = FakeNvidiaLLM(
+            model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            bind_content=decision.model_dump_json(),
+        )
+
+        result = invoke_structured(llm, RoutingDecision, "prompt")
+
+        assert result == decision
+        assert llm.include_raw_calls == 1
+        assert llm.bind_calls == 1
+        assert llm.plain_calls == 0
+        assert llm.direct_invoke_calls == 0
+
+    def test_default_timeout_is_30s(self):
+        """LLM_REQUEST_TIMEOUT_SECONDS's default is 30.0 now (reduced from
+        75.0, which was only ever sized for the retired stalled model) -
+        this dev environment's own .env does not set the variable, so the
+        module-level constant reflects the code's literal default."""
+        from backend.core.config import LLM_REQUEST_TIMEOUT_SECONDS
+        assert LLM_REQUEST_TIMEOUT_SECONDS == 30.0
+
+    def test_timeout_still_configurable_via_env_override(self, monkeypatch):
+        """Reducing the default must not remove configurability - an
+        explicit LLM_REQUEST_TIMEOUT_SECONDS env var still wins."""
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
+        monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "12.5")
+        from backend.services.llm import get_llm
+
+        client = get_llm(provider="nvidia")
+        assert client._timeout == 12.5
+
+
+# ---------------------------------------------------------------------------
+# 8. Structured-output mechanism (2026-09-24): direct guided_json, not
+#    response_format (intermittent 503) or nvext.guided_json (silently
+#    ignores the schema) - see the module docstring on
+#    _invoke_nvidia_single_format_structured for the confirming investigation.
+# ---------------------------------------------------------------------------
+
+class TestNvidiaGuidedJsonMechanism:
+    def test_bind_is_called_with_direct_guided_json_not_response_format_or_nvext(self):
+        """Exact request-shape assertion via a plain spy (independent of
+        FakeNvidiaLLM's own internal assertions) - proves the real JSON
+        schema dict is passed as the top-level `guided_json` kwarg, and
+        that neither `response_format` nor `nvext` is ever sent."""
+        decision = RoutingDecision(
+            task_type=TaskType.GENERAL, requires_planning=False,
+            requires_knowledge=False, reasoning="n/a",
+        )
+        captured_kwargs = {}
+
+        class SpyLLM:
+            _provider = "nvidia"
+            model = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+
+            def bind(self, **kwargs):
+                captured_kwargs.update(kwargs)
+                return SimpleNamespace(invoke=lambda prompt: SimpleNamespace(content=decision.model_dump_json()))
+
+        _invoke_nvidia_single_format_structured(SpyLLM(), RoutingDecision, "prompt")
+
+        assert "guided_json" in captured_kwargs
+        assert "response_format" not in captured_kwargs
+        assert "nvext" not in captured_kwargs
+        schema = captured_kwargs["guided_json"]
+        assert schema == RoutingDecision.model_json_schema()
+
+    def test_schema_is_the_real_json_schema_not_wrapped_in_an_envelope(self):
+        """The investigation's Case D (full RoutingDecision schema wrapped
+        in response_format's {"type", "json_schema": {"name", "schema",
+        "strict"}} envelope) 503'd; Case E1 (the bare schema dict as
+        guided_json) succeeded. Confirms this code sends the bare schema,
+        never the response_format envelope shape."""
+        guided_schema = RoutingDecision.model_json_schema()
+        assert guided_schema.get("title") == "RoutingDecision"
+        assert "properties" in guided_schema
+        assert "task_type" in guided_schema["properties"]
+        # Not the response_format envelope shape.
+        assert "json_schema" not in guided_schema
+        assert "strict" not in guided_schema
+
+    def test_valid_routing_decision_parses_correctly_via_guided_json(self):
+        decision = RoutingDecision(
+            task_type=TaskType.DATA_ANALYSIS, requires_planning=True,
+            requires_knowledge=True, reasoning="Needs a data pipeline change.",
+        )
+        llm = FakeNvidiaLLM(bind_content=decision.model_dump_json())
+
+        result = _invoke_nvidia_single_format_structured(llm, RoutingDecision, "prompt")
+
+        assert result == decision
+        assert llm.bind_calls == 1
+
+    def test_exactly_one_provider_request_for_guided_json_success(self):
+        """No cascade, no retry - the include_raw NotImplementedError probe
+        plus exactly one bind() call, nothing else."""
+        decision = RoutingDecision(
+            task_type=TaskType.GENERAL, requires_planning=False,
+            requires_knowledge=False, reasoning="n/a",
+        )
+        llm = FakeNvidiaLLM(bind_content=decision.model_dump_json())
+
+        result = invoke_structured(llm, RoutingDecision, "prompt")
+
+        assert result == decision
+        assert llm.include_raw_calls == 1
+        assert llm.bind_calls == 1
+        assert llm.plain_calls == 0
+        assert llm.direct_invoke_calls == 0
+
+    def test_provider_503_worker_limit_reached_is_classified_as_transient_and_fallback_eligible(self):
+        """The exact real NVIDIA error observed in the investigation must
+        classify as a transient, fallback-eligible failure - never as
+        malformed, auth, or invalid-request (which would not trigger safe
+        fallback to Gemini)."""
+        exc = Exception(
+            "[503] {'message': 'ResourceExhausted: Worker local total request "
+            "limit reached (16/16)', 'type': 'Service Unavailable', 'code': 503}"
+        )
+        classified = classify_llm_exception(exc, provider="nvidia")
+        assert isinstance(classified, LLMTransientError)
+        assert is_fallback_eligible(classified) is True
+        assert classified.provider == "nvidia"
+
+    def test_provider_503_triggers_real_fallback_to_gemini(self, monkeypatch):
+        """End-to-end: the exact 503 from the investigation, hit on the
+        primary NVIDIA call, must trigger the same safe provider fallback
+        as any other transient failure - not a special case, not silently
+        swallowed."""
+        decision = RoutingDecision(
+            task_type=TaskType.BUG_FIX, requires_planning=False,
+            requires_knowledge=False, reasoning="Fallback after 503.",
+        )
+
+        primary = FakeNvidiaLLM()
+
+        def bind_then_503(**kwargs):
+            raise Exception(
+                "[503] {'message': 'ResourceExhausted: Worker local total request "
+                "limit reached (16/16)', 'type': 'Service Unavailable', 'code': 503}"
+            )
+
+        primary.bind = bind_then_503
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "google-test-key")
+        monkeypatch.setenv("LLM_FALLBACK_ENABLED", "true")
+        monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "gemini")
+
+        from backend.services import llm as llm_module
+
+        fallback_llm = FakeNvidiaLLM(plain_result=decision)
+        fallback_llm._provider = "gemini"
+        monkeypatch.setattr(llm_module, "get_llm", lambda provider=None: fallback_llm)
+
+        result = invoke_structured(primary, RoutingDecision, "prompt")
+
+        assert result == decision
+        assert primary.include_raw_calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -398,9 +644,9 @@ class TestExistingFallbackBehaviorPreserved:
 
         from backend.services import llm as llm_module
 
-        # This fake becomes non-gpt-oss (provider "gemini"), so it takes
-        # the ORIGINAL with_structured_output(schema) cascade path, not the
-        # bind() fast path - set plain_result accordingly.
+        # This fake is a non-NVIDIA provider ("gemini"), so it takes the
+        # ORIGINAL with_structured_output(schema) cascade path, not the
+        # NVIDIA-only bind() fast path - set plain_result accordingly.
         fallback_llm = FakeNvidiaLLM(plain_result=decision)
         fallback_llm._provider = "gemini"
         monkeypatch.setattr(llm_module, "get_llm", lambda provider=None: fallback_llm)

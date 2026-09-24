@@ -9,14 +9,18 @@ LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME")  # provider-specific default applie
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# 75s (not the previous 60s) is an evidence-based, bounded increase: with
-# NVIDIA's openai/gpt-oss-20b at reasoning_effort="low", measured
-# single-round-trip classification calls ranged ~37-49s. 75s gives margin
-# over that observed ceiling without approaching the multi-minute values
-# that would mask a genuinely hung request; a request that's still slower
-# than this is handled by the existing safe provider fallback, not by
-# raising this further.
-LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "75.0"))
+# 30s (reduced from 75s, 2026-09-24, alongside the migration off
+# openai/gpt-oss-20b - see _DEFAULT_MODELS in backend/services/llm.py):
+# that prior 75s bound was sized around openai/gpt-oss-20b's own observed
+# ~37-49s single-round-trip latency, which was itself only a workaround for
+# that model's endpoint being stalled. Raw minimal HTTPS requests against
+# the exact same NVIDIA endpoint and credentials confirmed other hosted
+# models respond in ~1-7s - 30s keeps a real margin over that normal
+# latency without waiting anywhere near as long to detect a genuinely
+# stalled request; a request slower than this is handled by the existing
+# safe provider fallback, not by raising this further. Still fully
+# configurable via the LLM_REQUEST_TIMEOUT_SECONDS environment variable.
+LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "30.0"))
 WORKSPACE_LOCK_TIMEOUT_SECONDS = float(os.getenv("WORKSPACE_LOCK_TIMEOUT_SECONDS", "30.0"))
 SHUTDOWN_DRAIN_TIMEOUT_SECONDS = float(os.getenv("SHUTDOWN_DRAIN_TIMEOUT_SECONDS", "30.0"))
 
